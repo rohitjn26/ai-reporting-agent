@@ -1,0 +1,120 @@
+services:
+  # ── Data Layer ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: reporting
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./data-db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d reporting"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  library-db:
+    image: postgres:15-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: library
+    volumes:
+      - library-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d library"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── Semantic / API Layer ──────────────────────────────────────────────────
+  library:
+    build: ./library
+    ports:
+      - "3001:3001"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@library-db:5432/library
+      PORT: "3001"
+    depends_on:
+      library-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:3001/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  cube:
+    build: ./cube
+    ports:
+      - "4000:4000"
+    environment:
+      CUBEJS_DB_TYPE: postgres
+      CUBEJS_DB_HOST: postgres
+      CUBEJS_DB_PORT: "5432"
+      CUBEJS_DB_NAME: reporting
+      CUBEJS_DB_USER: postgres
+      CUBEJS_DB_PASS: postgres
+      CUBEJS_API_SECRET: local-dev-secret
+      CUBEJS_DEV_MODE: "true"
+      CUBEJS_TELEMETRY: "false"
+      CUBEJS_DATAMODEL: dynamic
+      CUBEJS_SCHEMA_PATH: data-models/dynamic
+      LIBRARY_URL: http://library:3001/v1/CUBE_CONFIG
+      CUBEJS_CACHE_AND_QUEUE_DRIVER: memory
+      CUBEJS_REFRESH_WORKER: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      library:
+        condition: service_healthy
+
+  # ── MCP Servers ───────────────────────────────────────────────────────────
+  cube-mcp:
+    build: ./mcp
+    ports:
+      - "5001:5001"
+    environment:
+      CUBE_URL: http://cube:4000
+      CUBE_API_SECRET: local-dev-secret
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "5001"
+      CUBE_CONTAINER_NAME: reporting-agent-cube-1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["python", "cube_server.py"]
+    depends_on:
+      - cube
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5001/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  library-mcp:
+    build: ./mcp
+    ports:
+      - "5002:5002"
+    environment:
+      LIBRARY_URL: http://library:3001
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "5002"
+    command: ["python", "library_server.py"]
+    depends_on:
+      library:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5002/health')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+volumes:
+  postgres-data:
+  library-db-data:

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Env files — contain secrets
+.env
+*.env
+
+# Node
+node_modules/
+
+# Docker volumes / data
+postgres-data/
+library-db-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/

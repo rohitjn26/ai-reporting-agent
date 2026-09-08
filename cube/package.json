@@ -1,0 +1,8 @@
+{
+  "name": "reporting-agent-cube",
+  "version": "1.0.0",
+  "dependencies": {
+    "@cubejs-backend/postgres-driver": "^1.6.40",
+    "node-fetch": "^2.7.0"
+  }
+}

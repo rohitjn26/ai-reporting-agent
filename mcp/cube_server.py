@@ -4,8 +4,15 @@ Exposes: get_cube_metadata, query_cube
 SSE endpoint:    http://0.0.0.0:5001/sse
 Health endpoint: http://0.0.0.0:5001/health
 """
-import asyncio, os, json, urllib.parse
+import asyncio, logging, os, json, urllib.parse
 import httpx
+
+
+class _NoHealthFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/health" not in record.getMessage()
+
+logging.getLogger("uvicorn.access").addFilter(_NoHealthFilter())
 from httpx import AsyncHTTPTransport
 from starlette.requests import Request
 from starlette.responses import JSONResponse

@@ -5,8 +5,15 @@ Exposes: list_cube_configs, get_cube_config_detail, create_cube_config,
 SSE endpoint:    http://0.0.0.0:5002/sse
 Health endpoint: http://0.0.0.0:5002/health
 """
-import os, json
+import logging, os, json
 from typing import Optional
+
+
+class _NoHealthFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "/health" not in record.getMessage()
+
+logging.getLogger("uvicorn.access").addFilter(_NoHealthFilter())
 
 _VALID_MEASURE_TYPES = {
     "sum", "count", "count_distinct", "count_distinct_approx",

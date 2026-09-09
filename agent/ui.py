@@ -23,7 +23,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 import uvicorn
 
-from graph.agent import build_agent, maybe_summarise
+from graph.agent import build_agent, maybe_summarise, pick_agent, _agent_sonnet
 import chart.server as _chart_server
 
 os.environ.setdefault("CHART_OPEN_BROWSER", "false")
@@ -67,14 +67,16 @@ def _sse_headers():
     return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
-async def _stream_agent(request: Request, input_, thread_id: str):
+async def _stream_agent(request: Request, input_, thread_id: str, agent=None):
     """
     Core SSE generator — drives the agent, emits typed events, detects interrupts.
     `input_` is either {"messages": [...]} for new turns or Command(resume=...) for resumes.
     """
+    if agent is None:
+        agent = _agent_sonnet
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
     try:
-        async for event in _agent.astream_events(input_, config=config, version="v2"):
+        async for event in agent.astream_events(input_, config=config, version="v2"):
             if await request.is_disconnected():
                 return
 
@@ -148,7 +150,7 @@ async def _stream_agent(request: Request, input_, thread_id: str):
                 pass
             yield f"data: {json.dumps({'type': 'session_reset', 'text': 'Session was corrupted (page refreshed mid-tool-call). Cleared and retrying...'})}\n\n"
             # Replay the original message now that the thread is clean.
-            async for chunk in _stream_agent(request, input_, thread_id):
+            async for chunk in _stream_agent(request, input_, thread_id, agent=agent):
                 yield chunk
             return
         yield f"data: {json.dumps({'type': 'error', 'text': err_text})}\n\n"
@@ -157,7 +159,7 @@ async def _stream_agent(request: Request, input_, thread_id: str):
 
     # After the stream ends, check whether the graph paused on an interrupt.
     try:
-        state = _agent.get_state(config)
+        state = agent.get_state(config)
         for task in state.tasks:
             if task.interrupts:
                 iv = task.interrupts[0].value   # dict passed to interrupt()
@@ -171,7 +173,7 @@ async def _stream_agent(request: Request, input_, thread_id: str):
 
     # Summarise history if it has grown too long (only at clean done points).
     try:
-        did_summarise = await maybe_summarise(_agent, thread_id)
+        did_summarise = await maybe_summarise(agent, thread_id)
         if did_summarise:
             yield f"data: {json.dumps({'type': 'status', 'text': 'History compressed'})}\n\n"
     except Exception:
@@ -182,9 +184,10 @@ async def _stream_agent(request: Request, input_, thread_id: str):
 
 @app.get("/chat")
 async def chat_stream(request: Request, message: str, thread_id: str = "default"):
-    """SSE — new user message."""
+    """SSE — new user message. Routes to Sonnet for config edits, Haiku for queries."""
+    routed = pick_agent(message)
     return StreamingResponse(
-        _stream_agent(request, {"messages": [HumanMessage(content=message)]}, thread_id),
+        _stream_agent(request, {"messages": [HumanMessage(content=message)]}, thread_id, agent=routed),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -192,9 +195,9 @@ async def chat_stream(request: Request, message: str, thread_id: str = "default"
 
 @app.get("/resume")
 async def resume_stream(request: Request, answer: str, thread_id: str = "default"):
-    """SSE — resume after the user answers an interrupt question."""
+    """SSE — resume after the user answers an interrupt question. Always uses Sonnet (config flow)."""
     return StreamingResponse(
-        _stream_agent(request, Command(resume=answer), thread_id),
+        _stream_agent(request, Command(resume=answer), thread_id, agent=_agent_sonnet),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )

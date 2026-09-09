@@ -15,7 +15,25 @@ from graph.config_editor import edit_cube_config
 
 CUBE_MCP_URL    = os.environ.get("CUBE_MCP_URL",    "http://localhost:5001/sse")
 LIBRARY_MCP_URL = os.environ.get("LIBRARY_MCP_URL", "http://localhost:5002/sse")
-MODEL           = os.environ.get("CLAUDE_MODEL",    "claude-sonnet-4-6")
+MODEL_SONNET    = os.environ.get("CLAUDE_MODEL",       "claude-sonnet-4-6")
+MODEL_HAIKU     = os.environ.get("CLAUDE_MODEL_FAST",  "claude-haiku-4-5-20251001")
+
+# Action verbs that signal a config-edit intent → needs Sonnet.
+# Pure data/chart queries use Haiku.
+_CONFIG_VERBS = {
+    "add", "create", "edit", "modify", "change", "update",
+    "remove", "delete", "rename", "replace", "new",
+}
+
+_agent_sonnet = None
+_agent_haiku  = None
+
+
+def pick_agent(message: str):
+    """Return Sonnet agent for config-edit requests, Haiku for everything else."""
+    words = set(message.lower().split())
+    use_sonnet = bool(words & _CONFIG_VERBS)
+    return _agent_sonnet if use_sonnet else _agent_haiku
 
 SYSTEM_PROMPT = """\
 You are a data reporting agent. When the user asks for a chart or data insight:
@@ -177,22 +195,29 @@ def _build_state_modifier(state) -> list:
 
 async def build_agent():
     """
-    Connect to both MCP servers, collect their tools, add local tools,
-    and return a compiled LangGraph ReAct agent with interrupt support.
+    Build two agents (Sonnet + Haiku) sharing one MemorySaver.
+    Both read/write the same thread history — only the model differs.
+    Sonnet handles config edits; Haiku handles chart/data queries.
     """
+    global _agent_sonnet, _agent_haiku
+
     mcp_client = MultiServerMCPClient({
         "cube":    {"url": CUBE_MCP_URL,    "transport": "sse"},
         "library": {"url": LIBRARY_MCP_URL, "transport": "sse"},
     })
-
     mcp_tools = await mcp_client.get_tools()
-    all_tools  = mcp_tools + [create_chart, edit_cube_config]
+    all_tools = mcp_tools + [create_chart, edit_cube_config]
 
-    model = ChatAnthropic(model=MODEL)
-    agent = create_react_agent(
-        model,
+    _agent_sonnet = create_react_agent(
+        ChatAnthropic(model=MODEL_SONNET),
         all_tools,
         state_modifier=_build_state_modifier,
         checkpointer=_checkpointer,
     )
-    return agent
+    _agent_haiku = create_react_agent(
+        ChatAnthropic(model=MODEL_HAIKU),
+        all_tools,
+        state_modifier=_build_state_modifier,
+        checkpointer=_checkpointer,
+    )
+    return _agent_sonnet  # default for callers that hold a reference

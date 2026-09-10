@@ -23,7 +23,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 import uvicorn
 
-from graph.agent import build_agent, maybe_summarise, pick_agent, _agent_sonnet
+from graph.agent import build_agent, maybe_summarise, pick_agent, _CONFIG_VERBS
 import chart.server as _chart_server
 
 os.environ.setdefault("CHART_OPEN_BROWSER", "false")
@@ -63,6 +63,13 @@ def index():
     return _HTML
 
 
+@app.get("/chart", response_class=HTMLResponse)
+def chart():
+    """Serve the most recent chart HTML same-origin (avoids the separate
+    random-port chart server, so charts render however the UI is reached)."""
+    return _chart_server._current_html
+
+
 def _sse_headers():
     return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -73,8 +80,11 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None):
     `input_` is either {"messages": [...]} for new turns or Command(resume=...) for resumes.
     """
     if agent is None:
-        agent = _agent_sonnet
+        agent = _agent
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+    # SQL of the most recent query_cube — only surfaced when it feeds a chart,
+    # so intermediate/exploratory queries don't clutter the UI with SQL.
+    pending_sql = None
     try:
         async for event in agent.astream_events(input_, config=config, version="v2"):
             if await request.is_disconnected():
@@ -111,7 +121,8 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None):
                         parsed = json.loads(output.content if hasattr(output, "content") else output)
                         sql = parsed.get("sql", "")
                         if sql:
-                            yield f"data: {json.dumps({'type': 'sql', 'sql': sql})}\n\n"
+                            # Buffer it — only emit if a chart is created from it.
+                            pending_sql = sql
                     except Exception:
                         pass
                 if name == "preview_cube_config_update" and not error:
@@ -132,8 +143,11 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None):
                     except Exception:
                         pass
                 if name == "create_chart":
-                    url = f"http://localhost:{_chart_server._PORT}"
-                    yield f"data: {json.dumps({'type': 'chart', 'url': url})}\n\n"
+                    # Show the SQL behind the final visualization (if any).
+                    if pending_sql:
+                        yield f"data: {json.dumps({'type': 'sql', 'sql': pending_sql})}\n\n"
+                        pending_sql = None
+                    yield f"data: {json.dumps({'type': 'chart', 'url': '/chart'})}\n\n"
 
     except Exception as e:
         err_text = str(e)
@@ -186,6 +200,8 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None):
 async def chat_stream(request: Request, message: str, thread_id: str = "default"):
     """SSE — new user message. Routes to Sonnet for config edits, Haiku for queries."""
     routed = pick_agent(message)
+    model_name = "sonnet" if set(message.lower().split()) & _CONFIG_VERBS else "haiku"
+    print(f"[routing] model={model_name}  thread={thread_id}  msg={message[:80]!r}")
     return StreamingResponse(
         _stream_agent(request, {"messages": [HumanMessage(content=message)]}, thread_id, agent=routed),
         media_type="text/event-stream",
@@ -197,7 +213,7 @@ async def chat_stream(request: Request, message: str, thread_id: str = "default"
 async def resume_stream(request: Request, answer: str, thread_id: str = "default"):
     """SSE — resume after the user answers an interrupt question. Always uses Sonnet (config flow)."""
     return StreamingResponse(
-        _stream_agent(request, Command(resume=answer), thread_id, agent=_agent_sonnet),
+        _stream_agent(request, Command(resume=answer), thread_id, agent=_agent),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -327,6 +343,27 @@ _HTML = """<!DOCTYPE html>
       border-bottom-left-radius: 4px;
       border: 1px solid #334155;
     }
+
+    /* Markdown rendered inside agent bubbles */
+    .bubble strong { color: #f1f5f9; font-weight: 600; }
+    .bubble em { font-style: italic; }
+    .bubble code {
+      background: #0f172a; border: 1px solid #334155; border-radius: 4px;
+      padding: 1px 5px; font-family: ui-monospace, monospace; font-size: 0.82em;
+    }
+    .bubble ul, .bubble ol { margin: 6px 0 6px 18px; }
+    .bubble li { margin: 2px 0; }
+    .bubble > div { margin: 0; }
+    .bubble .md-table {
+      border-collapse: collapse; margin: 8px 0; width: 100%; font-size: 0.82rem;
+    }
+    .bubble .md-table th {
+      background: #6366f1; color: #fff; text-align: left; padding: 5px 10px;
+    }
+    .bubble .md-table td {
+      padding: 4px 10px; border-bottom: 1px solid #334155;
+    }
+    .bubble .md-table tr:last-child td { border-bottom: none; }
 
     .tool-badge {
       display: inline-flex;
@@ -745,15 +782,37 @@ _HTML = """<!DOCTYPE html>
 </main>
 
 <script>
+  // Surface any script error visibly instead of silently killing the page
+  // (a throw before the event listeners attach would leave Send/Enter dead).
+  window.addEventListener('error', (e) => {
+    const b = document.createElement('div');
+    b.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#7f1d1d;color:#fee2e2;padding:10px 16px;font:13px system-ui;border-bottom:2px solid #ef4444';
+    b.textContent = '⚠ Script error: ' + e.message + (e.filename ? ' (line ' + e.lineno + ')' : '');
+    document.body.appendChild(b);
+  });
+
   const messagesEl  = document.getElementById('messages');
   const input       = document.getElementById('msg-input');
   const sendBtn     = document.getElementById('send-btn');
   const frame       = document.getElementById('chart-frame');
   const placeholder = document.getElementById('chart-placeholder');
 
+  // Generate a UUID without requiring a secure context. crypto.randomUUID()
+  // only exists over https/localhost — accessing the UI via a LAN IP or
+  // hostname would otherwise throw here and kill the whole script.
+  function makeUUID() {
+    if (window.crypto && crypto.randomUUID) {
+      try { return crypto.randomUUID(); } catch (_) {}
+    }
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      const r = Math.random() * 16 | 0;
+      return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+    });
+  }
+
   // Stable session ID — one per browser tab, survives page refreshes within the tab.
   const threadId = sessionStorage.getItem('threadId') || (() => {
-    const id = crypto.randomUUID();
+    const id = makeUUID();
     sessionStorage.setItem('threadId', id);
     return id;
   })();
@@ -1226,30 +1285,113 @@ _HTML = """<!DOCTYPE html>
     frame.src = url + '?t=' + Date.now();
   }
 
+  // ── lightweight markdown → HTML (bold, italic, code, lists, tables) ─────────
+  function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function renderMarkdown(md) {
+    const lines = md.split('\\n');
+    let html = '', i = 0, inUl = false, inOl = false;
+    const closeLists = () => {
+      if (inUl) { html += '</ul>'; inUl = false; }
+      if (inOl) { html += '</ol>'; inOl = false; }
+    };
+    const inline = (s) => {
+      s = escapeHtml(s);
+      s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+      s = s.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+      s = s.replace(/(^|[^*])\\*([^*]+)\\*(?!\\*)/g, '$1<em>$2</em>');
+      return s;
+    };
+    while (i < lines.length) {
+      const line = lines[i];
+      // Markdown table: header row | ... | followed by a |---| separator
+      if (/^\\s*\\|.*\\|\\s*$/.test(line) && i + 1 < lines.length &&
+          /^\\s*\\|[\\s:|-]+\\|\\s*$/.test(lines[i + 1])) {
+        closeLists();
+        const cells = (row) => row.trim().replace(/^\\||\\|$/g, '').split('|').map(c => c.trim());
+        const headers = cells(line);
+        html += '<table class="md-table"><thead><tr>' +
+                headers.map(h => '<th>' + inline(h) + '</th>').join('') + '</tr></thead><tbody>';
+        i += 2;
+        while (i < lines.length && /^\\s*\\|.*\\|\\s*$/.test(lines[i])) {
+          html += '<tr>' + cells(lines[i]).map(c => '<td>' + inline(c) + '</td>').join('') + '</tr>';
+          i++;
+        }
+        html += '</tbody></table>';
+        continue;
+      }
+      const ulm = line.match(/^\\s*[-•*]\\s+(.*)$/);
+      const olm = line.match(/^\\s*\\d+\\.\\s+(.*)$/);
+      if (ulm) {
+        if (inOl) { html += '</ol>'; inOl = false; }
+        if (!inUl) { html += '<ul>'; inUl = true; }
+        html += '<li>' + inline(ulm[1]) + '</li>';
+      } else if (olm) {
+        if (inUl) { html += '</ul>'; inUl = false; }
+        if (!inOl) { html += '<ol>'; inOl = true; }
+        html += '<li>' + inline(olm[1]) + '</li>';
+      } else {
+        closeLists();
+        if (line.trim() === '') html += '<br>';
+        else html += '<div>' + inline(line) + '</div>';
+      }
+      i++;
+    }
+    closeLists();
+    return html;
+  }
+
   // ── core SSE handler — shared by /chat and /resume ─────────────────────────
   function handleStream(es, typingEl) {
     let agentBubble = null;
+    let agentRaw    = '';
     let firstToken  = true;
+
+    const SAVE_MARK = '%%SAVE_OFFER%%';
+
+    function newBubble() {
+      const wrap = document.createElement('div');
+      wrap.className = 'msg agent';
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      wrap.appendChild(bubble);
+      messagesEl.appendChild(wrap);
+      return bubble;
+    }
+
+    // Close out the current agent text run: render markdown, and if it contains
+    // the save-offer marker, split the trailing offer into its own message.
+    function finalizeAgentText() {
+      if (!agentBubble) return;
+      const parts = agentRaw.split(SAVE_MARK);
+      agentBubble.innerHTML = renderMarkdown(parts[0].trim());
+      if (parts.length > 1) {
+        const offer = parts.slice(1).join(SAVE_MARK).trim();
+        if (offer) {
+          const b = newBubble();
+          b.innerHTML = renderMarkdown(offer);
+        }
+      }
+      agentBubble = null;
+      agentRaw = '';
+    }
 
     es.onmessage = (e) => {
       const d = JSON.parse(e.data);
 
       if (d.type === 'token') {
-        if (firstToken) {
-          typingEl.remove();
-          const wrap = document.createElement('div');
-          wrap.className = 'msg agent';
-          agentBubble = document.createElement('div');
-          agentBubble.className = 'bubble';
-          wrap.appendChild(agentBubble);
-          messagesEl.appendChild(wrap);
-          firstToken = false;
-        }
-        agentBubble.textContent += d.text;
+        if (firstToken) { typingEl.remove(); firstToken = false; }
+        if (!agentBubble) { agentBubble = newBubble(); agentRaw = ''; }
+        agentRaw += d.text;
+        // Live preview (hide the marker while streaming); markdown finalised on completion.
+        agentBubble.innerHTML = renderMarkdown(agentRaw.split(SAVE_MARK).join('\\n\\n'));
         scrollBottom();
 
       } else if (d.type === 'tool_start') {
         if (firstToken) { typingEl.remove(); firstToken = false; }
+        finalizeAgentText();
         addToolBadge(d.name, d.run_id);
 
       } else if (d.type === 'tool_end') {
@@ -1262,6 +1404,7 @@ _HTML = """<!DOCTYPE html>
         showConfigPreview(d.current, d.proposed);
 
       } else if (d.type === 'chart') {
+        finalizeAgentText();
         showChart(d.url);
         const link = document.createElement('a');
         link.href = d.url; link.target = '_blank';
@@ -1295,6 +1438,7 @@ _HTML = """<!DOCTYPE html>
       } else if (d.type === 'interrupt') {
         // Graph paused — show question card or form, resume on answer
         if (firstToken) typingEl.remove();
+        finalizeAgentText();
         es.close();
         sendBtn.disabled = true;
         input.placeholder = 'Complete the form above to continue…';
@@ -1320,6 +1464,7 @@ _HTML = """<!DOCTYPE html>
         es.close();
 
       } else if (d.type === 'done') {
+        finalizeAgentText();
         es.close();
         sendBtn.disabled = false;
         input.placeholder = 'Ask for a chart…';

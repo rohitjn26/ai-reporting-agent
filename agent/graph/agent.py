@@ -41,10 +41,33 @@ You are a data reporting agent. When the user asks for a chart or data insight:
 1. Call get_cube_metadata to discover available cubes, measures, and dimensions.
 2. Choose the right cube and identify the correct measures and dimensions from the metadata.
 3. Call query_cube. Member names must be fully qualified: "cube_name.member_name".
-4. Call create_chart with the results to render the visualization.
-5. Return the chart URL with a brief description.
+4. If the user has NOT specified a chart type, ask: "What type of chart would you like? bar / line / pie / doughnut / table"
+   Wait for their answer before calling create_chart.
+5. Call create_chart with the results to render the visualization.
+6. Return the chart URL with a brief description.
 
+Supported chart types: bar, line, pie, doughnut, table.
 Always call create_chart at the end — the user expects a visual result.
+For chart_type="table", call create_chart with `columns` (header names) and `rows`
+(a list of rows, each a flat list of cell values) — NOT labels/datasets. Each row is
+one record; never put a list inside a single cell.
+
+Sometimes the existing measures and dimensions alone cannot produce what the user
+asked for, so you derive the result yourself — by writing new SQL, bucketing values
+(e.g. "0-5", "6-10", "26+"), computing a ratio, categorising, or otherwise
+transforming the data in your reasoning. Whenever you did this:
+1. Render the chart first as normal so the user gets their result immediately.
+2. Write your normal summary of the chart. Then, on a brand new line, output the exact
+   marker %%SAVE_OFFER%% followed by the persistence offer as a SEPARATE short message:
+   "This [bucket/ratio/grouping] isn't a saved [measure/dimension] yet. Want me to add it
+   to the [cube_name] cube so it's reusable next time?"
+   The marker MUST be on its own, before the offer — it tells the UI to show the offer as
+   a separate message. Never mention the marker itself to the user.
+3. If the user says yes, follow the add-field flow below: call edit_cube_config with
+   suggested_field_type ("measure" or "dimension"), and a suggested_sql that
+   reproduces exactly the transformation you used. The form opens pre-filled for review.
+Only offer this when you actually derived something new — not for plain queries that
+already map cleanly to existing measures and dimensions.
 
 IMPORTANT query rules:
 - If query_cube fails, read the error carefully. Do NOT retry the same query.
@@ -154,22 +177,39 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
 @tool
 def create_chart(
     chart_type: str,
-    labels: list[str],
-    datasets: list[dict],
+    labels: list[str] = [],
+    datasets: list[dict] = [],
     title: str = "",
+    columns: list[str] = [],
+    rows: list[list] = [],
 ) -> str:
     """
-    Render a Chart.js chart and serve it at localhost.
+    Render a Chart.js chart (or an HTML table) in the UI's preview panel.
+
+    For bar / line / pie / doughnut charts use labels + datasets:
+        labels:   list of label strings (x-axis for bar/line, segments for pie)
+        datasets: list of dicts, each with "label" (str) and "data" (list of numbers)
+
+    For chart_type="table" DO NOT use labels/datasets — provide a real grid:
+        columns: list of column header strings,
+                 e.g. ["Category", "Total Revenue", "Qty Sold", "Revenue per Item"]
+        rows:    list of rows, each a list of cell values aligned to columns,
+                 e.g. [["Electronics", "$10,120.93", 26, "$389.27"],
+                       ["Sports", "$1,967.69", 38, "$51.78"]]
+        Each row is one record; do not nest lists inside a cell.
 
     Args:
-        chart_type: "bar" | "line" | "pie" | "doughnut"
-        labels:     list of label strings (x-axis for bar/line, segments for pie)
-        datasets:   list of dicts, each with "label" (str) and "data" (list of numbers)
+        chart_type: "bar" | "line" | "pie" | "doughnut" | "table"
         title:      optional chart title
     """
-    html = render_chart(chart_type, labels, datasets, title)
-    url = serve_chart(html, open_browser=True)
-    return f"Chart ready at: {url}"
+    html = render_chart(chart_type, labels, datasets, title, columns or None, rows or None)
+    serve_chart(html, open_browser=True)
+    # Don't return a URL — the UI renders the chart in its preview panel. Telling
+    # the model a localhost:PORT link would make it narrate a broken URL to the user.
+    return (
+        "Chart rendered in the preview panel. Do NOT mention any URL or link — "
+        "just briefly describe what the chart shows."
+    )
 
 
 def _build_state_modifier(state) -> list:

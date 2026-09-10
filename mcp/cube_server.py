@@ -72,6 +72,27 @@ async def get_cube_metadata() -> str:
     return "\n".join(lines) if lines else "No cubes available."
 
 
+def _inline_sql_params(sql: str, params: list) -> str:
+    """
+    Replace $1, $2, ... placeholders in a Cube SQL string with the actual
+    parameter values so the displayed SQL is directly runnable/readable.
+    Strings are single-quoted (with '' escaping); numbers/bools are inlined raw.
+    Replaces higher indices first so $1 doesn't clobber $10.
+    """
+    def render(v) -> str:
+        if v is None:
+            return "NULL"
+        if isinstance(v, bool):
+            return "TRUE" if v else "FALSE"
+        if isinstance(v, (int, float)):
+            return str(v)
+        return "'" + str(v).replace("'", "''") + "'"
+
+    for i in range(len(params), 0, -1):
+        sql = sql.replace(f"${i}", render(params[i - 1]))
+    return sql
+
+
 @mcp.tool()
 async def query_cube(
     measures: list[str],
@@ -125,9 +146,13 @@ async def query_cube(
     sql = ""
     if not isinstance(sql_result, Exception):
         try:
-            sql = sql_result["sql"]["sql"][0]
-        except (KeyError, IndexError, TypeError):
-            pass
+            raw_sql, params = sql_result["sql"]["sql"]
+            sql = _inline_sql_params(raw_sql, params)
+        except (KeyError, IndexError, TypeError, ValueError):
+            try:
+                sql = sql_result["sql"]["sql"][0]
+            except (KeyError, IndexError, TypeError):
+                pass
 
     return json.dumps(
         {"data": result.get("data", []), "annotation": result.get("annotation", {}), "sql": sql},

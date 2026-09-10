@@ -1,0 +1,9 @@
+# Test / development dependencies (app deps already live in agent/requirements.txt,
+# library/requirements.txt and mcp/requirements.txt).
+#
+# Install into the root .venv used by `make install`:
+#     .venv/bin/pip install -r requirements-dev.txt
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pg8000==1.31.5           # pure-Python Postgres driver — no compiler needed (Py 3.14 friendly)
+testcontainers==4.15.0   # disposable Postgres for the e2e test (needs a running Docker daemon)

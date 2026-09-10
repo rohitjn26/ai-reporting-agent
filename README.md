@@ -93,6 +93,31 @@ Makefile
 | `make down` | Stop all services and remove volumes |
 | `make logs` | Tail all service logs |
 | `make ps` | Show service status and ports |
+| `make test` | Run the full test suite (unit + e2e) |
+| `make test-unit` | Run fast unit tests only (no Docker) |
+| `make test-e2e` | Run the end-to-end test (disposable Postgres via Docker) |
+
+---
+
+## Testing
+
+Test dependencies live in `requirements-dev.txt`; install them into the same venv `make install` created:
+
+```bash
+make install-dev          # pytest, pytest-asyncio, pg8000, testcontainers
+make test-unit            # fast, no Docker
+make test                 # unit + e2e (e2e needs a running Docker daemon)
+```
+
+- **Unit tests** (`tests/unit/`) cover pure logic with no external services: the Chart.js/HTML
+  renderer, agent model routing and prompt merging, Cube SQL parameter inlining, cube-config
+  field validation, and the interactive config-editor's form parsing (network + `interrupt`
+  are mocked).
+- **End-to-end test** (`tests/e2e/`) is self-contained: it spins up a throwaway Postgres via
+  [testcontainers](https://testcontainers.com/), runs the FastAPI library app against it, points
+  the library MCP tools at that live server, and drives the full
+  create → preview → commit → delete config lifecycle — no mocks, no dev-stack dependency. It
+  skips automatically if Docker is unavailable.
 
 ---
 

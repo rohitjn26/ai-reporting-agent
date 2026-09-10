@@ -1,4 +1,4 @@
-.PHONY: up down seed agent logs ps install
+.PHONY: up down seed agent logs ps install install-dev test test-unit test-e2e
 
 # Start the full stack (postgres, cube, library, MCP servers)
 up:
@@ -40,6 +40,22 @@ agent:
 install:
 	python3 -m venv .venv
 	.venv/bin/pip install -r agent/requirements.txt
+
+# Install test/dev dependencies into the same venv
+install-dev:
+	.venv/bin/pip install -r requirements-dev.txt
+
+# Run the full test suite (unit + e2e). The e2e test needs a running Docker daemon.
+test:
+	.venv/bin/python -m pytest
+
+# Fast unit tests only — no Docker required.
+test-unit:
+	.venv/bin/python -m pytest tests/unit
+
+# End-to-end test only (spins up a disposable Postgres via Docker).
+test-e2e:
+	.venv/bin/python -m pytest -m e2e
 
 # Run the web UI (activates venv automatically)
 ui:

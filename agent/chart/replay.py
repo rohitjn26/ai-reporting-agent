@@ -50,6 +50,44 @@ def row_key(member: str, cube_query: dict) -> str:
     return member
 
 
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _granularity_of(member: str, cube_query: dict):
+    """The granularity a time dimension was queried at, or None if not a time dim."""
+    for td in cube_query.get("time_dimensions", []):
+        if td.get("dimension") == member:
+            return td.get("granularity")
+    return None
+
+
+def format_time_value(val, granularity):
+    """Turn Cube's raw ISO timestamp into a compact axis label per granularity,
+    e.g. "2024-01-01T00:00:00.000" + "month" -> "Jan 2024". Non-time or
+    unparseable values pass through unchanged."""
+    if not granularity or not isinstance(val, str):
+        return val
+    parts = val[:10].split("-")
+    if len(parts) != 3:
+        return val
+    y, m, d = parts
+    try:
+        mi = int(m)
+    except ValueError:
+        return val
+    if granularity == "year":
+        return y
+    if granularity == "quarter":
+        return f"{y} Q{(mi - 1) // 3 + 1}"
+    if granularity == "month":
+        return f"{_MONTHS[mi - 1]} {y}" if 1 <= mi <= 12 else val
+    if granularity in ("week", "day"):
+        return val[:10]
+    # hour/minute/second — keep date + HH:MM
+    return f"{val[:10]} {val[11:16]}".strip() if len(val) >= 16 else val[:10]
+
+
 def member_title(member: str, annotation: dict) -> str:
     """Human label for a member, from Cube's annotation (falls back to the member name)."""
     for section in ("measures", "dimensions", "timeDimensions"):
@@ -71,7 +109,8 @@ def apply_mapping(rows: list[dict], annotation: dict, mapping: dict,
     measures   = mapping.get("series_measures") or []
     series_dim = mapping.get("series_dimension")
 
-    label_key = row_key(label_dim, cube_query)
+    label_key  = row_key(label_dim, cube_query)
+    label_gran = _granularity_of(label_dim, cube_query)
 
     def _ordered_distinct(key):
         out = []
@@ -82,19 +121,22 @@ def apply_mapping(rows: list[dict], annotation: dict, mapping: dict,
         return out
 
     if series_dim:
-        series_key = row_key(series_dim, cube_query)
-        labels     = _ordered_distinct(label_key)
+        series_key  = row_key(series_dim, cube_query)
+        series_gran = _granularity_of(series_dim, cube_query)
+        labels_raw  = _ordered_distinct(label_key)   # match cells on raw values
+        labels      = [format_time_value(v, label_gran) for v in labels_raw]
         series_vals = _ordered_distinct(series_key)
         # Index cells by (label, series) for O(1) lookup per measure.
         datasets = []
         for m in measures:
             cell = {(r.get(label_key), r.get(series_key)): _num(r.get(m)) for r in rows}
             for sv in series_vals:
-                name = str(sv) if len(measures) == 1 else f"{sv} · {member_title(m, annotation)}"
-                datasets.append({"label": name, "data": [cell.get((lbl, sv)) for lbl in labels]})
+                sv_label = format_time_value(sv, series_gran)
+                name = str(sv_label) if len(measures) == 1 else f"{sv_label} · {member_title(m, annotation)}"
+                datasets.append({"label": name, "data": [cell.get((lbl, sv)) for lbl in labels_raw]})
         return labels, datasets
 
-    labels = [r.get(label_key) for r in rows]
+    labels = [format_time_value(r.get(label_key), label_gran) for r in rows]
     datasets = [
         {"label": member_title(m, annotation), "data": [_num(r.get(m)) for r in rows]}
         for m in measures
@@ -112,7 +154,11 @@ def build_table_grid(rows: list[dict], annotation: dict,
 
     columns = [member_title(m, annotation) for m in members]
     keys    = [row_key(m, cube_query) for m in members]
-    grid    = [[r.get(k) for k in keys] for r in rows]
+    grans   = [_granularity_of(m, cube_query) for m in members]
+    grid    = [
+        [format_time_value(r.get(k), g) if g else r.get(k) for k, g in zip(keys, grans)]
+        for r in rows
+    ]
     return columns, grid
 
 

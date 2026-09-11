@@ -1,4 +1,4 @@
-.PHONY: up down seed agent logs ps install
+.PHONY: up down seed agent logs ps install db
 
 # Start the full stack (postgres, cube, library, MCP servers)
 up:
@@ -45,6 +45,10 @@ install:
 ui:
 	ANTHROPIC_API_KEY=$$(grep ANTHROPIC_API_KEY agent/.env | cut -d= -f2) \
 	  .venv/bin/python agent/ui.py
+
+# Open a psql shell on the library DB (cube configs, saved graphs, dashboards)
+db:
+	docker compose exec library-db psql -U postgres -d library
 
 # Tail logs from all services
 logs:

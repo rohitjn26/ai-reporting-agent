@@ -87,11 +87,12 @@ def test_pivot_missing_cell_is_none():
     assert by_label["UK"] == [2, None]
 
 
-def test_time_dimension_granularity_key_resolution():
-    # A time dimension queried with granularity comes back suffixed in the row.
+def test_time_dimension_granularity_key_resolution_and_formatting():
+    # A time dimension queried with granularity comes back suffixed AND as a full
+    # ISO timestamp — the key must resolve and the label must be formatted compactly.
     rows = [
-        {"orders.created_at.month": "2026-01", "orders.count": "5"},
-        {"orders.created_at.month": "2026-02", "orders.count": "8"},
+        {"orders.created_at.month": "2026-01-01T00:00:00.000", "orders.count": "5"},
+        {"orders.created_at.month": "2026-02-01T00:00:00.000", "orders.count": "8"},
     ]
     mapping = {"label_dimension": "orders.created_at", "series_measures": ["orders.count"]}
     cq = {
@@ -100,8 +101,20 @@ def test_time_dimension_granularity_key_resolution():
     }
 
     labels, datasets = replay.apply_mapping(rows, {}, mapping, cq)
-    assert labels == ["2026-01", "2026-02"]
+    assert labels == ["Jan 2026", "Feb 2026"]
     assert datasets[0]["data"] == [5, 8]
+
+
+def test_format_time_value_by_granularity():
+    iso = "2024-03-15T00:00:00.000"
+    assert replay.format_time_value(iso, "year") == "2024"
+    assert replay.format_time_value(iso, "quarter") == "2024 Q1"
+    assert replay.format_time_value(iso, "month") == "Mar 2024"
+    assert replay.format_time_value(iso, "day") == "2024-03-15"
+    assert replay.format_time_value(iso, "week") == "2024-03-15"
+    # non-time / no granularity passes through untouched
+    assert replay.format_time_value("USA", None) == "USA"
+    assert replay.format_time_value(42, "month") == 42
 
 
 # ── build_table_grid ──────────────────────────────────────────────────────────

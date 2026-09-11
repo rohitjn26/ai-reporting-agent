@@ -70,6 +70,36 @@ def chart():
     return _chart_server._current_html
 
 
+def _replay_error_page(kind: str, err: str) -> str:
+    return (
+        "<!DOCTYPE html><html><body style='font-family:system-ui;background:#f8fafc;"
+        "padding:40px;color:#b91c1c'>"
+        f"<h2>Couldn't render {kind}</h2><pre style='white-space:pre-wrap'>{err}</pre>"
+        "<p style='color:#64748b'>Is Cube running? Live rendering re-queries data on every load.</p>"
+        "</body></html>"
+    )
+
+
+@app.get("/graph/{graph_id}", response_class=HTMLResponse)
+async def graph(graph_id: str):
+    """Replay a saved GRAPH live (fresh data) and serve it as a standalone page."""
+    from chart.replay import render_graph_by_id
+    try:
+        return await render_graph_by_id(graph_id)
+    except Exception as e:
+        return _replay_error_page("graph", str(e))
+
+
+@app.get("/dashboard/{dashboard_id}", response_class=HTMLResponse)
+async def dashboard(dashboard_id: str):
+    """Replay a saved DASHBOARD live — every tile re-queried on each load."""
+    from chart.replay import render_dashboard_by_id
+    try:
+        return await render_dashboard_by_id(dashboard_id)
+    except Exception as e:
+        return _replay_error_page("dashboard", str(e))
+
+
 def _sse_headers():
     return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -148,6 +178,24 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None):
                         yield f"data: {json.dumps({'type': 'sql', 'sql': pending_sql})}\n\n"
                         pending_sql = None
                     yield f"data: {json.dumps({'type': 'chart', 'url': '/chart'})}\n\n"
+                # Render a saved graph or dashboard live in the preview panel.
+                # The tool output is the created/fetched resource JSON (has "id").
+                if name in ("create_dashboard", "get_dashboard_detail") and not error:
+                    try:
+                        parsed = json.loads(output_text)
+                        rid = parsed.get("id")
+                        if rid:
+                            yield f"data: {json.dumps({'type': 'dashboard', 'url': f'/dashboard/{rid}'})}\n\n"
+                    except Exception:
+                        pass
+                if name == "get_graph_detail" and not error:
+                    try:
+                        parsed = json.loads(output_text)
+                        rid = parsed.get("id")
+                        if rid:
+                            yield f"data: {json.dumps({'type': 'chart', 'url': f'/graph/{rid}'})}\n\n"
+                    except Exception:
+                        pass
 
     except Exception as e:
         err_text = str(e)
@@ -856,6 +904,14 @@ _HTML = """<!DOCTYPE html>
     get_cube_metadata:          '📐',
     query_cube:                 '⚡',
     create_chart:               '🎨',
+    save_graph:                 '💾',
+    list_graphs:                '🖼️',
+    get_graph_detail:           '🖼️',
+    delete_graph:               '🗑️',
+    create_dashboard:           '📊',
+    list_dashboards:            '📊',
+    get_dashboard_detail:       '📊',
+    delete_dashboard:           '🗑️',
   };
 
   function addToolBadge(name, runId) {
@@ -1410,6 +1466,17 @@ _HTML = """<!DOCTYPE html>
         link.href = d.url; link.target = '_blank';
         link.className = 'chart-link';
         link.innerHTML = '📊 View chart →';
+        const lw = document.createElement('div');
+        lw.className = 'msg agent'; lw.appendChild(link);
+        messagesEl.appendChild(lw); scrollBottom();
+
+      } else if (d.type === 'dashboard') {
+        finalizeAgentText();
+        showChart(d.url);
+        const link = document.createElement('a');
+        link.href = d.url; link.target = '_blank';
+        link.className = 'chart-link';
+        link.innerHTML = '📊 Open dashboard →';
         const lw = document.createElement('div');
         lw.className = 'msg agent'; lw.appendChild(link);
         messagesEl.appendChild(lw); scrollBottom();

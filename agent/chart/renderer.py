@@ -91,14 +91,9 @@ def _grid_from_chart_shape(labels: list, datasets: list) -> tuple[list, list]:
     return columns, rows
 
 
-def _render_table(labels: list, datasets: list, title: str,
-                  columns: list | None = None, rows: list | None = None) -> str:
-    # Prefer an explicit columns/rows grid; fall back to chart-shaped data.
-    if rows:
-        columns = columns or [f"Column {i+1}" for i in range(len(rows[0]))]
-    else:
-        columns, rows = _grid_from_chart_shape(labels, datasets)
-
+def table_element_html(columns: list, rows: list) -> str:
+    """Return just the <table>…</table> markup for a columns/rows grid.
+    Shared by the standalone table page and the dashboard tile renderer."""
     headers_html = "".join(f"<th>{_esc(h)}</th>" for h in columns)
     rows_html = ""
     for row in rows:
@@ -107,6 +102,18 @@ def _render_table(labels: list, datasets: list, title: str,
             for j, v in enumerate(row)
         )
         rows_html += f"<tr>{cells}</tr>"
+    return f"<table><thead><tr>{headers_html}</tr></thead><tbody>{rows_html}</tbody></table>"
+
+
+def _render_table(labels: list, datasets: list, title: str,
+                  columns: list | None = None, rows: list | None = None) -> str:
+    # Prefer an explicit columns/rows grid; fall back to chart-shaped data.
+    if rows:
+        columns = columns or [f"Column {i+1}" for i in range(len(rows[0]))]
+    else:
+        columns, rows = _grid_from_chart_shape(labels, datasets)
+
+    table_html = table_element_html(columns, rows)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -134,15 +141,61 @@ def _render_table(labels: list, datasets: list, title: str,
 <body>
   {f"<h1>{title}</h1>" if title else ""}
   <div class="table-wrap">
-    <table>
-      <thead><tr>{headers_html}</tr></thead>
-      <tbody>{rows_html}</tbody>
-    </table>
+    {table_html}
   </div>
   {_dl_button_html()}
   {_csv_grid_script(columns, rows, title)}
 </body>
 </html>"""
+
+
+def build_chart_config(
+    chart_type: str,
+    labels: list[str],
+    datasets: list[dict[str, Any]],
+    title: str = "",
+    fill_container: bool = False,
+) -> dict:
+    """Build the Chart.js config object (type/data/options) for a bar/line/pie/doughnut
+    chart. Shared by the standalone chart page and the dashboard tile renderer.
+
+    fill_container=True sets maintainAspectRatio:false so the chart fills a
+    fixed-height parent (dashboard tiles); the standalone page keeps the default
+    aspect-ratio sizing."""
+    enriched = []
+    for i, ds in enumerate(datasets):
+        bg, border = _color(i)
+        enriched.append({
+            "label":           ds.get("label", f"Series {i+1}"),
+            "data":            ds.get("data", []),
+            "backgroundColor": bg   if chart_type in ("pie", "doughnut") else _CHART_COLORS,
+            "borderColor":     border if chart_type in ("pie", "doughnut") else _BORDER_COLORS,
+            "borderWidth":     1,
+            "fill":            chart_type == "line",
+            **{k: v for k, v in ds.items() if k not in ("label", "data")},
+        })
+
+    return {
+        "type": chart_type,
+        "data": {
+            "labels":   labels,
+            "datasets": enriched,
+        },
+        "options": {
+            "responsive": True,
+            "maintainAspectRatio": not fill_container,
+            "plugins": {
+                "legend":  {"position": "top"},
+                "title":   {"display": bool(title), "text": title},
+                "tooltip": {"mode": "index"},
+            },
+            **(
+                {"scales": {"x": {"stacked": False}, "y": {"beginAtZero": True}}}
+                if chart_type in ("bar", "line")
+                else {}
+            ),
+        },
+    }
 
 
 def render_chart(
@@ -167,41 +220,7 @@ def render_chart(
     if chart_type == "table":
         return _render_table(labels, datasets, title, columns, rows)
 
-    enriched = []
-    for i, ds in enumerate(datasets):
-        bg, border = _color(i)
-        enriched.append({
-            "label":           ds.get("label", f"Series {i+1}"),
-            "data":            ds.get("data", []),
-            "backgroundColor": bg   if chart_type in ("pie", "doughnut") else _CHART_COLORS,
-            "borderColor":     border if chart_type in ("pie", "doughnut") else _BORDER_COLORS,
-            "borderWidth":     1,
-            "fill":            chart_type == "line",
-            **{k: v for k, v in ds.items() if k not in ("label", "data")},
-        })
-
-    chart_config = {
-        "type": chart_type,
-        "data": {
-            "labels":   labels,
-            "datasets": enriched,
-        },
-        "options": {
-            "responsive": True,
-            "plugins": {
-                "legend":  {"position": "top"},
-                "title":   {"display": bool(title), "text": title},
-                "tooltip": {"mode": "index"},
-            },
-            **(
-                {"scales": {"x": {"stacked": False}, "y": {"beginAtZero": True}}}
-                if chart_type in ("bar", "line")
-                else {}
-            ),
-        },
-    }
-
-    config_json = json.dumps(chart_config, default=str)
+    config_json = json.dumps(build_chart_config(chart_type, labels, datasets, title), default=str)
 
     return f"""<!DOCTYPE html>
 <html lang="en">

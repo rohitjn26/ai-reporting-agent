@@ -70,18 +70,52 @@ def chart():
     return _chart_server._current_html
 
 
+def _replay_error_page(kind: str, err: str) -> str:
+    return (
+        "<!DOCTYPE html><html><body style='font-family:system-ui;background:#f8fafc;"
+        "padding:40px;color:#b91c1c'>"
+        f"<h2>Couldn't render {kind}</h2><pre style='white-space:pre-wrap'>{err}</pre>"
+        "<p style='color:#64748b'>Is Cube running? Live rendering re-queries data on every load.</p>"
+        "</body></html>"
+    )
+
+
+@app.get("/graph/{graph_id}", response_class=HTMLResponse)
+async def graph(graph_id: str):
+    """Replay a saved GRAPH live (fresh data) and serve it as a standalone page."""
+    from chart.replay import render_graph_by_id
+    try:
+        return await render_graph_by_id(graph_id)
+    except Exception as e:
+        return _replay_error_page("graph", str(e))
+
+
+@app.get("/dashboard/{dashboard_id}", response_class=HTMLResponse)
+async def dashboard(dashboard_id: str):
+    """Replay a saved DASHBOARD live — every tile re-queried on each load."""
+    from chart.replay import render_dashboard_by_id
+    try:
+        return await render_dashboard_by_id(dashboard_id)
+    except Exception as e:
+        return _replay_error_page("dashboard", str(e))
+
+
 def _sse_headers():
     return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
-async def _stream_agent(request: Request, input_, thread_id: str, agent=None):
+async def _stream_agent(request: Request, input_, thread_id: str, agent=None, model_name=None):
     """
     Core SSE generator — drives the agent, emits typed events, detects interrupts.
     `input_` is either {"messages": [...]} for new turns or Command(resume=...) for resumes.
+    `model_name` (if given) is surfaced to the UI so it can badge which model handled the turn.
     """
     if agent is None:
         agent = _agent
     config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+    # Tell the UI which model is handling this turn (routed Haiku vs Sonnet).
+    if model_name:
+        yield f"data: {json.dumps({'type': 'model', 'model': model_name})}\n\n"
     # SQL of the most recent query_cube — only surfaced when it feeds a chart,
     # so intermediate/exploratory queries don't clutter the UI with SQL.
     pending_sql = None
@@ -148,6 +182,24 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None):
                         yield f"data: {json.dumps({'type': 'sql', 'sql': pending_sql})}\n\n"
                         pending_sql = None
                     yield f"data: {json.dumps({'type': 'chart', 'url': '/chart'})}\n\n"
+                # Render a saved graph or dashboard live in the preview panel.
+                # The tool output is the created/fetched resource JSON (has "id").
+                if name in ("create_dashboard", "get_dashboard_detail") and not error:
+                    try:
+                        parsed = json.loads(output_text)
+                        rid = parsed.get("id")
+                        if rid:
+                            yield f"data: {json.dumps({'type': 'dashboard', 'url': f'/dashboard/{rid}'})}\n\n"
+                    except Exception:
+                        pass
+                if name == "get_graph_detail" and not error:
+                    try:
+                        parsed = json.loads(output_text)
+                        rid = parsed.get("id")
+                        if rid:
+                            yield f"data: {json.dumps({'type': 'chart', 'url': f'/graph/{rid}'})}\n\n"
+                    except Exception:
+                        pass
 
     except Exception as e:
         err_text = str(e)
@@ -203,7 +255,8 @@ async def chat_stream(request: Request, message: str, thread_id: str = "default"
     model_name = "sonnet" if set(message.lower().split()) & _CONFIG_VERBS else "haiku"
     print(f"[routing] model={model_name}  thread={thread_id}  msg={message[:80]!r}")
     return StreamingResponse(
-        _stream_agent(request, {"messages": [HumanMessage(content=message)]}, thread_id, agent=routed),
+        _stream_agent(request, {"messages": [HumanMessage(content=message)]}, thread_id,
+                      agent=routed, model_name=model_name),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -213,7 +266,7 @@ async def chat_stream(request: Request, message: str, thread_id: str = "default"
 async def resume_stream(request: Request, answer: str, thread_id: str = "default"):
     """SSE — resume after the user answers an interrupt question. Always uses Sonnet (config flow)."""
     return StreamingResponse(
-        _stream_agent(request, Command(resume=answer), thread_id, agent=_agent),
+        _stream_agent(request, Command(resume=answer), thread_id, agent=_agent, model_name="sonnet"),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -389,6 +442,22 @@ _HTML = """<!DOCTYPE html>
     .tool-badge .badge-ok   { color: #22c55e; font-size: 0.75rem; line-height: 1; }
     .tool-badge .badge-err  { color: #f87171; font-size: 0.75rem; line-height: 1; }
     .tool-badge .badge-warn { color: #f59e0b; font-size: 0.75rem; line-height: 1; }
+    .model-chip {
+      align-self: flex-start;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 0.66rem;
+      font-weight: 600;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+      border-radius: 999px;
+      padding: 2px 9px;
+      margin: 2px 0;
+    }
+    .model-chip.sonnet { color: #c4b5fd; background: #2e1065; border: 1px solid #6d28d9; }
+    .model-chip.haiku  { color: #7dd3fc; background: #0c2a3a; border: 1px solid #0369a1; }
+
     .tool-badge.done        { color: #64748b; border-color: #1e293b; }
     .tool-badge.errored     { color: #f87171; border-color: #7f1d1d; background: #1c0a0a; }
     .tool-badge.timed-out   { color: #f59e0b; border-color: #78350f; background: #1c1200; }
@@ -831,6 +900,18 @@ _HTML = """<!DOCTYPE html>
     return bubble;
   }
 
+  function addModelChip(model) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg agent';
+    const chip = document.createElement('div');
+    const known = model === 'sonnet' || model === 'haiku';
+    chip.className = 'model-chip ' + (known ? model : 'haiku');
+    chip.innerHTML = (model === 'sonnet' ? '✦' : '⚡') + ' ' + model;
+    wrap.appendChild(chip);
+    messagesEl.appendChild(wrap);
+    scrollBottom();
+  }
+
   function addTyping() {
     const wrap = document.createElement('div');
     wrap.className = 'msg agent';
@@ -856,6 +937,14 @@ _HTML = """<!DOCTYPE html>
     get_cube_metadata:          '📐',
     query_cube:                 '⚡',
     create_chart:               '🎨',
+    save_graph:                 '💾',
+    list_graphs:                '🖼️',
+    get_graph_detail:           '🖼️',
+    delete_graph:               '🗑️',
+    create_dashboard:           '📊',
+    list_dashboards:            '📊',
+    get_dashboard_detail:       '📊',
+    delete_dashboard:           '🗑️',
   };
 
   function addToolBadge(name, runId) {
@@ -1381,7 +1470,10 @@ _HTML = """<!DOCTYPE html>
     es.onmessage = (e) => {
       const d = JSON.parse(e.data);
 
-      if (d.type === 'token') {
+      if (d.type === 'model') {
+        addModelChip(d.model);
+
+      } else if (d.type === 'token') {
         if (firstToken) { typingEl.remove(); firstToken = false; }
         if (!agentBubble) { agentBubble = newBubble(); agentRaw = ''; }
         agentRaw += d.text;
@@ -1410,6 +1502,17 @@ _HTML = """<!DOCTYPE html>
         link.href = d.url; link.target = '_blank';
         link.className = 'chart-link';
         link.innerHTML = '📊 View chart →';
+        const lw = document.createElement('div');
+        lw.className = 'msg agent'; lw.appendChild(link);
+        messagesEl.appendChild(lw); scrollBottom();
+
+      } else if (d.type === 'dashboard') {
+        finalizeAgentText();
+        showChart(d.url);
+        const link = document.createElement('a');
+        link.href = d.url; link.target = '_blank';
+        link.className = 'chart-link';
+        link.innerHTML = '📊 Open dashboard →';
         const lw = document.createElement('div');
         lw.className = 'msg agent'; lw.appendChild(link);
         messagesEl.appendChild(lw); scrollBottom();

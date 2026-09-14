@@ -41,8 +41,10 @@ so one file grades both query construction and `save_graph` mapping.
 
 | File | What |
 |---|---|
-| `generate.py` | Build cases from live metadata → `generated_queries.jsonl` |
-| `grading.py`  | Pure structural graders + the "no hallucinated fields" invariant |
+| `generate.py`   | Build cases from live metadata → `generated_queries.jsonl` |
+| `paraphrase.py` | LLM reword of title cases into natural phrasings (opt-in) |
+| `grading.py`    | Pure structural graders + the "no hallucinated fields" invariant |
+| `run.py`        | Drive the live agent over cases and score it per aspect/template |
 
 `generated_queries.jsonl` is a build artifact (git-ignored) — regenerate it.
 
@@ -63,12 +65,33 @@ python evals/generate.py --paraphrase 3  # + 3 LLM paraphrases per title case
 - `grade_chart_type` / `grade_mapping` — chart type is acceptable; save_graph
   mapping matches.
 
-## The runner (next)
+## The runner (`run.py`)
 
-Not built yet. It will: load the cases, drive the real agent per prompt, extract
-the actual `query_cube` / `create_chart` / `save_graph` tool calls from the
-`astream_events` trajectory, and grade them with `grading.py`. Report pass-rate
-**per template** (not one blended number) so you can see *where* it breaks when
-you change a prompt or swap models. Because it calls the live LLM, it runs
-separately from unit tests (money + non-determinism), not in the fast CI path.
+Loads the cases, drives the real agent per prompt (routed exactly like production
+via `pick_agent`), extracts the actual `query_cube` / `create_chart` / `save_graph`
+tool calls from the `astream_events` trajectory, and grades them with `grading.py`.
+Reports pass-rate **per aspect × per template/source** — not one blended number —
+so you see *where* it breaks when you change a prompt or swap models.
+
+```bash
+make eval                                  # sample of 20 cases (regenerates first)
+make eval ARGS="--limit 0"                 # all cases
+make eval ARGS="--templates pivot top_n"   # focus on the hard ones
+make eval ARGS="--source llm_paraphrase"   # robustness on natural phrasing
+python evals/run.py --out evals/eval_results.json   # save per-case detail
+```
+
+It calls the live LLM (money + non-determinism) and needs the stack up +
+`ANTHROPIC_API_KEY`, so it is **not** part of the fast unit suite / CI.
+
+### Aspects scored
+
+- `query`   — last `query_cube` args vs the case's expected query
+- `members` — no hallucinated fields (invariant; any schema)
+- `chart`   — `create_chart` type is acceptable (only when a chart was made)
+- `mapping` — `save_graph` mapping matches (only when a graph was saved)
+
+`chart`/`mapping` are only scored when the agent actually took that action; plain
+"X by Y" prompts usually stop at the query (the agent asks which chart type), so
+those columns show `—` unless the prompt drives a chart/save.
 ```

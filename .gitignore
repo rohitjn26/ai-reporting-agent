@@ -31,3 +31,4 @@ Thumbs.db
 
 # Generated eval cases (rebuild with evals/generate.py)
 evals/generated_*.jsonl
+evals/eval_results.json

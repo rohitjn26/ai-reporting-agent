@@ -28,3 +28,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Generated eval cases (rebuild with evals/generate.py)
+evals/generated_*.jsonl

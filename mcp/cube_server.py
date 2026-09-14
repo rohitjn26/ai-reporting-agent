@@ -59,16 +59,27 @@ async def get_cube_metadata() -> str:
     data = await _cube_get("/cubejs-api/v1/meta")
     cubes = data.get("cubes", [])
     lines = []
+
+    def _fmt(member: dict) -> str:
+        # Descriptions carry synonyms/meaning — critical for mapping NL to the
+        # right field, so always surface them when present.
+        base = f"    {member['name']}  type={member['type']}  title={member.get('title','')}"
+        desc = member.get("description")
+        return f"{base}\n        desc: {desc}" if desc else base
+
     for c in cubes:
-        lines.append(f"\nCube: {c['name']}")
+        header = f"\nCube: {c['name']}"
+        if c.get("description"):
+            header += f"  — {c['description']}"
+        lines.append(header)
         if c.get("measures"):
             lines.append("  Measures:")
             for m in c["measures"]:
-                lines.append(f"    {m['name']}  type={m['type']}  title={m.get('title','')}")
+                lines.append(_fmt(m))
         if c.get("dimensions"):
             lines.append("  Dimensions:")
             for d in c["dimensions"]:
-                lines.append(f"    {d['name']}  type={d['type']}  title={d.get('title','')}")
+                lines.append(_fmt(d))
     return "\n".join(lines) if lines else "No cubes available."
 
 

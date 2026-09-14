@@ -8,9 +8,11 @@ and you already know the correct answer because you built the prompt from that
 exact field. Swap in entirely different data tomorrow and the generator produces
 new, correct cases with no code changes — just re-run it.
 
-Two prompt sources per case:
-  - "title"   : literal, built from the field's title      (tests the easy mapping)
-  - "synonym" : built from a synonym in the description    (tests robustness)
+Prompt sources per case:
+  - "title"         : literal, built from the field's title       (easy mapping)
+  - "synonym"       : built from a synonym in the description     (robustness)
+  - "llm_paraphrase": natural rewording from an LLM (opt-in, see paraphrase.py;
+                      the expected query is COPIED, so cases stay auto-labelled)
 
 Cases carry both the expected Cube query AND the expected chart mapping, so the
 same file can grade query construction and save_graph mapping later.
@@ -160,14 +162,34 @@ def generate_cases(cubes: list[dict], *, max_synonyms: int = 2) -> list[dict]:
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
+def _dedupe(cases: list[dict]) -> list[dict]:
+    seen, out = set(), []
+    for c in cases:
+        key = (c["cube"], c["template"], c["prompt"])
+        if key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "generated_queries.jsonl"))
     ap.add_argument("--print", dest="do_print", action="store_true", help="print cases instead of writing")
+    ap.add_argument("--paraphrase", type=int, default=0, metavar="N",
+                    help="add N LLM paraphrases per title case (needs ANTHROPIC_API_KEY; 0=off)")
+    ap.add_argument("--paraphrase-model", default=None, help="override the paraphrase model id")
     args = ap.parse_args()
 
     cubes = fetch_metadata()
     cases = generate_cases(cubes)
+
+    if args.paraphrase > 0:
+        import paraphrase
+        kw = {"model": args.paraphrase_model} if args.paraphrase_model else {}
+        extra = paraphrase.paraphrase_cases(cases, n=args.paraphrase, **kw)
+        cases = _dedupe(cases + extra)
+        print(f"Added {len(extra)} LLM paraphrase case(s).")
 
     by_template: dict[str, int] = {}
     for c in cases:

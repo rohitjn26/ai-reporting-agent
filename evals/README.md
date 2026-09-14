@@ -22,6 +22,18 @@ cases, no code changes. The synonym prompts test whether the agent maps oblique
 language ("sales", "earnings") onto the right field — the actual hard skill —
 and they're auto-labelled because the label came from the schema.
 
+### LLM paraphrases (opt-in, `paraphrase.py`)
+
+Synonyms cover the words *you* wrote into descriptions. To test genuinely messy,
+real-user phrasing, `--paraphrase N` asks an LLM to reword each `title` case into
+N natural variants ("which countries make us the most money?"). The safety
+property: **the LLM only rewrites the wording — the expected query/mapping is
+copied from the base case**, so paraphrases stay auto-labelled. Only
+title-sourced `single_measure`/`measure_by_dimension`/`measure_over_time` cases
+are paraphrased; `top_n`/`pivot` hinge on qualifiers ("top 5", "split by") a
+rewrite might drop, which would invalidate the copied label. Paraphrases are a
+notch lower-trust than title/synonym cases — spot-check them.
+
 Each case carries the expected **Cube query** and the expected **chart mapping**,
 so one file grades both query construction and `save_graph` mapping.
 
@@ -37,8 +49,9 @@ so one file grades both query construction and `save_graph` mapping.
 ## Usage
 
 ```bash
-python evals/generate.py            # writes evals/generated_queries.jsonl
-python evals/generate.py --print    # print cases, don't write
+python evals/generate.py                 # deterministic: title + synonym cases
+python evals/generate.py --print         # print cases, don't write
+python evals/generate.py --paraphrase 3  # + 3 LLM paraphrases per title case
 ```
 
 ## Grading (portable by construction)

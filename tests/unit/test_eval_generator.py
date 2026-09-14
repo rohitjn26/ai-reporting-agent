@@ -1,4 +1,5 @@
 """Offline tests for the eval generator + graders (no Cube, no LLM)."""
+import json
 import sys
 from pathlib import Path
 
@@ -7,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "evals"))
 
 import generate
 import grading
+import paraphrase
 
 
 # A tiny fake /meta payload — the generator must work off whatever schema it's given.
@@ -140,3 +142,46 @@ def test_grade_mapping_normalizes_series_dimension_null():
 def test_grade_chart_type_membership():
     assert grading.grade_chart_type("bar", ["bar", "table"])["passed"]
     assert grading.grade_chart_type("pie", ["bar", "table"])["passed"] is False
+
+
+# ── LLM paraphrase layer (fake LLM — no network) ──────────────────────────────
+
+def test_paraphrase_copies_label_and_tags_source():
+    base = generate.generate_cases(FAKE_META)
+    fake = lambda prompt, n: [f"rephrased: {prompt}", "which countries make the most money?"]
+    extra = paraphrase.paraphrase_cases(base, n=2, generate_fn=fake)
+
+    assert extra, "should produce paraphrase cases"
+    for c in extra:
+        assert c["source"] == "llm_paraphrase"
+        # the LLM only reworded — the expected query is copied from a real base case
+        assert c["expected"]["measures"] == ["orders.total_revenue"] or c["cube"] != "orders" \
+            or c["template"] == "single_measure"
+    # a known paraphrase string made it in
+    assert any("make the most money" in c["prompt"] for c in extra)
+
+
+def test_paraphrase_skips_top_n_and_pivot():
+    base = generate.generate_cases(FAKE_META)
+    fake = lambda prompt, n: ["x"]
+    extra = paraphrase.paraphrase_cases(base, n=1, generate_fn=fake)
+    assert all(c["template"] in paraphrase._PARAPHRASABLE for c in extra)
+    assert not any(c["template"] in ("top_n", "pivot") for c in extra)
+
+
+def test_paraphrase_only_expands_title_cases():
+    base = generate.generate_cases(FAKE_META)
+    fake = lambda prompt, n: ["x"]
+    extra = paraphrase.paraphrase_cases(base, n=1, generate_fn=fake)
+    # never paraphrase a synonym/paraphrase case (avoid drift-on-drift)
+    assert all(c["source"] == "llm_paraphrase" for c in extra)
+    # every paraphrase traces back to a title prompt's expected query
+    title_expecteds = [json.dumps(c["expected"], sort_keys=True)
+                       for c in base if c["source"] == "title"]
+    for c in extra:
+        assert json.dumps(c["expected"], sort_keys=True) in title_expecteds
+
+
+def test_parse_array_tolerates_prose_and_fallbacks():
+    assert paraphrase._parse_array('Sure! ["a", "b"]') == ["a", "b"]
+    assert paraphrase._parse_array("- one\n- two") == ["one", "two"]

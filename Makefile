@@ -1,4 +1,4 @@
-.PHONY: up down seed agent logs ps install install-dev test test-unit test-e2e db
+.PHONY: up down seed agent logs ps install install-dev test test-unit test-e2e db eval
 
 # Start the full stack (postgres, cube, library, MCP servers)
 up:
@@ -56,6 +56,14 @@ test-unit:
 # End-to-end test only (spins up a disposable Postgres via Docker).
 test-e2e:
 	.venv/bin/python -m pytest -m e2e
+
+# Agent evals — drive the live agent over schema-derived cases and score it.
+# Calls the LLM (costs money), needs the stack up + ANTHROPIC_API_KEY. Not in CI.
+eval:
+	ANTHROPIC_API_KEY=$$(grep ANTHROPIC_API_KEY agent/.env | cut -d= -f2) \
+	  .venv/bin/python evals/generate.py >/dev/null && \
+	ANTHROPIC_API_KEY=$$(grep ANTHROPIC_API_KEY agent/.env | cut -d= -f2) \
+	  .venv/bin/python evals/run.py $(ARGS)
 
 # Run the web UI (activates venv automatically)
 ui:

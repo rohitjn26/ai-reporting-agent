@@ -1,6 +1,7 @@
 """
 Generate architecture diagrams as SVG (rendered to PDF/PNG via rsvg-convert).
-Two diagrams: the agent system, and the eval harness. LLM calls are red.
+Three diagrams: the agent system, the eval harness, and the config-edit
+human-in-the-loop flow. LLM calls are red; human-in-the-loop pauses are amber.
 
 Run:  python docs/make_diagrams.py
 Then: rsvg-convert -f pdf -o docs/architecture_agent.pdf docs/architecture_agent.svg
@@ -15,6 +16,7 @@ STYLES = {
     "data":    ("#e5e7eb", "#4b5563"),   # datastore — gray
     "tool":    ("#dcfce7", "#16a34a"),   # tool/code — green
     "app":     ("#ede9fe", "#7c3aed"),   # app/entry — purple
+    "human":   ("#fef3c7", "#d97706"),   # human-in-the-loop pause — amber
     "lane":    ("#f8fafc", "#cbd5e1"),   # background lane
 }
 
@@ -115,6 +117,20 @@ class SVG:
                 f'<rect x="{x+12}" y="{yy}" width="16" height="14" rx="3" fill="{fill}" stroke="{stroke}" stroke-width="1.5"/>'
             )
             self.text(x + 36, yy + 12, lbl, size=11, anchor="start", color="#334155")
+
+    def sep(self, y, label, x0=110, x1=770):
+        """A dashed boundary line with a centered label — used for SSE stream breaks."""
+        self.parts.append(
+            f'<line x1="{x0}" y1="{y}" x2="{x1}" y2="{y}" stroke="#94a3b8" '
+            f'stroke-width="1.5" stroke-dasharray="4 4"/>'
+        )
+        cx = (x0 + x1) / 2
+        wpx = 8.6 * len(label)
+        self.parts.append(
+            f'<rect x="{cx - wpx/2 - 8}" y="{y - 11}" width="{wpx + 16}" height="22" rx="6" '
+            f'fill="white" stroke="#f59e0b"/>'
+        )
+        self.text(cx, y + 4, label, size=11, weight="bold", color="#b45309", italic=True)
 
     def render(self):
         defs = (
@@ -230,9 +246,68 @@ def eval_diagram():
     return s.render()
 
 
+# ── Diagram 3: config-edit human-in-the-loop ─────────────────────────────────
+def config_edit_diagram():
+    s = SVG(1150, 940, "Config-Edit — Human-in-the-Loop Flow")
+    s.legend(920, 66, [
+        ("llm", "LLM call (red badge)"),
+        ("human", "human decision (pause)"),
+        ("app", "UI"),
+        ("service", "service / tool"),
+        ("data", "mechanism / store"),
+    ])
+
+    MX, MW = 120, 340   # main spine x, width
+    R = 560             # right column x
+
+    s.box("user", MX, 62, MW, 44, ["User: “add a measure for avg basket size”"], "app")
+    s.box("agent1", MX, 128, MW, 52, ["Agent (Sonnet) — calls edit_cube_config"], "llm", badge="LLM")
+    s.box("pause", MX, 200, MW, 56,
+          ["interrupt() → graph PAUSES", "state saved in MemorySaver (by thread_id)"], "data")
+    s.sep(288, "SSE: emit {interrupt} → /chat stream ENDS")
+    s.box("form", MX, 306, MW, 62, ["① Config-edit form (pre-filled)", "human reviews / adjusts"], "human")
+    s.box("testsql", R, 300, 250, 40, ["Test SQL → /test-sql"], "service")
+    s.box("pgdata", R, 356, 250, 40, ["Postgres data-db (:5432)"], "data")
+
+    s.sep(410, "▶ /resume?answer=…  (NEW connection)")
+    s.box("agent2", MX, 430, MW, 56,
+          ["Agent RESUMES — Command(resume)", "→ preview_cube_config_update"], "llm", badge="LLM")
+    s.box("stage", R, 436, 250, 44, ["library-mcp → Library API", "(stage only — not saved)"], "service")
+    s.box("diff", MX, 506, MW, 46, ["② UI diff card: current vs proposed"], "app")
+    s.box("confirm", MX, 574, MW, 56,
+          ["Agent asks “commit?” (text)", "③ human replies “yes”"], "human")
+
+    s.sep(662, "▶ new /chat turn: “yes”")
+    s.box("agent3", MX, 682, MW, 52, ["Agent — commit_cube_config_update"], "llm", badge="LLM")
+    s.box("commit", R, 684, 250, 44, ["library-mcp → Library API"], "service")
+    s.box("libdb", R, 744, 250, 40, ["Postgres library-db (:5433)"], "data")
+    s.box("reload", MX, 756, MW, 52, ["Agent — reload_cube_schema"], "llm", badge="LLM")
+    s.box("cube", R, 804, 250, 56, ["Cube.js restarts, rebuilds model", "from Library API /v1/CUBE_CONFIG"], "service")
+    s.box("verify", MX, 830, MW, 50, ["④ get_cube_config_detail → show result"], "app")
+
+    s.arrow(s.anchor("user", "bottom"), s.anchor("agent1", "top"))
+    s.arrow(s.anchor("agent1", "bottom"), s.anchor("pause", "top"))
+    s.arrow(s.anchor("pause", "bottom"), s.anchor("form", "top"))
+    s.arrow(s.anchor("form", "right"), s.anchor("testsql", "left"))
+    s.arrow(s.anchor("testsql", "bottom"), s.anchor("pgdata", "top"))
+    s.arrow(s.anchor("pgdata", "left"), (s.anchor("form", "right")[0], 376), "sample rows", dashed=True)
+    s.arrow(s.anchor("form", "bottom"), s.anchor("agent2", "top"))
+    s.arrow(s.anchor("agent2", "right"), s.anchor("stage", "left"))
+    s.arrow(s.anchor("agent2", "bottom"), s.anchor("diff", "top"))
+    s.arrow(s.anchor("diff", "bottom"), s.anchor("confirm", "top"))
+    s.arrow(s.anchor("confirm", "bottom"), s.anchor("agent3", "top"))
+    s.arrow(s.anchor("agent3", "right"), s.anchor("commit", "left"))
+    s.arrow(s.anchor("commit", "bottom"), s.anchor("libdb", "top"))
+    s.arrow(s.anchor("agent3", "bottom"), s.anchor("reload", "top"))
+    s.arrow(s.anchor("reload", "right"), s.anchor("cube", "left"))
+    s.arrow(s.anchor("reload", "bottom"), s.anchor("verify", "top"))
+    return s.render()
+
+
 if __name__ == "__main__":
     import pathlib
     here = pathlib.Path(__file__).parent
     (here / "architecture_agent.svg").write_text(agent_diagram())
     (here / "architecture_evals.svg").write_text(eval_diagram())
-    print("Wrote architecture_agent.svg and architecture_evals.svg")
+    (here / "architecture_config_edit.svg").write_text(config_edit_diagram())
+    print("Wrote architecture_agent.svg, architecture_evals.svg, architecture_config_edit.svg")

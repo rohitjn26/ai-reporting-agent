@@ -1,7 +1,8 @@
 """
 LangGraph ReAct agent wired to MCP tool servers + local chart/config tools.
 """
-import json, os
+import asyncio, json, os
+import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.tools import tool
@@ -12,9 +13,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from chart.renderer import render_chart
 from chart.server import serve_chart
 from graph.config_editor import edit_cube_config
+from graph import query_builder as qb
 
 CUBE_MCP_URL    = os.environ.get("CUBE_MCP_URL",    "http://localhost:5001/sse")
 LIBRARY_MCP_URL = os.environ.get("LIBRARY_MCP_URL", "http://localhost:5002/sse")
+CUBE_URL        = os.environ.get("CUBE_URL",        "http://localhost:4000")
+CUBE_API_SECRET = os.environ.get("CUBE_API_SECRET", "local-dev-secret")
 MODEL_SONNET    = os.environ.get("CLAUDE_MODEL",       "claude-sonnet-4-6")
 MODEL_HAIKU     = os.environ.get("CLAUDE_MODEL_FAST",  "claude-haiku-4-5-20251001")
 
@@ -38,13 +42,19 @@ def pick_agent(message: str):
 SYSTEM_PROMPT = """\
 You are a data reporting agent. When the user asks for a chart or data insight:
 
-1. Call get_cube_metadata to discover available cubes, measures, and dimensions.
-2. Choose the right cube and identify the correct measures and dimensions from the metadata.
-3. Call query_cube. Member names must be fully qualified: "cube_name.member_name".
-4. If the user has NOT specified a chart type, ask: "What type of chart would you like? bar / line / pie / doughnut / table"
+1. Call build_query with the user's request. Put any relevant details from earlier turns
+   in `context` (a prior query to tweak, a country filter, "line chart", etc.). It fetches
+   the schema, translates the request into a validated Cube query (mapping synonyms via
+   field descriptions), and auto-repairs invalid members. It returns JSON with
+   measures / dimensions / filters / time_dimensions / order / limit.
+   - If the result contains "_validation_problems", the request cannot be fully mapped to
+     existing fields. Do NOT guess — tell the user what's missing and offer to add it
+     (see the add-field flow below).
+2. Call query_cube with the EXACT fields build_query returned (member names are already
+   fully qualified: "cube_name.member_name").
+3. If the user has NOT specified a chart type, ask: "What type of chart would you like? bar / line / pie / doughnut / table"
    Wait for their answer before calling create_chart.
-5. Call create_chart with the results to render the visualization.
-6. Return the chart URL with a brief description.
+4. Call create_chart with the results to render the visualization.
 
 Supported chart types: bar, line, pie, doughnut, table.
 Always call create_chart at the end — the user expects a visual result.
@@ -106,7 +116,8 @@ IMPORTANT query rules:
 - NEVER call reload_cube_schema when answering a data/chart question.
   reload_cube_schema is only for after committing a config change.
 
-When the user asks for a measure or dimension that does NOT appear in get_cube_metadata:
+When build_query reports "_validation_problems" (or the user asks for a measure or
+dimension that does NOT exist in the schema):
 1. Tell the user it does not exist yet, and ask: "Should I add it to the [cube_name] cube?"
 2. If the user says yes, call edit_cube_config with your best-guess values:
    - suggested_field_type: "measure" or "dimension" based on what they asked for
@@ -204,6 +215,43 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
     return True
 
 
+async def _fetch_cube_metadata() -> list[dict]:
+    """Fetch the raw Cube data model (/meta cubes list) for the query builder."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{CUBE_URL}/cubejs-api/v1/meta",
+            headers={"Authorization": f"Bearer {CUBE_API_SECRET}"},
+        )
+        resp.raise_for_status()
+        return resp.json().get("cubes", [])
+
+
+@tool
+async def build_query(request: str, context: str = "") -> str:
+    """
+    Translate a natural-language data request into a validated Cube query.
+
+    Fetches the live schema, maps the request onto existing measures/dimensions
+    (using each field's description/synonyms), validates every member against the
+    schema, and auto-repairs invalid members. Call this FIRST for any data/chart
+    request, then pass the returned fields to query_cube.
+
+    Args:
+        request: the user's data request in natural language, e.g. "revenue by country"
+        context: optional — relevant details from earlier turns (a prior query to
+                 modify, "for Germany", "as a line chart")
+
+    Returns:
+        JSON {measures, dimensions, filters, time_dimensions, order, limit}. If it
+        contains "_validation_problems", the request could not be fully mapped to
+        existing fields — surface that to the user instead of guessing.
+    """
+    metadata = await _fetch_cube_metadata()
+    # build_query is sync (structured LLM call) — run off the event loop.
+    query = await asyncio.to_thread(qb.build_query, request, metadata, context=context or None)
+    return json.dumps(query)
+
+
 @tool
 def create_chart(
     chart_type: str,
@@ -276,7 +324,7 @@ async def build_agent():
         "library": {"url": LIBRARY_MCP_URL, "transport": "sse"},
     })
     mcp_tools = await mcp_client.get_tools()
-    all_tools = mcp_tools + [create_chart, edit_cube_config]
+    all_tools = mcp_tools + [build_query, create_chart, edit_cube_config]
 
     _agent_sonnet = create_react_agent(
         ChatAnthropic(model=MODEL_SONNET),

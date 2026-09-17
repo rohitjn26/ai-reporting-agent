@@ -179,6 +179,11 @@ def main():
     ap.add_argument("--paraphrase", type=int, default=0, metavar="N",
                     help="add N LLM paraphrases per title case (needs ANTHROPIC_API_KEY; 0=off)")
     ap.add_argument("--paraphrase-model", default=None, help="override the paraphrase model id")
+    ap.add_argument("--verify", action="store_true",
+                    help="drop paraphrases whose meaning drifted: keep one only if an "
+                         "independent LLM re-derives the same query from the wording alone "
+                         "(needs ANTHROPIC_API_KEY)")
+    ap.add_argument("--verify-model", default=None, help="override the verifier model id")
     args = ap.parse_args()
 
     cubes = fetch_metadata()
@@ -190,6 +195,15 @@ def main():
         extra = paraphrase.paraphrase_cases(cases, n=args.paraphrase, **kw)
         cases = _dedupe(cases + extra)
         print(f"Added {len(extra)} LLM paraphrase case(s).")
+
+    if args.verify:
+        import verify
+        kw = {"model": args.verify_model} if args.verify_model else {}
+        kept, dropped = verify.verify_cases(cases, cubes, **kw)
+        print(f"Verifier: kept {len(kept)}, dropped {len(dropped)} paraphrase(s) as drift.")
+        for d in dropped:
+            print(f"  drift: {d['prompt']!r}  ({d['_drift'].get('checks') or d['_drift'].get('error')})")
+        cases = kept
 
     by_template: dict[str, int] = {}
     for c in cases:

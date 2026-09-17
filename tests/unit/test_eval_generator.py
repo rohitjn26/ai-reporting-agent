@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "evals"))
 import generate
 import grading
 import paraphrase
+import verify
 
 
 # A tiny fake /meta payload — the generator must work off whatever schema it's given.
@@ -185,3 +186,61 @@ def test_paraphrase_only_expands_title_cases():
 def test_parse_array_tolerates_prose_and_fallbacks():
     assert paraphrase._parse_array('Sure! ["a", "b"]') == ["a", "b"]
     assert paraphrase._parse_array("- one\n- two") == ["one", "two"]
+
+
+# ── paraphrase verifier (fake re-deriver — no network) ────────────────────────
+
+def _paraphrase_cases():
+    """A couple of paraphrase cases to run the verifier over."""
+    base = generate.generate_cases(FAKE_META)
+    fake = lambda prompt, n: ["which countries make us the most money?"]
+    # measure_by_dimension is paraphrasable; its expected is revenue by country.
+    return paraphrase.paraphrase_cases(
+        [c for c in base if c["template"] == "measure_by_dimension" and c["source"] == "title"],
+        n=1, generate_fn=fake,
+    )
+
+
+def test_verify_keeps_paraphrase_that_round_trips():
+    cases = _paraphrase_cases()
+    assert cases
+    # An independent re-deriver that lands on the SAME query -> kept.
+    good = lambda prompt, md: {"measures": ["orders.total_revenue"], "dimensions": ["orders.country"]}
+    kept, dropped = verify.verify_cases(cases, FAKE_META, verify_fn=good)
+    assert len(kept) == len(cases) and not dropped
+
+
+def test_verify_drops_paraphrase_that_drifted():
+    cases = _paraphrase_cases()
+    # Re-deriver reads a DIFFERENT meaning (dropped the grouping) -> drift, dropped.
+    drift = lambda prompt, md: {"measures": ["orders.total_revenue"]}
+    kept, dropped = verify.verify_cases(cases, FAKE_META, verify_fn=drift)
+    assert not kept and len(dropped) == len(cases)
+    assert "checks" in dropped[0]["_drift"]  # carries what failed for eyeballing
+
+
+def test_verify_passes_non_paraphrase_cases_through_untouched():
+    base = generate.generate_cases(FAKE_META)  # title/synonym only
+    # verify_fn should never be called for non-paraphrase sources.
+    boom = lambda prompt, md: (_ for _ in ()).throw(AssertionError("should not verify title/synonym"))
+    kept, dropped = verify.verify_cases(base, FAKE_META, verify_fn=boom)
+    assert kept == base and not dropped
+
+
+def test_verify_drops_case_when_rederiver_raises():
+    cases = _paraphrase_cases()
+    boom = lambda prompt, md: (_ for _ in ()).throw(RuntimeError("api down"))
+    kept, dropped = verify.verify_cases(cases, FAKE_META, verify_fn=boom)
+    assert not kept and dropped and "api down" in dropped[0]["_drift"]["error"]
+
+
+def test_verify_ignores_validation_annotation_on_derived_query():
+    cases = _paraphrase_cases()
+    # build_query tags unshippable queries with _validation_problems; it must not
+    # break the structural comparison.
+    annotated = lambda prompt, md: {
+        "measures": ["orders.total_revenue"], "dimensions": ["orders.country"],
+        "_validation_problems": ["some note"],
+    }
+    kept, dropped = verify.verify_cases(cases, FAKE_META, verify_fn=annotated)
+    assert len(kept) == len(cases) and not dropped

@@ -32,7 +32,20 @@ copied from the base case**, so paraphrases stay auto-labelled. Only
 title-sourced `single_measure`/`measure_by_dimension`/`measure_over_time` cases
 are paraphrased; `top_n`/`pivot` hinge on qualifiers ("top 5", "split by") a
 rewrite might drop, which would invalidate the copied label. Paraphrases are a
-notch lower-trust than title/synonym cases — spot-check them.
+notch lower-trust than title/synonym cases — spot-check them, or gate them with
+the verifier below.
+
+### Paraphrase verifier (opt-in, `verify.py`)
+
+The copied-label safety property only holds if the LLM changed the *wording*, not
+the *meaning*. A drifted paraphrase ("revenue by country" → "profit by region")
+keeps the old label and would make the eval assert a wrong answer. `--verify` adds
+a **second, independent LLM** that re-derives a Cube query from the paraphrase
+*alone* (it never sees the label), then keeps the case only if that query
+round-trips to the expected one. Non-round-trips are dropped as drift and printed.
+It defaults to a different model from the paraphraser (`EVAL_VERIFIER_MODEL`) so
+the two don't share a blind spot, and it reuses the agent's `build_query` +
+`grade_query` for the re-derivation and comparison.
 
 Each case carries the expected **Cube query** and the expected **chart mapping**,
 so one file grades both query construction and `save_graph` mapping.
@@ -43,6 +56,7 @@ so one file grades both query construction and `save_graph` mapping.
 |---|---|
 | `generate.py`   | Build cases from live metadata → `generated_queries.jsonl` |
 | `paraphrase.py` | LLM reword of title cases into natural phrasings (opt-in) |
+| `verify.py`     | Independent LLM drift gate: drop paraphrases that don't round-trip (opt-in) |
 | `grading.py`    | Pure structural graders + the "no hallucinated fields" invariant |
 | `run.py`        | Drive the live agent over cases and score it per aspect/template |
 
@@ -54,6 +68,7 @@ so one file grades both query construction and `save_graph` mapping.
 python evals/generate.py                 # deterministic: title + synonym cases
 python evals/generate.py --print         # print cases, don't write
 python evals/generate.py --paraphrase 3  # + 3 LLM paraphrases per title case
+python evals/generate.py --paraphrase 3 --verify   # + drop drifted paraphrases
 ```
 
 ## Grading (portable by construction)

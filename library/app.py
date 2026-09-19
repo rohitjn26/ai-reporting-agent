@@ -54,9 +54,10 @@ def health():
 
 # Resource types stored in the (shared) cube_configs table, distinguished by `type`.
 # CUBE_CONFIG — Cube.js data-model definitions (measures/dimensions/sql).
+# VIEW        — a Cube view: curated members across cubes, joins resolved via cubes.
 # GRAPH       — a replayable chart recipe (chart_type + cube_query + mapping).
 # DASHBOARD   — an ordered grid of graph references (tiles with w/h).
-_VALID_TYPES = {"CUBE_CONFIG", "GRAPH", "DASHBOARD"}
+_VALID_TYPES = {"CUBE_CONFIG", "VIEW", "GRAPH", "DASHBOARD"}
 
 
 class CubeConfigCreate(BaseModel):

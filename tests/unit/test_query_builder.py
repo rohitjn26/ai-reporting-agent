@@ -30,6 +30,20 @@ class FakeLLM:
         return self.queue.pop(0) if self.queue else self.queue and None
 
 
+# A second view, so routing has something to choose between.
+INVENTORY = {
+    "name": "inventory",
+    "description": "Warehouse stock levels",
+    "measures": [
+        {"name": "inventory.units_on_hand", "type": "number", "shortTitle": "Units On Hand"},
+    ],
+    "dimensions": [
+        {"name": "inventory.warehouse", "type": "string", "shortTitle": "Warehouse"},
+    ],
+}
+MULTI = META + [INVENTORY]
+
+
 # ── to_query / render_schema ──────────────────────────────────────────────────
 
 def test_to_query_drops_empties_and_serializes_time():
@@ -86,6 +100,51 @@ def test_validate_time_dimension_must_be_a_dimension():
         META,
     )
     assert any("orders.count" in x for x in p)
+
+
+def test_validate_catches_cross_view_mixing():
+    # revenue lives in orders, units in inventory — a single query can't span both.
+    p = qb.validate_query(
+        {"measures": ["orders.total_revenue", "inventory.units_on_hand"]}, MULTI
+    )
+    assert any("multiple views" in x for x in p)
+
+
+# ── select_view / routing ─────────────────────────────────────────────────────
+
+class FakeSelector:
+    """Returns a queued ViewSelection per .invoke call."""
+    def __init__(self, *selections):
+        self.queue = list(selections)
+        self.calls = 0
+
+    def invoke(self, msgs):
+        self.calls += 1
+        return self.queue.pop(0)
+
+
+def test_build_query_routes_to_chosen_view():
+    selector = FakeSelector(qb.ViewSelection(view="orders", reason="revenue is in orders"))
+    llm = FakeLLM(qb.CubeQuery(measures=["orders.total_revenue"], dimensions=["orders.country"]))
+    q = qb.build_query("revenue by country", MULTI, llm=llm, view_llm=selector)
+    assert selector.calls == 1
+    assert q == {"measures": ["orders.total_revenue"], "dimensions": ["orders.country"]}
+
+
+def test_build_query_surfaces_view_boundary():
+    # request spans views -> selector returns no view -> honest error, no query built.
+    selector = FakeSelector(qb.ViewSelection(view=None, reason="needs orders and inventory"))
+    llm = FakeLLM()  # must never be called
+    q = qb.build_query("revenue vs stock levels", MULTI, llm=llm, view_llm=selector)
+    assert q == {"_view_error": "needs orders and inventory"}
+    assert llm.calls == 0
+
+
+def test_single_view_skips_routing():
+    # only one view -> no selector needed at all.
+    llm = FakeLLM(qb.CubeQuery(measures=["orders.count"]))
+    q = qb.build_query("how many orders", META, llm=llm)
+    assert q == {"measures": ["orders.count"]}
 
 
 # ── build_query (with repair) ─────────────────────────────────────────────────

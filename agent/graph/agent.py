@@ -50,6 +50,10 @@ You are a data reporting agent. When the user asks for a chart or data insight:
    - If the result contains "_validation_problems", the request cannot be fully mapped to
      existing fields. Do NOT guess — tell the user what's missing and offer to add it
      (see the add-field flow below).
+   - If the result contains "_view_error", the request spans two separate data areas
+     (views) that cannot be combined in one query. Do NOT call query_cube. Explain the
+     boundary to the user, name the areas involved, and ask them to pick one area or
+     split it into two separate charts.
 2. Call query_cube with the EXACT fields build_query returned (member names are already
    fully qualified: "cube_name.member_name").
 3. If the user has NOT specified a chart type, ask: "What type of chart would you like? bar / line / pie / doughnut / table"
@@ -216,14 +220,21 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
 
 
 async def _fetch_cube_metadata() -> list[dict]:
-    """Fetch the raw Cube data model (/meta cubes list) for the query builder."""
+    """Fetch the Cube data model (/meta cubes list) for the query builder.
+
+    Views are the only surface the agent should query. In dev mode /meta also lists
+    private base cubes (isVisible/public=false), so filter to visible entries — this
+    is what feeds build_query's view routing, so raw cubes must never leak in here.
+    """
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
             f"{CUBE_URL}/cubejs-api/v1/meta",
             headers={"Authorization": f"Bearer {CUBE_API_SECRET}"},
         )
         resp.raise_for_status()
-        return resp.json().get("cubes", [])
+        cubes = resp.json().get("cubes", [])
+    return [c for c in cubes
+            if c.get("isVisible", c.get("public", True)) is not False]
 
 
 @tool
@@ -244,11 +255,26 @@ async def build_query(request: str, context: str = "") -> str:
     Returns:
         JSON {measures, dimensions, filters, time_dimensions, order, limit}. If it
         contains "_validation_problems", the request could not be fully mapped to
-        existing fields — surface that to the user instead of guessing.
+        existing fields — surface that to the user instead of guessing. If it
+        contains "_view_error", the request spans two separate data areas (views)
+        that cannot be combined in one query — do NOT call query_cube; relay the
+        boundary to the user.
     """
     metadata = await _fetch_cube_metadata()
     # build_query is sync (structured LLM call) — run off the event loop.
     query = await asyncio.to_thread(qb.build_query, request, metadata, context=context or None)
+    if isinstance(query, dict) and query.get("_view_error"):
+        # A single query can't span two views. Stop the tool chain here and hand the
+        # boundary back to the model to explain — don't let it fall through to query_cube.
+        return json.dumps({
+            "_view_error": query["_view_error"],
+            "instruction": (
+                "This request spans more than one data area (view) and cannot be answered "
+                "in a single query. Do NOT call query_cube. Tell the user the request mixes "
+                "separate areas, name what's involved, and ask them to pick one area or split "
+                "it into two charts."
+            ),
+        })
     return json.dumps(query)
 
 

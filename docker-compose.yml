@@ -33,6 +33,25 @@ services:
       timeout: 5s
       retries: 10
 
+  checkpoint-db:
+    # Durable store for the agent's LangGraph checkpoints (interrupt/resume state).
+    # Kept separate from the analytics data so agent state and reporting data don't
+    # share a lifecycle. Agent UI runs on the host → reach it at localhost:5434.
+    image: postgres:15-alpine
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: checkpoints
+    volumes:
+      - checkpoint-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d checkpoints"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+
   # ── Semantic / API Layer ──────────────────────────────────────────────────
   library:
     build: ./library
@@ -118,3 +137,4 @@ services:
 volumes:
   postgres-data:
   library-db-data:
+  checkpoint-db-data:

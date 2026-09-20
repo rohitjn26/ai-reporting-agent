@@ -19,8 +19,14 @@ CUBE_CONFIGS = [
         "data": {
             "sql":    "SELECT * FROM orders",
             "name":   "orders",
-            "public": True,
+            "public": False,
             "description": "Customer orders — one row per order, with amount, status, country and date.",
+            "joins": {
+                "customers": {
+                    "sql":          "${CUBE}.customer_id = ${customers.id}",
+                    "relationship": "many_to_one"
+                }
+            },
             "measures": {
                 "count": {
                     "sql":   "id",
@@ -105,7 +111,7 @@ CUBE_CONFIGS = [
         "data": {
             "sql":    "SELECT * FROM products",
             "name":   "products",
-            "public": True,
+            "public": False,
             "description": "Product catalog — one row per product, with category and price.",
             "measures": {
                 "count": {
@@ -161,7 +167,7 @@ CUBE_CONFIGS = [
         "data": {
             "sql":    "SELECT * FROM customers",
             "name":   "customers",
-            "public": True,
+            "public": False,
             "description": "Customer base — one row per customer, with country and signup date.",
             "measures": {
                 "count": {
@@ -203,10 +209,20 @@ CUBE_CONFIGS = [
     {
         "name": "order_items",
         "data": {
-            "sql":    "SELECT oi.*, p.name as product_name, p.category FROM order_items oi JOIN products p ON p.id = oi.product_id",
+            "sql":    "SELECT * FROM order_items",
             "name":   "order_items",
-            "public": True,
-            "description": "Order line items — one row per product within an order, joined with product info.",
+            "public": False,
+            "description": "Order line items — one row per product within an order.",
+            "joins": {
+                "orders": {
+                    "sql":          "${CUBE}.order_id = ${orders.id}",
+                    "relationship": "many_to_one"
+                },
+                "products": {
+                    "sql":          "${CUBE}.product_id = ${products.id}",
+                    "relationship": "many_to_one"
+                }
+            },
             "measures": {
                 "count": {
                     "sql":   "id",
@@ -253,25 +269,88 @@ CUBE_CONFIGS = [
                     "primary_key": True,
                     "description": "Unique line-item identifier (primary key)."
                 },
-                "category": {
-                    "sql":   "category",
-                    "type":  "string",
-                    "title": "Category",
-                    "description": "Product category of the line item. Synonyms: product type, department."
-                },
                 "quantity": {
                     "sql":   "quantity",
                     "type":  "number",
                     "title": "Quantity",
                     "description": "Units purchased in the line item."
-                },
-                "product_name": {
-                    "sql":   "product_name",
-                    "type":  "string",
-                    "title": "Product Name",
-                    "description": "Name of the product in the line item. Synonyms: item, product title."
                 }
+                # product_name & category now come from the products cube via the
+                # product_sales view (no longer denormalised into this cube's SQL).
             }
+        }
+    }
+]
+
+
+# Views are the ONLY public surface the agent sees (base cubes above are public:False).
+# A query can never span two views, so each view is a self-contained analytical area.
+# Member descriptions (with synonyms) live on the `includes` objects so they reach /meta.
+VIEW_CONFIGS = [
+    {
+        "name": "sales",
+        "data": {
+            "name": "sales",
+            "public": True,
+            "description": "Order & customer analytics — revenue, order counts and status by country, date and customer. One row per order.",
+            "cubes": [
+                {
+                    "join_path": "orders",
+                    "includes": [
+                        "count", "day_count", "total_revenue", "avg_order_value",
+                        "status", "country", "bi_monthly", "created_at",
+                        "day_of_week", "order_bucket", "revenue_bucket"
+                    ]
+                },
+                {
+                    "join_path": "orders.customers",
+                    "includes": [
+                        {"name": "name", "alias": "customer_name",
+                         "description": "Name of the customer who placed the order."},
+                        {"name": "country", "alias": "customer_country",
+                         "description": "Home country of the customer (distinct from the order's country). Synonyms: buyer country, customer region."}
+                    ]
+                }
+            ]
+        }
+    },
+    {
+        "name": "product_sales",
+        "data": {
+            "name": "product_sales",
+            "public": True,
+            "description": "Line-item & product analytics — units sold, line revenue and revenue per item by product, category and order date. One row per order line item.",
+            "cubes": [
+                {
+                    "join_path": "order_items",
+                    "includes": [
+                        "count", "order_count", "total_revenue", "total_quantity",
+                        "avg_order_value", "revenue_per_item", "quantity"
+                    ]
+                },
+                {
+                    "join_path": "order_items.products",
+                    "includes": [
+                        {"name": "name", "alias": "product_name",
+                         "description": "Name of the product sold. Synonyms: item, product title."},
+                        {"name": "category",
+                         "description": "Product category. Synonyms: product type, department, segment."},
+                        {"name": "price", "alias": "unit_list_price",
+                         "description": "Catalog unit price of the product in USD."}
+                    ]
+                },
+                {
+                    "join_path": "order_items.orders",
+                    "includes": [
+                        {"name": "created_at", "alias": "order_date",
+                         "description": "Date the order was placed. Use for product-sales trends over time by day/week/month/quarter/year."},
+                        {"name": "status", "alias": "order_status",
+                         "description": "Order status: pending, completed, cancelled, refunded."},
+                        {"name": "country", "alias": "order_country",
+                         "description": "Country where the order was placed. Synonyms: market, region."}
+                    ]
+                }
+            ]
         }
     }
 ]
@@ -291,10 +370,29 @@ def _request(url: str, payload: dict | None, method: str) -> dict:
         return {}
 
 
-def _existing_by_name(base: str) -> dict:
-    """Map cube name -> id for configs already in the library."""
-    result = _request(f"{base}/v1/CUBE_CONFIG", None, "GET")
+def _existing_by_name(base: str, resource_type: str) -> dict:
+    """Map resource name -> id for resources of a type already in the library."""
+    result = _request(f"{base}/v1/{resource_type}", None, "GET")
     return {c["name"]: c["id"] for c in result.get("data", [])}
+
+
+def _seed(base: str, resource_type: str, configs: list, update: bool) -> None:
+    endpoint = f"{base}/v1/{resource_type}"
+    existing = _existing_by_name(base, resource_type) if update else {}
+
+    verb = "Upserting" if update else "Seeding"
+    print(f"{verb} {resource_type} → {endpoint}")
+    for cfg in configs:
+        name = cfg["name"]
+        if update and name in existing:
+            cid = existing[name]
+            print(f"  Updating '{name}' (id={cid}) ...", end=" ")
+            result = _request(f"{endpoint}/{cid}", {"name": name, "data": cfg["data"]}, "PUT")
+        else:
+            print(f"  Creating '{name}' ...", end=" ")
+            result = _request(endpoint, {"name": name, "data": cfg["data"]}, "POST")
+        print(f"OK (id={result['id']})" if result.get("id") else "FAILED")
+    print()
 
 
 def main():
@@ -305,23 +403,11 @@ def main():
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
-    endpoint = f"{base}/v1/CUBE_CONFIG"
-    existing = _existing_by_name(base) if args.update else {}
+    # Cubes first (views reference them), then views.
+    _seed(base, "CUBE_CONFIG", CUBE_CONFIGS, args.update)
+    _seed(base, "VIEW", VIEW_CONFIGS, args.update)
 
-    verb = "Upserting" if args.update else "Seeding"
-    print(f"{verb} cube configs → {endpoint}\n")
-    for cfg in CUBE_CONFIGS:
-        name = cfg["name"]
-        if args.update and name in existing:
-            cid = existing[name]
-            print(f"  Updating '{name}' (id={cid}) ...", end=" ")
-            result = _request(f"{endpoint}/{cid}", {"name": name, "data": cfg["data"]}, "PUT")
-        else:
-            print(f"  Creating '{name}' ...", end=" ")
-            result = _request(endpoint, cfg, "POST")
-        print(f"OK (id={result['id']})" if result.get("id") else "FAILED")
-
-    print("\nDone. Reload the Cube schema so descriptions reach /meta.")
+    print("Done. Reload the Cube schema so joins/views and descriptions reach /meta.")
 
 
 if __name__ == "__main__":

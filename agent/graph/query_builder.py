@@ -2,11 +2,20 @@
 build_query — a focused NL → Cube query component (SKETCH, not yet wired in).
 
 The orchestrator agent keeps doing conversation / chart-type / saving; it
-delegates the risky translation step to this. One structured LLM call, then a
-deterministic validate → repair-once wrapper:
+delegates the risky translation step to this. When the schema exposes several
+views, we route to exactly ONE view first (Cube can never answer a query that
+mixes members from two views), then run one structured LLM call against only
+that view's slice, then a deterministic validate → repair-once wrapper:
 
-    build_query(request, metadata)                      # static-validated query
+    select_view(request, metadata)                      # -> ViewSelection
+    build_query(request, metadata)                      # routed + static-validated query
     build_and_run(request, metadata, run_fn)            # + runtime-error repair
+
+Why route first:
+  - A query is built against a single view's members only, so it CANNOT mix
+    views — the boundary is enforced structurally, not just checked.
+  - When a request genuinely spans two views, we return {"_view_error": ...}
+    so the caller can tell the user honestly instead of shipping half an answer.
 
 Why structured + validated:
   - `.with_structured_output` forces a well-shaped query (can't emit garbage JSON).
@@ -58,6 +67,22 @@ class CubeQuery(BaseModel):
         return q
 
 
+class ViewSelection(BaseModel):
+    view: Optional[str] = None          # the one view that answers the request; None = spans views
+    reason: str = ""                    # why this view, or which views would be needed
+
+
+_SELECT_SYSTEM = """You route a data request to exactly ONE view.
+
+A view is a self-contained analytical area. A single query can NEVER combine
+members from two different views — they cannot be joined at query time.
+
+- If one view covers the ENTIRE request, return its name in `view`.
+- If answering would require members from two or more views, return view=null
+  and name the views that would be needed in `reason`. Do NOT force-fit.
+Return only the selection."""
+
+
 _SYSTEM = """You translate a data request into a Cube query, using ONLY the schema provided.
 
 Rules:
@@ -86,6 +111,25 @@ def render_schema(metadata: list[dict]) -> str:
                 title = m.get("shortTitle") or m.get("title") or ""
                 desc = f" — {m['description']}" if m.get("description") else ""
                 lines.append(f"    {m['name']}  ({m['type']}) {title}{desc}")
+    return "\n".join(lines)
+
+
+def render_view_catalog(metadata: list[dict]) -> str:
+    """Compact catalog for routing — view names, descriptions, and a taste of the
+    members so the selector can tell which view owns the request."""
+    lines = []
+    for c in metadata:
+        desc = f" — {c['description']}" if c.get("description") else ""
+        lines.append(f"\nView: {c['name']}{desc}")
+        for kind in ("measures", "dimensions"):
+            members = c.get(kind, [])
+            if not members:
+                continue
+            titles = ", ".join(
+                (m.get("shortTitle") or m.get("title") or m["name"]) for m in members[:12]
+            )
+            more = " …" if len(members) > 12 else ""
+            lines.append(f"  {kind.capitalize()}: {titles}{more}")
     return "\n".join(lines)
 
 
@@ -122,6 +166,17 @@ def validate_query(query: dict, metadata: list[dict]) -> list[str]:
         mem = f.get("member")
         if mem and mem not in known:
             problems.append(f"filter references unknown member '{mem}'")
+
+    # containment: a query must never span two views — Cube can't join across them.
+    referenced = set(query.get("measures", [])) | set(query.get("dimensions", []))
+    referenced |= {td.get("dimension") for td in query.get("time_dimensions", []) if td.get("dimension")}
+    referenced |= set(query.get("order") or {})
+    referenced |= {f.get("member") for f in query.get("filters", []) if f.get("member")}
+    views = {m.split(".")[0] for m in referenced if isinstance(m, str) and "." in m}
+    if len(views) > 1:
+        problems.append(
+            f"query mixes members from multiple views {sorted(views)} — a query must stay within one view"
+        )
     return problems
 
 
@@ -130,6 +185,51 @@ def validate_query(query: dict, metadata: list[dict]) -> list[str]:
 def _default_llm(model: str):
     from langchain_anthropic import ChatAnthropic
     return ChatAnthropic(model=model, temperature=0).with_structured_output(CubeQuery)
+
+
+def _default_view_llm(model: str):
+    from langchain_anthropic import ChatAnthropic
+    return ChatAnthropic(model=model, temperature=0).with_structured_output(ViewSelection)
+
+
+def select_view(
+    request: str,
+    metadata: list[dict],
+    *,
+    context: str | None = None,
+    model: str | None = None,
+    llm=None,
+) -> ViewSelection:
+    """Route a request to exactly one view. Returns ViewSelection(view=None) when
+    the request would need to span views (Cube can't answer that in one query)."""
+    llm = llm or _default_view_llm(model or os.environ.get("VIEW_SELECTOR_MODEL", "claude-haiku-4-5-20251001"))
+    msgs = [("system", _SELECT_SYSTEM), ("human", f"Views:\n{render_view_catalog(metadata)}")]
+    if context:
+        msgs.append(("human", f"Recent conversation (for follow-ups):\n{context}"))
+    msgs.append(("human", f"Request: {request}"))
+    return llm.invoke(msgs)
+
+
+def _resolve_view(
+    request: str,
+    metadata: list[dict],
+    *,
+    context: str | None,
+    model: str | None,
+    view_llm,
+) -> tuple[list[dict] | None, str | None]:
+    """Pick the single view this request lives in and return (view_metadata, error).
+    With 0–1 views there's nothing to route. `error` is set (and metadata None)
+    when no single view fits, so callers can surface the boundary honestly."""
+    if len(metadata) <= 1:
+        return metadata, None
+    sel = select_view(request, metadata, context=context, model=model, llm=view_llm)
+    if not sel.view:
+        return None, sel.reason or "request spans multiple views and can't be answered in one query"
+    view_meta = [c for c in metadata if c.get("name") == sel.view]
+    if not view_meta:
+        return None, f"selected view '{sel.view}' is not in the schema"
+    return view_meta, None
 
 
 def _invoke(llm, request: str, schema_text: str, context: str | None,
@@ -154,20 +254,29 @@ def build_query(
     context: str | None = None,
     model: str | None = None,
     llm=None,
+    view_llm=None,
     max_repairs: int = 1,
 ) -> dict:
-    """NL → validated Cube query dict. Repairs static validation problems once."""
-    llm = llm or _default_llm(model or os.environ.get("QUERY_BUILDER_MODEL", "claude-haiku-4-5-20251001"))
+    """NL → validated Cube query dict. Routes to a single view first (a query can
+    never span views), builds against only that view's slice, then repairs static
+    validation problems once. When no single view fits, returns {"_view_error": ...}
+    for the caller to surface — nothing else in the dict."""
+    view_meta, view_error = _resolve_view(request, metadata, context=context, model=model, view_llm=view_llm)
+    if view_error:
+        return {"_view_error": view_error}
 
-    result = _invoke(llm, request, render_schema(metadata), context, None, None)
+    llm = llm or _default_llm(model or os.environ.get("QUERY_BUILDER_MODEL", "claude-haiku-4-5-20251001"))
+    schema_text = render_schema(view_meta)
+
+    result = _invoke(llm, request, schema_text, context, None, None)
     query = result.to_query()
-    problems = validate_query(query, metadata)
+    problems = validate_query(query, view_meta)
 
     repairs = 0
     while problems and repairs < max_repairs:
-        result = _invoke(llm, request, render_schema(metadata), context, query, problems)
+        result = _invoke(llm, request, schema_text, context, query, problems)
         query = result.to_query()
-        problems = validate_query(query, metadata)
+        problems = validate_query(query, view_meta)
         repairs += 1
 
     if problems:
@@ -184,14 +293,21 @@ def build_and_run(
     context: str | None = None,
     model: str | None = None,
     llm=None,
+    view_llm=None,
 ) -> tuple[dict, dict]:
-    """build_query, execute via run_fn, and on a Cube runtime error repair ONCE
-    using the error message. run_fn(query) -> result dict (with 'error' on failure).
-    Returns (final_query, result)."""
-    llm = llm or _default_llm(model or os.environ.get("QUERY_BUILDER_MODEL", "claude-haiku-4-5-20251001"))
-    schema_text = render_schema(metadata)
+    """Route to one view, build_query, execute via run_fn, and on a Cube runtime
+    error repair ONCE using the error message. run_fn(query) -> result dict (with
+    'error' on failure). Returns (final_query, result). When no single view fits,
+    returns ({"_view_error": ...}, {"error": ...}) without calling run_fn."""
+    view_meta, view_error = _resolve_view(request, metadata, context=context, model=model, view_llm=view_llm)
+    if view_error:
+        return {"_view_error": view_error}, {"error": view_error}
 
-    query = build_query(request, metadata, context=context, llm=llm)
+    llm = llm or _default_llm(model or os.environ.get("QUERY_BUILDER_MODEL", "claude-haiku-4-5-20251001"))
+    schema_text = render_schema(view_meta)
+
+    # view_meta is a single view, so build_query won't re-route.
+    query = build_query(request, view_meta, context=context, llm=llm)
     result = run_fn(query)
 
     if isinstance(result, dict) and result.get("error"):

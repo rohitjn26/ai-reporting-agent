@@ -23,7 +23,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 import uvicorn
 
-from graph.agent import build_agent, maybe_summarise, pick_agent, _CONFIG_VERBS
+from graph.agent import build_agent, maybe_summarise, pick_agent, close_checkpointer, _CONFIG_VERBS
 import chart.server as _chart_server
 
 os.environ.setdefault("CHART_OPEN_BROWSER", "false")
@@ -53,6 +53,7 @@ async def lifespan(app: FastAPI):
     print(f"\n  Chat UI  → http://localhost:{_ui_port}")
     print(f"  Charts   → http://localhost:{_chart_server._PORT}\n")
     yield
+    await close_checkpointer()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -207,11 +208,9 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
         # refresh mid-interrupt). Clear the thread state and tell the frontend to retry.
         if "INVALID_CHAT_HISTORY" in err_text or "do not have a corresponding ToolMessage" in err_text:
             try:
-                from graph.agent import _checkpointer
-                # Wipe all checkpoints for this thread from MemorySaver's storage.
-                keys_to_delete = [k for k in _checkpointer.storage if k[0] == thread_id]
-                for k in keys_to_delete:
-                    del _checkpointer.storage[k]
+                from graph.agent import clear_thread
+                # Wipe all checkpoints for this thread (backend-agnostic).
+                await clear_thread(thread_id)
             except Exception:
                 pass
             yield f"data: {json.dumps({'type': 'session_reset', 'text': 'Session was corrupted (page refreshed mid-tool-call). Cleared and retrying...'})}\n\n"

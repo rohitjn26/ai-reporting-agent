@@ -57,7 +57,11 @@ async def get_cube_metadata() -> str:
     Call this first to understand what data is queryable before building a query.
     """
     data = await _cube_get("/cubejs-api/v1/meta")
-    cubes = data.get("cubes", [])
+    # In dev mode /meta lists private cubes too (isVisible/public=false). Views are
+    # the only surface the agent should query, so skip anything not visible — this
+    # keeps raw cubes and their join keys out of the agent's schema regardless of mode.
+    cubes = [c for c in data.get("cubes", [])
+             if c.get("isVisible", c.get("public", True)) is not False]
     lines = []
 
     def _fmt(member: dict) -> str:

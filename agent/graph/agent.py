@@ -10,6 +10,17 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
+# Durable checkpointer (prod). Imported lazily-tolerant: if the postgres extras
+# aren't installed, we simply fall back to MemorySaver for local dev.
+try:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from psycopg_pool import AsyncConnectionPool
+    from psycopg.rows import dict_row
+except ImportError:  # postgres extras not installed — dev keeps using MemorySaver
+    AsyncPostgresSaver = None
+    AsyncConnectionPool = None
+    dict_row = None
+
 from chart.renderer import render_chart
 from chart.server import serve_chart
 from graph.config_editor import edit_cube_config
@@ -147,7 +158,80 @@ When the user asks to CREATE a new cube config, use create_cube_config directly.
 """
 
 # Single shared checkpointer — persists interrupt state across SSE reconnections.
-_checkpointer = MemorySaver()
+# Created in build_agent(): a durable AsyncPostgresSaver when CHECKPOINT_DB_URL is set
+# (survives restarts and lets any replica resume an interrupt), else an in-memory
+# MemorySaver for single-process local dev.
+_checkpointer = None
+_checkpoint_pool = None  # kept open for the app's lifetime when using Postgres
+
+CHECKPOINT_DB_URL = os.environ.get("CHECKPOINT_DB_URL")
+
+
+async def _make_checkpointer():
+    """Build the shared checkpointer.
+
+    CHECKPOINT_DB_URL set + postgres extras installed → durable AsyncPostgresSaver
+    (creates its tables on first run via setup(), idempotent). Otherwise MemorySaver,
+    which is correct for a single-process local/dev run but loses state on restart.
+    """
+    global _checkpoint_pool
+    if CHECKPOINT_DB_URL and AsyncPostgresSaver is not None:
+        _checkpoint_pool = AsyncConnectionPool(
+            conninfo=CHECKPOINT_DB_URL,
+            max_size=int(os.environ.get("CHECKPOINT_DB_POOL_SIZE", "10")),
+            open=False,
+            # AsyncPostgresSaver requires autocommit + dict rows; prepare_threshold=0
+            # keeps it compatible with transaction-pooling proxies (e.g. pgbouncer).
+            kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": 0},
+        )
+        await _checkpoint_pool.open()
+        saver = AsyncPostgresSaver(_checkpoint_pool)
+        await saver.setup()
+        print(f"[checkpointer] AsyncPostgresSaver (durable) → {CHECKPOINT_DB_URL.rsplit('@', 1)[-1]}")
+        return saver
+    if CHECKPOINT_DB_URL and AsyncPostgresSaver is None:
+        print("[checkpointer] CHECKPOINT_DB_URL is set but postgres extras aren't installed; "
+              "install langgraph-checkpoint-postgres + psycopg[binary,pool]. Falling back to MemorySaver.")
+    else:
+        print("[checkpointer] MemorySaver (in-memory) — set CHECKPOINT_DB_URL for durable state")
+    return MemorySaver()
+
+
+async def close_checkpointer() -> None:
+    """Close the Postgres connection pool on shutdown (no-op for MemorySaver)."""
+    global _checkpoint_pool
+    if _checkpoint_pool is not None:
+        await _checkpoint_pool.close()
+        _checkpoint_pool = None
+
+
+async def clear_thread(thread_id: str) -> None:
+    """Wipe all checkpoints for one thread (used to recover a corrupted thread).
+
+    Backend-agnostic: prefers the checkpointer's delete_thread API, and falls back to
+    MemorySaver's in-memory storage dict for older versions.
+    """
+    cp = _checkpointer
+    if cp is None:
+        return
+    # Prefer the native API (forward-compatible), but it's declared-but-unimplemented
+    # in current langgraph-checkpoint-postgres, so tolerate NotImplementedError.
+    if hasattr(cp, "adelete_thread"):
+        try:
+            await cp.adelete_thread(thread_id)
+            return
+        except NotImplementedError:
+            pass
+    # Postgres fallback: delete the thread's rows from the checkpoint tables directly.
+    if _checkpoint_pool is not None:
+        async with _checkpoint_pool.connection() as conn:
+            for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+                await conn.execute(f"DELETE FROM {table} WHERE thread_id = %s", (thread_id,))
+        return
+    # MemorySaver fallback: drop the thread's entries from its in-memory dict.
+    if hasattr(cp, "storage"):
+        for k in [k for k in cp.storage if k[0] == thread_id]:
+            del cp.storage[k]
 
 # Summarise when message count exceeds this; keep the last KEEP_RECENT messages as-is.
 SUMMARISE_AFTER = 10
@@ -339,11 +423,14 @@ def _build_state_modifier(state) -> list:
 
 async def build_agent():
     """
-    Build two agents (Sonnet + Haiku) sharing one MemorySaver.
+    Build two agents (Sonnet + Haiku) sharing one checkpointer.
     Both read/write the same thread history — only the model differs.
     Sonnet handles config edits; Haiku handles chart/data queries.
     """
-    global _agent_sonnet, _agent_haiku
+    global _agent_sonnet, _agent_haiku, _checkpointer
+
+    if _checkpointer is None:
+        _checkpointer = await _make_checkpointer()
 
     mcp_client = MultiServerMCPClient({
         "cube":    {"url": CUBE_MCP_URL,    "transport": "sse"},

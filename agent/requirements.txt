@@ -9,3 +9,7 @@ python-dotenv==1.0.1
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 asyncpg==0.30.0
+# Durable LangGraph checkpointer (prod). Only used when CHECKPOINT_DB_URL is set;
+# without these the agent falls back to an in-memory MemorySaver for local dev.
+langgraph-checkpoint-postgres==2.0.19
+psycopg[binary,pool]==3.2.13

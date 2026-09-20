@@ -160,6 +160,17 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                             pending_sql = sql
                     except Exception:
                         pass
+                # Surface what build_query chose (measures/dimensions/filters) so the
+                # user can see the LLM's plan — and which view it routed to (members
+                # are prefixed, e.g. "sales.total_revenue"). Skip when it couldn't map
+                # the request (view boundary / validation) — the model relays those.
+                if name == "build_query" and not error:
+                    try:
+                        parsed = json.loads(output_text)
+                        if not parsed.get("_view_error") and (parsed.get("measures") or parsed.get("dimensions")):
+                            yield f"data: {json.dumps({'type': 'query_plan', 'measures': parsed.get('measures', []), 'dimensions': parsed.get('dimensions', []), 'filters': parsed.get('filters', []), 'time_dimensions': parsed.get('time_dimensions', []), 'problems': parsed.get('_validation_problems', [])})}\n\n"
+                    except Exception:
+                        pass
                 if name == "preview_cube_config_update" and not error:
                     try:
                         output = event["data"].get("output", "")
@@ -511,6 +522,36 @@ _HTML = """<!DOCTYPE html>
       max-height: 180px;
       overflow-y: auto;
     }
+
+    /* ── Query plan (what build_query chose) ── */
+    .query-plan {
+      max-width: 92%;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 10px 12px;
+      margin: 2px 0;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .query-plan .qp-header {
+      font-size: 0.68rem; color: #8b949e;
+      text-transform: uppercase; letter-spacing: .04em;
+    }
+    .query-plan .qp-row { display: flex; gap: 8px; align-items: baseline; }
+    .query-plan .qp-label {
+      font-size: 0.7rem; color: #64748b; min-width: 74px; flex-shrink: 0; padding-top: 2px;
+    }
+    .query-plan .qp-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .query-plan .qp-chip {
+      font-family: ui-monospace, monospace; font-size: 0.72rem;
+      border-radius: 6px; padding: 2px 8px;
+    }
+    .query-plan .qp-measure   { background: #0c2a3a; border: 1px solid #0369a1; color: #7dd3fc; }
+    .query-plan .qp-dimension { background: #2e1065; border: 1px solid #6d28d9; color: #c4b5fd; }
+    .query-plan .qp-filter    { background: #1e293b; border: 1px solid #334155; color: #94a3b8; }
+    .query-plan .qp-problem   { color: #f59e0b; font-size: 0.72rem; }
 
     .config-preview {
       max-width: 96%;
@@ -1309,6 +1350,42 @@ _HTML = """<!DOCTYPE html>
     scrollBottom();
   }
 
+  function showQueryPlan(d) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg agent';
+    const card = document.createElement('div');
+    card.className = 'query-plan';
+
+    const chips = (items, cls) =>
+      '<div class="qp-chips">' +
+      items.map(x => '<span class="qp-chip ' + cls + '">' + escapeHtml(String(x)) + '</span>').join('') +
+      '</div>';
+    const row = (label, html) =>
+      '<div class="qp-row"><span class="qp-label">' + label + '</span>' + html + '</div>';
+
+    let out = '<div class="qp-header">\\uD83E\\uDDED Query plan — what the model chose</div>';
+    if (d.measures && d.measures.length)   out += row('Measures',   chips(d.measures, 'qp-measure'));
+    if (d.dimensions && d.dimensions.length) out += row('Dimensions', chips(d.dimensions, 'qp-dimension'));
+
+    const filters = (d.filters || [])
+      .map(f => [f.member, f.operator, (f.values || []).join(', ')].filter(Boolean).join(' '))
+      .filter(s => s.trim());
+    if (filters.length) out += row('Filters', chips(filters, 'qp-filter'));
+
+    const tds = (d.time_dimensions || [])
+      .map(t => [t.dimension, t.granularity].filter(Boolean).join(' \\u00B7 '))
+      .filter(s => s.trim());
+    if (tds.length) out += row('Time', chips(tds, 'qp-dimension'));
+
+    if (d.problems && d.problems.length)
+      out += '<div class="qp-problem">\\u26A0 ' + d.problems.map(escapeHtml).join('; ') + '</div>';
+
+    card.innerHTML = out;
+    wrap.appendChild(card);
+    messagesEl.appendChild(wrap);
+    scrollBottom();
+  }
+
   function showConfigPreview(current, proposed) {
     const cubeName = (proposed && proposed.name) || (current && current.name) || 'cube';
     const curM  = (current  && current.data  && current.data.measures)   || {};
@@ -1490,6 +1567,9 @@ _HTML = """<!DOCTYPE html>
 
       } else if (d.type === 'sql') {
         showSql(d.sql);
+
+      } else if (d.type === 'query_plan') {
+        showQueryPlan(d);
 
       } else if (d.type === 'config_preview') {
         showConfigPreview(d.current, d.proposed);

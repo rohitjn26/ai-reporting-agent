@@ -13,3 +13,5 @@ asyncpg==0.30.0
 # without these the agent falls back to an in-memory MemorySaver for local dev.
 langgraph-checkpoint-postgres==2.0.19
 psycopg[binary,pool]==3.2.13
+# Schema-discovery module (discovery/): profiles CSVs and finds relationships.
+duckdb==1.5.5

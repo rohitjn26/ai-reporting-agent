@@ -406,13 +406,22 @@ def _build_state_modifier(state) -> list:
     created before that change is demoted to a HumanMessage in place — both to
     preserve the cache prefix and to avoid the "multiple non-consecutive system
     messages" error create_react_agent would otherwise hit.
+
+    The system block carries a `cache_control` breakpoint. Because the render
+    order is tools -> system -> messages, a breakpoint on the (single) system
+    block caches the tool definitions AND the system prompt together — measured
+    at ~6.5K tokens, well over Haiku's 4096-token minimum — so that whole prefix
+    is served from cache on every tool round-trip and every turn.
     """
     messages = state["messages"] if isinstance(state, dict) else state.messages
     history = [
         HumanMessage(content=m.content) if isinstance(m, SystemMessage) else m
         for m in messages
     ]
-    return [SystemMessage(content=SYSTEM_PROMPT)] + history
+    system = SystemMessage(content=[
+        {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+    ])
+    return [system] + history
 
 
 async def build_agent():

@@ -23,7 +23,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 import uvicorn
 
-from graph.agent import build_agent, maybe_summarise, pick_agent, close_checkpointer, _CONFIG_VERBS
+from graph.agent import build_agent, maybe_summarise, close_checkpointer, MODEL_LABEL
 import chart.server as _chart_server
 
 os.environ.setdefault("CHART_OPEN_BROWSER", "false")
@@ -260,13 +260,11 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
 
 @app.get("/chat")
 async def chat_stream(request: Request, message: str, thread_id: str = "default"):
-    """SSE — new user message. Routes to Sonnet for config edits, Haiku for queries."""
-    routed = pick_agent(message)
-    model_name = "sonnet" if set(message.lower().split()) & _CONFIG_VERBS else "haiku"
-    print(f"[routing] model={model_name}  thread={thread_id}  msg={message[:80]!r}")
+    """SSE — new user message. One model handles every turn (see agent.MODEL)."""
+    print(f"[chat] model={MODEL_LABEL}  thread={thread_id}  msg={message[:80]!r}")
     return StreamingResponse(
         _stream_agent(request, {"messages": [HumanMessage(content=message)]}, thread_id,
-                      agent=routed, model_name=model_name),
+                      agent=_agent, model_name=MODEL_LABEL),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
@@ -274,9 +272,9 @@ async def chat_stream(request: Request, message: str, thread_id: str = "default"
 
 @app.get("/resume")
 async def resume_stream(request: Request, answer: str, thread_id: str = "default"):
-    """SSE — resume after the user answers an interrupt question. Always uses Sonnet (config flow)."""
+    """SSE — resume after the user answers an interrupt question (config flow)."""
     return StreamingResponse(
-        _stream_agent(request, Command(resume=answer), thread_id, agent=_agent, model_name="sonnet"),
+        _stream_agent(request, Command(resume=answer), thread_id, agent=_agent, model_name=MODEL_LABEL),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )

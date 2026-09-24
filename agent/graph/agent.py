@@ -30,25 +30,17 @@ CUBE_MCP_URL    = os.environ.get("CUBE_MCP_URL",    "http://localhost:5001/sse")
 LIBRARY_MCP_URL = os.environ.get("LIBRARY_MCP_URL", "http://localhost:5002/sse")
 CUBE_URL        = os.environ.get("CUBE_URL",        "http://localhost:4000")
 CUBE_API_SECRET = os.environ.get("CUBE_API_SECRET", "local-dev-secret")
-MODEL_SONNET    = os.environ.get("CLAUDE_MODEL",       "claude-sonnet-4-6")
-MODEL_HAIKU     = os.environ.get("CLAUDE_MODEL_FAST",  "claude-haiku-4-5-20251001")
+# One model for the whole loop. Kept single on purpose: switching models
+# mid-thread invalidates the cached tools+system prefix (caches are
+# model-scoped), so the two-model routing that used to send config edits to
+# Sonnet cost a cold cache on every switch. Config edits are human-reviewed
+# via a form interrupt, so the model only pre-fills suggestions the user
+# vets — Haiku is sufficient there. Override CLAUDE_MODEL to run the whole
+# loop on a stronger model if a workload needs it.
+MODEL       = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+MODEL_LABEL = next((n for n in ("haiku", "sonnet", "opus", "fable") if n in MODEL), MODEL)
 
-# Action verbs that signal a config-edit intent → needs Sonnet.
-# Pure data/chart queries use Haiku.
-_CONFIG_VERBS = {
-    "add", "create", "edit", "modify", "change", "update",
-    "remove", "delete", "rename", "replace", "new",
-}
-
-_agent_sonnet = None
-_agent_haiku  = None
-
-
-def pick_agent(message: str):
-    """Return Sonnet agent for config-edit requests, Haiku for everything else."""
-    words = set(message.lower().split())
-    use_sonnet = bool(words & _CONFIG_VERBS)
-    return _agent_sonnet if use_sonnet else _agent_haiku
+_agent = None
 
 SYSTEM_PROMPT = """\
 You are a data reporting agent. When the user asks for a chart or data insight:
@@ -425,11 +417,11 @@ def _build_state_modifier(state) -> list:
 
 async def build_agent():
     """
-    Build two agents (Sonnet + Haiku) sharing one checkpointer.
-    Both read/write the same thread history — only the model differs.
-    Sonnet handles config edits; Haiku handles chart/data queries.
+    Build the single agent (one model, see MODEL) over a shared checkpointer.
+    Every turn — data queries and config edits alike — runs on the same model
+    so the cached tools+system prefix survives across turns.
     """
-    global _agent_sonnet, _agent_haiku, _checkpointer
+    global _agent, _checkpointer
 
     if _checkpointer is None:
         _checkpointer = await _make_checkpointer()
@@ -441,16 +433,10 @@ async def build_agent():
     mcp_tools = await mcp_client.get_tools()
     all_tools = mcp_tools + [build_query, create_chart, edit_cube_config]
 
-    _agent_sonnet = create_react_agent(
-        ChatAnthropic(model=MODEL_SONNET),
+    _agent = create_react_agent(
+        ChatAnthropic(model=MODEL),
         all_tools,
         state_modifier=_build_state_modifier,
         checkpointer=_checkpointer,
     )
-    _agent_haiku = create_react_agent(
-        ChatAnthropic(model=MODEL_HAIKU),
-        all_tools,
-        state_modifier=_build_state_modifier,
-        checkpointer=_checkpointer,
-    )
-    return _agent_sonnet  # default for callers that hold a reference
+    return _agent

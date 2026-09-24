@@ -1,38 +1,7 @@
-"""Unit tests for agent/graph/agent.py — model routing, text extraction, prompt merge."""
+"""Unit tests for agent/graph/agent.py — text extraction, prompt/state modifier."""
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from graph import agent
-
-
-# ── pick_agent ────────────────────────────────────────────────────────────────
-
-def _stub_agents(monkeypatch):
-    """Replace the (initially None) agent singletons with recognisable sentinels."""
-    monkeypatch.setattr(agent, "_agent_sonnet", "SONNET")
-    monkeypatch.setattr(agent, "_agent_haiku", "HAIKU")
-
-
-def test_pick_agent_routes_config_verbs_to_sonnet(monkeypatch):
-    _stub_agents(monkeypatch)
-    for msg in ["add a new measure", "delete the orders cube", "please RENAME status"]:
-        assert agent.pick_agent(msg) == "SONNET", msg
-
-
-def test_pick_agent_routes_plain_queries_to_haiku(monkeypatch):
-    _stub_agents(monkeypatch)
-    for msg in ["show me revenue by month", "what is the total count?", "top 5 products"]:
-        assert agent.pick_agent(msg) == "HAIKU", msg
-
-
-def test_pick_agent_matches_whole_words_only(monkeypatch):
-    _stub_agents(monkeypatch)
-    # "additional" contains "add" as a substring but is not the verb → Haiku.
-    assert agent.pick_agent("additional revenue please") == "HAIKU"
-
-
-def test_pick_agent_is_case_insensitive(monkeypatch):
-    _stub_agents(monkeypatch)
-    assert agent.pick_agent("ADD revenue measure") == "SONNET"
 
 
 # ── _extract_text ─────────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@ Browser (Chat UI)
       ▼
   FastAPI (agent/ui.py)
       │
-  LangGraph ReAct agent  ←──  Claude (claude-sonnet-4-6)
+  LangGraph ReAct agent  ←──  Claude (one model, default Haiku — see CLAUDE_MODEL)
       │
   ┌───┴─────────────────────┐
   │   MCP Tool Servers       │
@@ -120,6 +120,26 @@ make test                 # unit + e2e (e2e needs a running Docker daemon)
   skips automatically if Docker is unavailable.
 
 ---
+
+## Performance notes
+
+The agent is tuned so Anthropic prompt caching holds across the conversation:
+
+- **One model for the whole loop.** Every turn — data queries and config edits
+  alike — runs on a single model (`CLAUDE_MODEL`, default Haiku). Prompt caches
+  are model-scoped, so mixing models on one thread would cold-start the cache on
+  every switch. Config edits are safe on Haiku because `edit_cube_config` only
+  pre-fills a form the user reviews before anything commits. Set `CLAUDE_MODEL`
+  to run the whole loop on a stronger model.
+- **Frozen system prompt.** The conversation summary is stored as a history
+  message, not concatenated into the system prompt, so the cached prefix stays
+  byte-identical turn to turn.
+- **Cached tools+system prefix.** The system prompt is sent as a `cache_control`
+  block; since tools render before it, that one breakpoint caches the tool
+  definitions + system prompt together (~6.2K tokens, over Haiku's 4096-token
+  minimum). It's served from cache on every tool round-trip and every turn.
+- **Reused clients.** LLM clients are memoized so the HTTP connection pool stays
+  warm instead of re-doing a TLS handshake per tool call.
 
 ## How the config edit flow works
 

@@ -67,13 +67,16 @@ def test_state_modifier_prepends_single_system_prompt():
     assert result[1:] == msgs
 
 
-def test_state_modifier_merges_summaries_into_system_prompt():
+def test_state_modifier_demotes_legacy_summary_out_of_system_prompt():
+    # Legacy threads stored the summary as a SystemMessage. It must NOT be
+    # merged into the system prompt (that would change the cached prefix) — it
+    # is demoted to a human turn in the history instead.
     summary = SystemMessage(content="[Conversation summary]\nUser asked for revenue.")
     msgs = [summary, HumanMessage(content="now show orders")]
     result = agent._build_state_modifier({"messages": msgs})
-    # still exactly one system message
+    # exactly one system message, and it is the frozen prompt verbatim
     assert sum(isinstance(m, SystemMessage) for m in result) == 1
-    assert result[0].content.startswith(agent.SYSTEM_PROMPT)
-    assert "User asked for revenue." in result[0].content
-    # the human message survives, the summary SystemMessage is folded in (removed)
-    assert result[1:] == [msgs[1]]
+    assert result[0].content == agent.SYSTEM_PROMPT
+    # the summary survives as a human-turn message, ahead of the real turn
+    assert result[1] == HumanMessage(content="[Conversation summary]\nUser asked for revenue.")
+    assert result[2] == msgs[1]

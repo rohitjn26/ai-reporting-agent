@@ -253,8 +253,10 @@ def _extract_text(content) -> str:
 async def maybe_summarise(agent, thread_id: str) -> bool:
     """
     If the stored message history for this thread is longer than SUMMARISE_AFTER,
-    ask a fast model to compress the old messages into one SystemMessage summary,
-    then remove the originals from the graph state.
+    ask a fast model to compress the old messages into one summary message
+    (stored as a HumanMessage so it rides in the history AFTER the system prompt,
+    keeping the cached tools+system prefix byte-stable), then remove the
+    originals from the graph state.
 
     Returns True if summarisation happened, False otherwise.
     Never runs when an interrupt is pending.
@@ -298,7 +300,7 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
     summary    = response.content if isinstance(response.content, str) else _extract_text(response.content)
 
     remove_ops   = [RemoveMessage(id=m.id) for m in to_summarise]
-    summary_msg  = SystemMessage(content=f"[Conversation summary]\n{summary}")
+    summary_msg  = HumanMessage(content=f"[Conversation summary]\n{summary}")
     agent.update_state(config, {"messages": remove_ops + [summary_msg]})
     return True
 
@@ -402,23 +404,23 @@ def create_chart(
 
 def _build_state_modifier(state) -> list:
     """
-    Merge any SystemMessage summaries stored in the message history into the
-    main SYSTEM_PROMPT so the model always sees exactly ONE system message.
+    Send exactly ONE system message — the frozen SYSTEM_PROMPT — so the cached
+    tools+system prefix stays byte-identical across every turn. Anything that
+    varies per thread (the conversation summary) rides in the message history
+    AFTER the system prompt, where it invalidates nothing ahead of it.
 
-    Without this, `create_react_agent` prepends SYSTEM_PROMPT as a SystemMessage
-    and our injected summary SystemMessage results in two system messages, which
-    the Anthropic API rejects with "multiple non-consecutive system messages".
+    Summaries are now stored as HumanMessages (see maybe_summarise), so they
+    flow through untouched. Any legacy SystemMessage summary from a thread
+    created before that change is demoted to a HumanMessage in place — both to
+    preserve the cache prefix and to avoid the "multiple non-consecutive system
+    messages" error create_react_agent would otherwise hit.
     """
     messages = state["messages"] if isinstance(state, dict) else state.messages
-    summaries  = [m for m in messages if isinstance(m, SystemMessage)]
-    non_system = [m for m in messages if not isinstance(m, SystemMessage)]
-
-    system_content = SYSTEM_PROMPT
-    if summaries:
-        summary_text = "\n\n".join(m.content for m in summaries)
-        system_content = SYSTEM_PROMPT + "\n\n" + summary_text
-
-    return [SystemMessage(content=system_content)] + non_system
+    history = [
+        HumanMessage(content=m.content) if isinstance(m, SystemMessage) else m
+        for m in messages
+    ]
+    return [SystemMessage(content=SYSTEM_PROMPT)] + history
 
 
 async def build_agent():

@@ -6,7 +6,7 @@ See docs/SCHEMA_DISCOVERY.md.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import duckdb
@@ -25,6 +25,7 @@ class DiscoveryResult:
     grains: dict[str, GrainResult]
     accepted: list[JoinCandidate]
     uncertain: list[JoinCandidate]
+    sources: dict[str, str] = field(default_factory=dict)  # table -> CSV path
 
     def bridges(self) -> list[str]:
         """Tables whose whole grain is made of foreign-key columns = junctions."""
@@ -73,6 +74,7 @@ class DiscoveryResult:
                 "uncertain": [j.to_dict() for j in self.uncertain],
             },
             "bridges": self.bridges(),
+            "sources": self.sources,
             "graph": self.graph(),
         }
 
@@ -96,4 +98,5 @@ def run_discovery(files: list[str | Path],
     explained = {(j.fk_table, j.fk_column) for j in accepted}
     uncertain = [j for j in uncertain if (j.fk_table, j.fk_column) not in explained]
 
-    return DiscoveryResult(profiles, grains, accepted, uncertain)
+    sources = {Path(f).stem: str(Path(f).resolve()) for f in files}
+    return DiscoveryResult(profiles, grains, accepted, uncertain, sources)

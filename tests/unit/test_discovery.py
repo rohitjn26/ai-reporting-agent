@@ -117,3 +117,111 @@ def test_graph_has_nodes_and_directed_edges(ecommerce):
     assert {n["id"] for n in g["nodes"]} == {"customers", "products", "orders", "order_items"}
     assert all(e["status"] == "accepted" for e in g["edges"])
     assert ("order_items", "orders") in {(e["source"], e["target"]) for e in g["edges"]}
+
+
+# ── semantic-layer draft (discovery/semantic.py) ─────────────────────────────
+
+from discovery import draft_semantic_layer  # noqa: E402
+
+
+def _cube(draft, name):
+    return next(c["data"] for c in draft["cubes"] if c["name"] == name)
+
+
+def _view(draft, root):
+    return next(v["data"] for v in draft["views"] if v["name"] == f"{root}_view")
+
+
+def test_semantic_roles_and_one_view_per_fact(ecommerce):
+    d = draft_semantic_layer(run_discovery(ecommerce).to_dict())
+    assert d["roles"] == {"orders": "fact", "order_items": "fact",
+                          "customers": "dimension", "products": "dimension"}
+    assert {v["name"] for v in d["views"]} == {"orders_view", "order_items_view"}
+    assert d["notes"] == []
+
+
+def test_semantic_cubes_are_private_with_pk_and_joins(ecommerce):
+    r = run_discovery(ecommerce)
+    d = draft_semantic_layer(r.to_dict())
+    orders = _cube(d, "orders")
+    assert orders["public"] is False
+    assert orders["dimensions"]["id"]["primary_key"] is True
+    assert orders["joins"] == next(j for j in r.accepted if j.fk_table == "orders").cube_join
+    assert "customer_id" not in orders["dimensions"]  # FK is join plumbing
+    assert orders["measures"]["total_amount"]["type"] == "sum"
+    # dimension tables aggregate nothing but count
+    assert set(_cube(d, "products")["measures"]) == {"count"}
+
+
+def test_semantic_view_paths_attach_dimensions_only(ecommerce):
+    d = draft_semantic_layer(run_discovery(ecommerce).to_dict())
+    v = _view(d, "order_items")
+    paths = {e["join_path"]: e for e in v["cubes"]}
+    assert set(paths) == {"order_items", "order_items.orders", "order_items.products",
+                          "order_items.orders.customers"}
+    assert "total_quantity" in paths["order_items"]["includes"]
+    assert "id" not in paths["order_items"]["includes"]
+    # joined cubes contribute dimensions only (no fan-out-prone measures), prefixed
+    orders = paths["order_items.orders"]
+    assert orders["prefix"] is True
+    assert not set(orders["includes"]) & set(_cube(d, "orders")["measures"])
+
+
+def test_semantic_respects_user_review(ecommerce):
+    disc = run_discovery(ecommerce).to_dict()
+    kept = [j for j in disc["joins"]["accepted"] if j["fk"]["column"] != "product_id"]
+    kept = [dict(j, relationship="one_to_many") if j["fk"]["column"] == "customer_id" else j
+            for j in kept]
+    d = draft_semantic_layer(disc, kept)
+    assert "products" not in _cube(d, "order_items")["joins"]
+    assert _cube(d, "orders")["joins"]["customers"]["relationship"] == "one_to_many"
+    assert not any("customers" in e["join_path"] for e in _view(d, "orders")["cubes"])
+    assert any("fans out" in n for n in d["notes"])
+
+
+def test_semantic_bridge_gets_composite_pk_and_view(junction):
+    d = draft_semantic_layer(run_discovery(junction).to_dict())
+    assert d["roles"]["enrollments"] == "bridge"
+    enr = _cube(d, "enrollments")
+    assert enr["dimensions"]["pk"]["primary_key"] is True
+    assert enr["dimensions"]["pk"]["sql"].startswith("CONCAT(")
+    # grade is non-additive: averaged, never summed
+    assert "avg_grade" in enr["measures"] and "total_grade" not in enr["measures"]
+    assert {e["join_path"] for e in _view(d, "enrollments")["cubes"]} == {
+        "enrollments", "enrollments.students", "enrollments.courses"}
+
+
+def test_semantic_dataset_namespaces_everything(ecommerce):
+    d = draft_semantic_layer(run_discovery(ecommerce).to_dict(), dataset="Retail Q3")
+    assert d["dataset"] == "retail_q3"
+    assert {c["name"] for c in d["cubes"]} == {
+        "retail_q3_orders", "retail_q3_order_items", "retail_q3_customers", "retail_q3_products"}
+    orders = next(c["data"] for c in d["cubes"] if c["name"] == "retail_q3_orders")
+    assert orders["sql"] == "SELECT * FROM retail_q3.orders"
+    assert orders["joins"] == {"retail_q3_customers": {
+        "sql": "${CUBE}.customer_id = ${retail_q3_customers.id}", "relationship": "many_to_one"}}
+    v = next(v["data"] for v in d["views"] if v["name"] == "retail_q3_orders_view")
+    assert [e["join_path"] for e in v["cubes"]] == ["retail_q3_orders", "retail_q3_orders.retail_q3_customers"]
+    assert d["roles"]["retail_q3_orders"] == "fact"
+    assert set(d["sources"]) == {"orders", "order_items", "customers", "products"}
+
+
+def test_dataset_name_is_schema_safe():
+    from discovery.semantic import dataset_name
+    assert dataset_name("Retail Q3") == "retail_q3"
+    assert dataset_name("2024-sales") == "ds_2024_sales"
+
+
+def test_load_data_refuses_without_dataset(ecommerce):
+    from discovery.publish import load_data
+    with pytest.raises(ValueError, match="dataset"):
+        load_data(draft_semantic_layer(run_discovery(ecommerce).to_dict()))
+
+
+def test_seed_from_draft_detects_name_clashes():
+    sys.path.insert(0, str(REPO_ROOT / "library"))
+    from seed import _draft_collisions
+    draft = {"cubes": [{"name": "shop_orders"}, {"name": "orders"}],
+             "views": [{"name": "shop_orders_view"}]}
+    existing = {"CUBE_CONFIG": {"orders": 1}, "VIEW": {"sales": 2}}
+    assert _draft_collisions(draft, existing) == ["CUBE_CONFIG orders"]

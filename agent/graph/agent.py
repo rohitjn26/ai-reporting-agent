@@ -31,25 +31,17 @@ CUBE_MCP_URL    = os.environ.get("CUBE_MCP_URL",    "http://localhost:5001/sse")
 LIBRARY_MCP_URL = os.environ.get("LIBRARY_MCP_URL", "http://localhost:5002/sse")
 CUBE_URL        = os.environ.get("CUBE_URL",        "http://localhost:4000")
 CUBE_API_SECRET = os.environ.get("CUBE_API_SECRET", "local-dev-secret")
-MODEL_SONNET    = os.environ.get("CLAUDE_MODEL",       "claude-sonnet-4-6")
-MODEL_HAIKU     = os.environ.get("CLAUDE_MODEL_FAST",  "claude-haiku-4-5-20251001")
+# One model for the whole loop. Kept single on purpose: switching models
+# mid-thread invalidates the cached tools+system prefix (caches are
+# model-scoped), so the two-model routing that used to send config edits to
+# Sonnet cost a cold cache on every switch. Config edits are human-reviewed
+# via a form interrupt, so the model only pre-fills suggestions the user
+# vets — Haiku is sufficient there. Override CLAUDE_MODEL to run the whole
+# loop on a stronger model if a workload needs it.
+MODEL       = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+MODEL_LABEL = next((n for n in ("haiku", "sonnet", "opus", "fable") if n in MODEL), MODEL)
 
-# Action verbs that signal a config-edit intent → needs Sonnet.
-# Pure data/chart queries use Haiku.
-_CONFIG_VERBS = {
-    "add", "create", "edit", "modify", "change", "update",
-    "remove", "delete", "rename", "replace", "new",
-}
-
-_agent_sonnet = None
-_agent_haiku  = None
-
-
-def pick_agent(message: str):
-    """Return Sonnet agent for config-edit requests, Haiku for everything else."""
-    words = set(message.lower().split())
-    use_sonnet = bool(words & _CONFIG_VERBS)
-    return _agent_sonnet if use_sonnet else _agent_haiku
+_agent = None
 
 SYSTEM_PROMPT = """\
 You are a data reporting agent. When the user asks for a chart or data insight:
@@ -261,8 +253,10 @@ def _extract_text(content) -> str:
 async def maybe_summarise(agent, thread_id: str) -> bool:
     """
     If the stored message history for this thread is longer than SUMMARISE_AFTER,
-    ask a fast model to compress the old messages into one SystemMessage summary,
-    then remove the originals from the graph state.
+    ask a fast model to compress the old messages into one summary message
+    (stored as a HumanMessage so it rides in the history AFTER the system prompt,
+    keeping the cached tools+system prefix byte-stable), then remove the
+    originals from the graph state.
 
     Returns True if summarisation happened, False otherwise.
     Never runs when an interrupt is pending.
@@ -306,7 +300,7 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
     summary    = response.content if isinstance(response.content, str) else _extract_text(response.content)
 
     remove_ops   = [RemoveMessage(id=m.id) for m in to_summarise]
-    summary_msg  = SystemMessage(content=f"[Conversation summary]\n{summary}")
+    summary_msg  = HumanMessage(content=f"[Conversation summary]\n{summary}")
     agent.update_state(config, {"messages": remove_ops + [summary_msg]})
     return True
 
@@ -410,32 +404,41 @@ def create_chart(
 
 def _build_state_modifier(state) -> list:
     """
-    Merge any SystemMessage summaries stored in the message history into the
-    main SYSTEM_PROMPT so the model always sees exactly ONE system message.
+    Send exactly ONE system message — the frozen SYSTEM_PROMPT — so the cached
+    tools+system prefix stays byte-identical across every turn. Anything that
+    varies per thread (the conversation summary) rides in the message history
+    AFTER the system prompt, where it invalidates nothing ahead of it.
 
-    Without this, `create_react_agent` prepends SYSTEM_PROMPT as a SystemMessage
-    and our injected summary SystemMessage results in two system messages, which
-    the Anthropic API rejects with "multiple non-consecutive system messages".
+    Summaries are now stored as HumanMessages (see maybe_summarise), so they
+    flow through untouched. Any legacy SystemMessage summary from a thread
+    created before that change is demoted to a HumanMessage in place — both to
+    preserve the cache prefix and to avoid the "multiple non-consecutive system
+    messages" error create_react_agent would otherwise hit.
+
+    The system block carries a `cache_control` breakpoint. Because the render
+    order is tools -> system -> messages, a breakpoint on the (single) system
+    block caches the tool definitions AND the system prompt together — measured
+    at ~6.5K tokens, well over Haiku's 4096-token minimum — so that whole prefix
+    is served from cache on every tool round-trip and every turn.
     """
     messages = state["messages"] if isinstance(state, dict) else state.messages
-    summaries  = [m for m in messages if isinstance(m, SystemMessage)]
-    non_system = [m for m in messages if not isinstance(m, SystemMessage)]
-
-    system_content = SYSTEM_PROMPT
-    if summaries:
-        summary_text = "\n\n".join(m.content for m in summaries)
-        system_content = SYSTEM_PROMPT + "\n\n" + summary_text
-
-    return [SystemMessage(content=system_content)] + non_system
+    history = [
+        HumanMessage(content=m.content) if isinstance(m, SystemMessage) else m
+        for m in messages
+    ]
+    system = SystemMessage(content=[
+        {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+    ])
+    return [system] + history
 
 
 async def build_agent():
     """
-    Build two agents (Sonnet + Haiku) sharing one checkpointer.
-    Both read/write the same thread history — only the model differs.
-    Sonnet handles config edits; Haiku handles chart/data queries.
+    Build the single agent (one model, see MODEL) over a shared checkpointer.
+    Every turn — data queries and config edits alike — runs on the same model
+    so the cached tools+system prefix survives across turns.
     """
-    global _agent_sonnet, _agent_haiku, _checkpointer
+    global _agent, _checkpointer
 
     if _checkpointer is None:
         _checkpointer = await _make_checkpointer()
@@ -447,16 +450,10 @@ async def build_agent():
     mcp_tools = await mcp_client.get_tools()
     all_tools = mcp_tools + [build_query, create_chart, edit_cube_config]
 
-    _agent_sonnet = create_react_agent(
-        ChatAnthropic(model=MODEL_SONNET),
+    _agent = create_react_agent(
+        ChatAnthropic(model=MODEL),
         all_tools,
         state_modifier=_build_state_modifier,
         checkpointer=_checkpointer,
     )
-    _agent_haiku = create_react_agent(
-        ChatAnthropic(model=MODEL_HAIKU),
-        all_tools,
-        state_modifier=_build_state_modifier,
-        checkpointer=_checkpointer,
-    )
-    return _agent_sonnet  # default for callers that hold a reference
+    return _agent

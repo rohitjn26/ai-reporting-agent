@@ -1,38 +1,7 @@
-"""Unit tests for agent/graph/agent.py — model routing, text extraction, prompt merge."""
+"""Unit tests for agent/graph/agent.py — text extraction, prompt/state modifier."""
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from graph import agent
-
-
-# ── pick_agent ────────────────────────────────────────────────────────────────
-
-def _stub_agents(monkeypatch):
-    """Replace the (initially None) agent singletons with recognisable sentinels."""
-    monkeypatch.setattr(agent, "_agent_sonnet", "SONNET")
-    monkeypatch.setattr(agent, "_agent_haiku", "HAIKU")
-
-
-def test_pick_agent_routes_config_verbs_to_sonnet(monkeypatch):
-    _stub_agents(monkeypatch)
-    for msg in ["add a new measure", "delete the orders cube", "please RENAME status"]:
-        assert agent.pick_agent(msg) == "SONNET", msg
-
-
-def test_pick_agent_routes_plain_queries_to_haiku(monkeypatch):
-    _stub_agents(monkeypatch)
-    for msg in ["show me revenue by month", "what is the total count?", "top 5 products"]:
-        assert agent.pick_agent(msg) == "HAIKU", msg
-
-
-def test_pick_agent_matches_whole_words_only(monkeypatch):
-    _stub_agents(monkeypatch)
-    # "additional" contains "add" as a substring but is not the verb → Haiku.
-    assert agent.pick_agent("additional revenue please") == "HAIKU"
-
-
-def test_pick_agent_is_case_insensitive(monkeypatch):
-    _stub_agents(monkeypatch)
-    assert agent.pick_agent("ADD revenue measure") == "SONNET"
 
 
 # ── _extract_text ─────────────────────────────────────────────────────────────
@@ -57,23 +26,32 @@ def test_extract_text_falls_back_to_str():
 
 # ── _build_state_modifier ─────────────────────────────────────────────────────
 
-def test_state_modifier_prepends_single_system_prompt():
+_SYSTEM_BLOCK = [
+    {"type": "text", "text": agent.SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+]
+
+
+def test_state_modifier_prepends_single_cached_system_prompt():
     msgs = [HumanMessage(content="hi"), AIMessage(content="hello")]
     result = agent._build_state_modifier({"messages": msgs})
     assert isinstance(result[0], SystemMessage)
-    assert result[0].content == agent.SYSTEM_PROMPT
+    # frozen prompt, delivered as a cache_control block so tools+system cache
+    assert result[0].content == _SYSTEM_BLOCK
     # exactly one system message, originals preserved after it
     assert sum(isinstance(m, SystemMessage) for m in result) == 1
     assert result[1:] == msgs
 
 
-def test_state_modifier_merges_summaries_into_system_prompt():
+def test_state_modifier_demotes_legacy_summary_out_of_system_prompt():
+    # Legacy threads stored the summary as a SystemMessage. It must NOT be
+    # merged into the system prompt (that would change the cached prefix) — it
+    # is demoted to a human turn in the history instead.
     summary = SystemMessage(content="[Conversation summary]\nUser asked for revenue.")
     msgs = [summary, HumanMessage(content="now show orders")]
     result = agent._build_state_modifier({"messages": msgs})
-    # still exactly one system message
+    # exactly one system message, and it is the frozen prompt verbatim
     assert sum(isinstance(m, SystemMessage) for m in result) == 1
-    assert result[0].content.startswith(agent.SYSTEM_PROMPT)
-    assert "User asked for revenue." in result[0].content
-    # the human message survives, the summary SystemMessage is folded in (removed)
-    assert result[1:] == [msgs[1]]
+    assert result[0].content == _SYSTEM_BLOCK
+    # the summary survives as a human-turn message, ahead of the real turn
+    assert result[1] == HumanMessage(content="[Conversation summary]\nUser asked for revenue.")
+    assert result[2] == msgs[1]

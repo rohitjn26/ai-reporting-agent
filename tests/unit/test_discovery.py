@@ -189,3 +189,39 @@ def test_semantic_bridge_gets_composite_pk_and_view(junction):
     assert "avg_grade" in enr["measures"] and "total_grade" not in enr["measures"]
     assert {e["join_path"] for e in _view(d, "enrollments")["cubes"]} == {
         "enrollments", "enrollments.students", "enrollments.courses"}
+
+
+def test_semantic_dataset_namespaces_everything(ecommerce):
+    d = draft_semantic_layer(run_discovery(ecommerce).to_dict(), dataset="Retail Q3")
+    assert d["dataset"] == "retail_q3"
+    assert {c["name"] for c in d["cubes"]} == {
+        "retail_q3_orders", "retail_q3_order_items", "retail_q3_customers", "retail_q3_products"}
+    orders = next(c["data"] for c in d["cubes"] if c["name"] == "retail_q3_orders")
+    assert orders["sql"] == "SELECT * FROM retail_q3.orders"
+    assert orders["joins"] == {"retail_q3_customers": {
+        "sql": "${CUBE}.customer_id = ${retail_q3_customers.id}", "relationship": "many_to_one"}}
+    v = next(v["data"] for v in d["views"] if v["name"] == "retail_q3_orders_view")
+    assert [e["join_path"] for e in v["cubes"]] == ["retail_q3_orders", "retail_q3_orders.retail_q3_customers"]
+    assert d["roles"]["retail_q3_orders"] == "fact"
+    assert set(d["sources"]) == {"orders", "order_items", "customers", "products"}
+
+
+def test_dataset_name_is_schema_safe():
+    from discovery.semantic import dataset_name
+    assert dataset_name("Retail Q3") == "retail_q3"
+    assert dataset_name("2024-sales") == "ds_2024_sales"
+
+
+def test_load_data_refuses_without_dataset(ecommerce):
+    from discovery.publish import load_data
+    with pytest.raises(ValueError, match="dataset"):
+        load_data(draft_semantic_layer(run_discovery(ecommerce).to_dict()))
+
+
+def test_seed_from_draft_detects_name_clashes():
+    sys.path.insert(0, str(REPO_ROOT / "library"))
+    from seed import _draft_collisions
+    draft = {"cubes": [{"name": "shop_orders"}, {"name": "orders"}],
+             "views": [{"name": "shop_orders_view"}]}
+    existing = {"CUBE_CONFIG": {"orders": 1}, "VIEW": {"sales": 2}}
+    assert _draft_collisions(draft, existing) == ["CUBE_CONFIG orders"]

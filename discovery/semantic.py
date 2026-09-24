@@ -9,8 +9,9 @@ can post back what it already has plus the joins the user approved/edited.
       -> one public view per fact/bridge grain, dimensions attached via
          grain-preserving (many_to_one / one_to_one) join paths
 
-Emits the same shape as library/seed.py. Nothing is pushed anywhere — the
-output is a draft for review. Names/descriptions are deliberately plain; a
+Emits the same shape as library/seed.py, namespaced by dataset. Nothing is
+pushed anywhere — the output is a draft for review; `seed.py --from-draft`
+loads it (see publish.py for the data side). Names/descriptions are deliberately plain; a
 later LLM pass rewrites them. See docs/SCHEMA_DISCOVERY.md.
 """
 
@@ -103,8 +104,19 @@ def _numeric_kind(name: str, col: dict) -> str:
     return "additive"
 
 
+def dataset_name(raw: str) -> str:
+    """Folder name -> a safe Postgres schema / Cube name prefix (e.g. 'Retail Q3' -> 'retail_q3')."""
+    name = re.sub(r"[^a-z0-9_]+", "_", raw.lower()).strip("_")
+    return f"ds_{name}" if not name or name[0].isdigit() else name
+
+
+def _cn(ds: str | None, table: str) -> str:
+    """Cube name for a table — namespaced by dataset so it can't clobber live cubes."""
+    return f"{ds}_{table}" if ds else table
+
+
 def _build_cube(table: str, prof: dict, grain: dict, role: str,
-                joins: list[dict], notes: list[str]) -> dict:
+                joins: list[dict], notes: list[str], ds: str | None = None) -> dict:
     key = grain["key"] or []
     fk_cols = {j["fk_column"] for j in joins if j["fk_table"] == table}
     dims: dict[str, dict] = {}
@@ -159,14 +171,14 @@ def _build_cube(table: str, prof: dict, grain: dict, role: str,
                               "description": f"{t} value."}
 
     data = {
-        "sql": f"SELECT * FROM {table}",
-        "name": table,
+        "sql": f"SELECT * FROM {ds}.{table}" if ds else f"SELECT * FROM {table}",
+        "name": _cn(ds, table),
         "public": False,
         "description": _cube_description(table, key, role),
     }
     cube_joins = {
-        j["pk_table"]: {
-            "sql": f"${{CUBE}}.{j['fk_column']} = ${{{j['pk_table']}.{j['pk_column']}}}",
+        _cn(ds, j["pk_table"]): {
+            "sql": f"${{CUBE}}.{j['fk_column']} = ${{{_cn(ds, j['pk_table'])}.{j['pk_column']}}}",
             "relationship": j["relationship"],
         }
         for j in joins if j["fk_table"] == table
@@ -175,7 +187,7 @@ def _build_cube(table: str, prof: dict, grain: dict, role: str,
         data["joins"] = cube_joins
     data["measures"] = measures
     data["dimensions"] = dims
-    return {"name": table, "data": data}
+    return {"name": _cn(ds, table), "data": data}
 
 
 def _cube_description(table: str, key: list[str], role: str) -> str:
@@ -212,9 +224,10 @@ def _view_paths(root: str, joins: list[dict], notes: list[str]) -> list[tuple[st
 
 
 def _build_view(root: str, cubes: dict[str, dict], joins: list[dict],
-                notes: list[str]) -> dict:
+                notes: list[str], ds: str | None = None) -> dict:
     entries, attached = [], []
     for table, path in _view_paths(root, joins, notes):
+        path = ".".join(_cn(ds, t) for t in path.split("."))
         data = cubes[table]["data"]
         pk = {n for n, d in data["dimensions"].items() if d.get("primary_key")}
         dims = [n for n in data["dimensions"] if n not in pk]
@@ -228,7 +241,7 @@ def _build_view(root: str, cubes: dict[str, dict], joins: list[dict],
             entry = {"join_path": path, "includes": dims, "prefix": True}
             attached.append(table)
         entries.append(entry)
-    name = f"{root}_view"
+    name = f"{_cn(ds, root)}_view"
     desc = f"Analytics at the {root} grain"
     if attached:
         desc += f", with {', '.join(attached)} attributes"
@@ -240,12 +253,17 @@ def _build_view(root: str, cubes: dict[str, dict], joins: list[dict],
     }}
 
 
-def draft_semantic_layer(discovery: dict, joins: list[dict] | None = None) -> dict:
+def draft_semantic_layer(discovery: dict, joins: list[dict] | None = None,
+                         dataset: str | None = None) -> dict:
     """Discovery dict (+ optional approved joins) -> draft cubes, views, roles, notes.
 
     `joins` uses the discovery join shape ({fk:{table,column}, pk:{...},
     relationship}); omit it to take discovery's accepted joins as-is.
+    `dataset` namespaces everything: tables load into Postgres schema
+    `<dataset>` and cubes/views are named `<dataset>_<table>`, so a draft can
+    never overwrite the live model. Roles are keyed by cube name.
     """
+    ds = dataset_name(dataset) if dataset else None
     notes: list[str] = []
     approved = _approved_joins(discovery, joins)
     for j in approved:
@@ -254,14 +272,18 @@ def draft_semantic_layer(discovery: dict, joins: list[dict] | None = None) -> di
                          f"{j['relationship']} fans out; kept on the cube, left out of views.")
     roles = classify_tables(discovery, approved)
     cubes = {t: _build_cube(t, discovery["tables"][t], discovery["grains"][t],
-                            roles[t], approved, notes)
+                            roles[t], approved, notes, ds)
              for t in discovery["tables"]}
     roots = [t for t, r in roles.items() if r in ("fact", "bridge")]
-    views = [_build_view(r, cubes, approved, notes) for r in roots]
+    views = [_build_view(r, cubes, approved, notes, ds) for r in roots]
     if not views:
         notes.append("No fact table found — no views proposed.")
+    sources = discovery.get("sources", {})
     return {
-        "roles": roles,
+        "dataset": ds,
+        # table -> CSV, for loading the data (only tables that made it into cubes)
+        "sources": {t: sources[t] for t in discovery["tables"] if t in sources},
+        "roles": {_cn(ds, t): r for t, r in roles.items()},
         "cubes": list(cubes.values()),
         "views": views,
         "notes": notes,

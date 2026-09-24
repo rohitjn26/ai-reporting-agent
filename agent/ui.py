@@ -174,7 +174,7 @@ async def discovery_semantic(request: Request):
         return {"error": "Run discovery first."}
     try:
         draft = _load_draft_semantic_layer()
-        return draft(body["discovery"], body.get("joins"))
+        return draft(body["discovery"], body.get("joins"), body.get("dataset") or None)
     except Exception as e:
         return {"error": str(e)}
 
@@ -985,6 +985,13 @@ _HTML = """<!DOCTYPE html>
     #draft-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
     #draft-head h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: .05em; color: #64748b; margin: 0; }
     .draft-btns { display: flex; gap: 6px; }
+    #dataset-row { display: flex; align-items: center; gap: 8px; }
+    #dataset-row label { font-size: 0.75rem; color: #94a3b8; }
+    #dataset-input {
+      flex: 1; background: #0f172a; border: 1px solid #334155; border-radius: 6px;
+      color: #e2e8f0; padding: 5px 8px; font: 0.8rem ui-monospace, monospace;
+    }
+    #dataset-hint { font-size: 0.68rem; color: #475569; margin: 4px 0 8px; }
     #draft-export { background: #2563eb !important; border-color: #2563eb !important; color: #fff !important; }
     #draft-export:disabled { background: #334155 !important; border-color: #334155 !important; color: #64748b !important; }
     #draft-copy, #draft-export {
@@ -1153,6 +1160,11 @@ _HTML = """<!DOCTYPE html>
         <button id="draft-export" onclick="exportSemanticLayer()" disabled>Export semantic layer</button>
       </div>
     </div>
+    <div id="dataset-row">
+      <label for="dataset-input">Dataset</label>
+      <input id="dataset-input" placeholder="folder name" onchange="refreshDraft()"/>
+    </div>
+    <div id="dataset-hint">Postgres schema + cube/view name prefix — keeps this dataset apart from the live model.</div>
     <div id="draft-body"><span class="draft-empty">Run discovery — the proposed cubes and views appear here and update as you review joins.</span></div>
   </div>
 
@@ -2070,6 +2082,8 @@ _HTML = """<!DOCTYPE html>
       d.joins.uncertain.forEach(j => relState[relKey(j)] = { j, status: 'uncertain', relationship: j.relationship });
       activeKey = null;
       cubeExcl = new Set(); viewExcl = new Set();
+      const folder = document.getElementById('folder-input').value.trim().replace(/[/]+$/, '');
+      document.getElementById('dataset-input').value = folder.split('/').pop() || '';
       refreshDraft();
       status.textContent = 'Done — ' + d.joins.accepted.length + ' accepted, ' +
                            d.joins.uncertain.length + ' uncertain.';
@@ -2208,15 +2222,24 @@ _HTML = """<!DOCTYPE html>
     try {
       const r = await fetch('/discovery/semantic', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ discovery: discData, joins })
+        body: JSON.stringify({ discovery: discData, joins,
+                               dataset: document.getElementById('dataset-input').value.trim() })
       });
       const d = await r.json();
       if (seq !== draftSeq) return;
       if (d.error) { draft = null; renderDraft(d.error); return; }
       draft = d;
+      if (d.dataset) document.getElementById('dataset-input').value = d.dataset;  // show the sanitised name
       renderDraft();
     } catch (e) { if (seq === draftSeq) { draft = null; renderDraft(e.message); } }
   }
+
+  // removal keys use un-prefixed names so they survive a dataset rename
+  const bare = n => {
+    const p = draft && draft.dataset ? draft.dataset + '_' : '';
+    return p && n.startsWith(p) ? n.slice(p.length) : n;
+  };
+  const barePath = p => p.split('.').map(bare).join('.');
 
   // the draft with removals applied — what Copy JSON exports
   function effectiveDraft() {
@@ -2224,7 +2247,7 @@ _HTML = """<!DOCTYPE html>
     d.cubes.forEach(cb => {
       ['measures', 'dimensions'].forEach(kind => {
         Object.keys(cb.data[kind]).forEach(n => {
-          if (cubeExcl.has(cb.name + '.' + n) && !cb.data[kind][n].primary_key) delete cb.data[kind][n];
+          if (cubeExcl.has(bare(cb.name) + '.' + n) && !cb.data[kind][n].primary_key) delete cb.data[kind][n];
         });
       });
     });
@@ -2232,7 +2255,8 @@ _HTML = """<!DOCTYPE html>
       v.data.cubes = v.data.cubes.map(e => {
         const table = e.join_path.split('.').pop();
         e.includes = e.includes.filter(n =>
-          !cubeExcl.has(table + '.' + n) && !viewExcl.has(v.name + '|' + e.join_path + '|' + n));
+          !cubeExcl.has(bare(table) + '.' + n) &&
+          !viewExcl.has(bare(v.name) + '|' + barePath(e.join_path) + '|' + n));
         return e;
       }).filter(e => e.includes.length);   // Cube rejects an empty includes list
       return v;
@@ -2276,11 +2300,11 @@ _HTML = """<!DOCTYPE html>
         const c = cubes[table] || { measures: {}, dimensions: {} };
         const pfx = e.prefix ? table + '_' : '';
         const item = n => {
-          const key = 'v|' + v.name + '|' + e.join_path + '|' + n;
+          const key = 'v|' + bare(v.name) + '|' + barePath(e.join_path) + '|' + n;
           return { label: pfx + n, key, off: viewExcl.has(key.slice(2)) };
         };
         // members removed at cube level vanish from views entirely
-        const inc = e.includes.filter(n => !cubeExcl.has(table + '.' + n));
+        const inc = e.includes.filter(n => !cubeExcl.has(bare(table) + '.' + n));
         const ms = inc.filter(n => n in c.measures);
         const ds = inc.filter(n => !(n in c.measures));
         const time = ds.filter(n => (c.dimensions[n] || {}).type === 'time');
@@ -2298,7 +2322,7 @@ _HTML = """<!DOCTYPE html>
     draft.cubes.forEach(cb => {
       const c = cb.data;
       const item = (n, label) => {
-        const key = 'c|' + cb.name + '.' + n;
+        const key = 'c|' + bare(cb.name) + '.' + n;
         return { label, key, off: cubeExcl.has(key.slice(2)) };
       };
       const dims = Object.entries(c.dimensions);
@@ -2344,16 +2368,17 @@ _HTML = """<!DOCTYPE html>
   function exportSemanticLayer() {
     if (!draft) return;
     const d = effectiveDraft();
-    const text = JSON.stringify({ cubes: d.cubes, views: d.views, notes: d.notes }, null, 2);
+    const text = JSON.stringify({ dataset: d.dataset, sources: d.sources,
+                                  cubes: d.cubes, views: d.views, notes: d.notes }, null, 2);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
-    a.download = 'semantic_layer.json';
+    a.download = (d.dataset || 'semantic_layer') + '.json';
     document.body.appendChild(a);
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     document.getElementById('scan-status').textContent =
-      'Exported semantic_layer.json — ' + d.cubes.length + ' cubes, ' + d.views.length + ' views.';
+      'Exported ' + a.download + ' — load it with: python library/seed.py --from-draft ' + a.download + ' · ' + d.cubes.length + ' cubes, ' + d.views.length + ' views.';
   }
 
   function copyDraft() {

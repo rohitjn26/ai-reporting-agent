@@ -9,8 +9,11 @@ Run:
   python seed.py                     # create configs (fresh install)
   python seed.py --update            # upsert: patch existing configs by name
   python seed.py --url http://host   # target a different library API
+  python seed.py --from-draft semantic_layer.json   # load a Schema-tab export:
+                                     # CSVs -> Postgres schema <dataset>, then cubes + views
 """
 import argparse, json, sys
+from pathlib import Path
 import urllib.request, urllib.error
 
 CUBE_CONFIGS = [
@@ -395,14 +398,58 @@ def _seed(base: str, resource_type: str, configs: list, update: bool) -> None:
     print()
 
 
+def _draft_collisions(draft: dict, existing: dict[str, dict]) -> list[str]:
+    """Draft cube/view names that already exist in the library."""
+    return [f"{rtype} {cfg['name']}"
+            for rtype, key in (("CUBE_CONFIG", "cubes"), ("VIEW", "views"))
+            for cfg in draft.get(key, []) if cfg["name"] in existing.get(rtype, {})]
+
+
+def _from_draft(base: str, path: str, force: bool, skip_data: bool, pg_url: str | None) -> None:
+    """Seed a Schema-tab export: load its CSVs into Postgres, then upsert cubes + views."""
+    with open(path) as f:
+        draft = json.load(f)
+    existing = {t: _existing_by_name(base, t) for t in ("CUBE_CONFIG", "VIEW")}
+    clashes = _draft_collisions(draft, existing)
+    if clashes and not force:
+        sys.exit("Refusing to overwrite existing library entries (use --force):\n  "
+                 + "\n  ".join(clashes))
+
+    if not skip_data:
+        # discovery/ lives at the repo root; appended so it can't shadow installed packages
+        sys.path.append(str(Path(__file__).resolve().parent.parent))
+        from discovery.publish import DEFAULT_PG_URL, load_data
+        print(f"Loading data into Postgres schema '{draft.get('dataset')}' ...")
+        for table, rows in load_data(draft, pg_url or DEFAULT_PG_URL).items():
+            print(f"  {table}: {rows} rows")
+        print()
+
+    _seed(base, "CUBE_CONFIG", draft.get("cubes", []), update=True)
+    _seed(base, "VIEW", draft.get("views", []), update=True)
+    for note in draft.get("notes", []):
+        print(f"  note: {note}")
+    print("Done. Reload the Cube schema so the new views reach /meta.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://localhost:3001")
     parser.add_argument("--update", action="store_true",
                         help="Upsert: patch existing configs (by name) instead of creating duplicates.")
+    parser.add_argument("--from-draft", metavar="JSON",
+                        help="Seed a semantic_layer.json exported from the Schema tab instead of the built-in configs.")
+    parser.add_argument("--force", action="store_true",
+                        help="--from-draft: overwrite library entries that already exist by name.")
+    parser.add_argument("--skip-data", action="store_true",
+                        help="--from-draft: don't (re)load the CSVs into Postgres.")
+    parser.add_argument("--pg-url", help="--from-draft: analytics Postgres URL "
+                        "(default $ANALYTICS_DB_URL or localhost:5432/reporting).")
     args = parser.parse_args()
 
     base = args.url.rstrip("/")
+    if args.from_draft:
+        _from_draft(base, args.from_draft, args.force, args.skip_data, args.pg_url)
+        return
     # Cubes first (views reference them), then views.
     _seed(base, "CUBE_CONFIG", CUBE_CONFIGS, args.update)
     _seed(base, "VIEW", VIEW_CONFIGS, args.update)

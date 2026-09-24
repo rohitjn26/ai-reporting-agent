@@ -1,6 +1,6 @@
 """CLI: point at CSVs (a folder or explicit files), print discovered schema.
 
-    python -m discovery <folder-or-files...> [--json | --semantic]
+    python -m discovery <folder-or-files...> [--json | --semantic [--dataset NAME]]
 
 With a folder, every *.csv inside is loaded.
 """
@@ -61,6 +61,8 @@ def main() -> None:
     ap.add_argument("--json", action="store_true", help="emit full result as JSON")
     ap.add_argument("--semantic", action="store_true",
                     help="emit a draft Cube semantic layer (cubes + views) as JSON")
+    ap.add_argument("--dataset", help="--semantic: namespace (Postgres schema + cube prefix); "
+                                      "defaults to the folder name")
     args = ap.parse_args()
 
     files = _collect_files(args.paths)
@@ -70,7 +72,10 @@ def main() -> None:
 
     result = run_discovery(files)
     if args.semantic:
-        print(json.dumps(draft_semantic_layer(result.to_dict()), indent=2, default=str))
+        dataset = args.dataset or (Path(args.paths[0]).resolve().name
+                                   if Path(args.paths[0]).is_dir() else None)
+        print(json.dumps(draft_semantic_layer(result.to_dict(), dataset=dataset),
+                         indent=2, default=str))
     elif args.json:
         print(json.dumps(result.to_dict(), indent=2, default=str))
     else:

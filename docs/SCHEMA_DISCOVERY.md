@@ -172,7 +172,11 @@ Flow to live Cube (a later step, out of v1 scope): `seed.py --update` → `reloa
 - **Views:** one per fact/bridge (`<table>_view`). BFS over `many_to_one`/`one_to_one` joins gives the `join_path`s; the root contributes measures + dimensions, joined cubes contribute dimensions only with `prefix: true`. Fan-out joins stay on the cube but out of views; ambiguous equal-length paths are noted.
 - On the e-commerce fixtures this re-derives the hand-written `sales` / `product_sales` split (orders view + order_items view).
 
-Surfaces: `python -m discovery <folder> --semantic`, `POST /discovery/semantic` (UI "Copy semantic-layer draft" sends the reviewed joins). Still a draft — pushing to the library (`seed.py --update`) is manual.
+Surfaces: `python -m discovery <folder> --semantic [--dataset NAME]`, `POST /discovery/semantic`, and the Schema tab's live draft panel (remove members per view or per cube, then **Export semantic layer** → `<dataset>.json`).
+
+**Dataset namespace.** Every draft is namespaced by a dataset (default: the CSV folder name, sanitised). Tables load into Postgres schema `<dataset>`, cubes/views are named `<dataset>_<table>[_view]`, so a draft can never clobber the live model (the fixtures reuse `orders`/`customers`).
+
+**Publishing.** `python library/seed.py --from-draft <dataset>.json` → (1) refuses if any cube/view name already exists in the library (unless `--force`); (2) `discovery/publish.py` loads each source CSV into Postgres via DuckDB's postgres extension (`ATTACH … (TYPE postgres)`, `CREATE TABLE pg.<dataset>.<table> AS SELECT * FROM read_csv_auto(…)`) — DuckDB's type inference carries over, no hand-written DDL (`--skip-data` to skip; `--pg-url` / `$ANALYTICS_DB_URL`); (3) upserts cubes then views. Reload the Cube schema afterwards.
 
 ## Scale & performance
 

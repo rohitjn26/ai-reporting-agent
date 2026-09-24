@@ -977,6 +977,53 @@ _HTML = """<!DOCTYPE html>
     .legend .sw { display: inline-block; width: 18px; height: 0; vertical-align: middle;
       margin-right: 6px; border-top-width: 2px; border-top-style: solid; }
 
+    /* semantic draft panel */
+    #draft-side {
+      width: 380px; flex-shrink: 0; background: #111c30; border-left: 1px solid #334155;
+      display: flex; flex-direction: column; overflow-y: auto; padding: 16px;
+    }
+    #draft-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+    #draft-head h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: .05em; color: #64748b; margin: 0; }
+    .draft-btns { display: flex; gap: 6px; }
+    #draft-export { background: #2563eb !important; border-color: #2563eb !important; color: #fff !important; }
+    #draft-export:disabled { background: #334155 !important; border-color: #334155 !important; color: #64748b !important; }
+    #draft-copy, #draft-export {
+      background: #1e293b; border: 1px solid #334155; color: #cbd5e1; cursor: pointer;
+      border-radius: 5px; padding: 4px 10px; font: 0.75rem system-ui;
+    }
+    #draft-copy:disabled, #draft-export:disabled { color: #475569; cursor: default; }
+    .draft-empty { color: #475569; font-size: 0.82rem; }
+    .draft-sec { font-size: 0.72rem; text-transform: uppercase; letter-spacing: .05em;
+      color: #64748b; margin: 14px 0 6px; }
+    .draft-note { background: #3b2a0b; border: 1px solid #92400e; color: #fcd34d; border-radius: 6px;
+      padding: 6px 8px; font-size: 0.75rem; margin-bottom: 6px; }
+    .draft-card { border: 1px solid #334155; border-radius: 8px; background: #0f172a;
+      padding: 10px; margin-bottom: 8px; font-size: 0.8rem; }
+    .draft-card.view { border-left: 3px solid #3b82f6; }
+    .draft-name { color: #e2e8f0; font-family: ui-monospace, monospace; font-weight: 600; }
+    .draft-desc { color: #64748b; margin: 3px 0 6px; font-size: 0.75rem; }
+    .draft-path { color: #94a3b8; font-family: ui-monospace, monospace; font-size: 0.72rem; margin: 8px 0 4px; }
+    .draft-path .pfx { color: #475569; }
+    .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .chip { border-radius: 4px; padding: 1px 6px; font: 0.7rem ui-monospace, monospace; }
+    .chip.m { background: #1e3a5f; color: #93c5fd; }
+    .chip.d { background: #1e293b; color: #cbd5e1; }
+    .chip.t { background: #1e3b2f; color: #86efac; }
+    .chip.k { background: #3b1e3b; color: #f0abfc; }
+    .chip.rm { cursor: pointer; }
+    .chip.rm b { color: #64748b; font-weight: 400; margin-left: 2px; }
+    .chip.rm:hover b { color: #f87171; }
+    .chip.off { opacity: .4; text-decoration: line-through; }
+    .role { font-size: 0.65rem; border-radius: 4px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; }
+    .role.fact { background: #1e3a5f; color: #93c5fd; }
+    .role.dimension { background: #1e293b; color: #94a3b8; }
+    .role.bridge { background: #2a1e3b; color: #d8b4fe; }
+    .draft-card details summary { cursor: pointer; list-style: none; }
+    .draft-card details summary::-webkit-details-marker { display: none; }
+    .draft-card details summary::before { content: "▸ "; color: #475569; }
+    .draft-card details[open] summary::before { content: "▾ "; }
+    .draft-join { color: #94a3b8; font: 0.7rem ui-monospace, monospace; margin-top: 4px; }
+
     /* relationship review cards */
     .join-item { cursor: pointer; }
     .join-item.active { outline: 2px solid #38bdf8; }
@@ -1089,7 +1136,6 @@ _HTML = """<!DOCTYPE html>
 
     <h2>Relationships <span id="rel-count" style="color:#475569"></span></h2>
     <div id="join-panel"><span style="color:#475569;font-size:0.82rem">Discovered joins appear here.</span></div>
-    <button class="primary" id="export-btn" onclick="exportDraft()" style="margin-top:10px;display:none">Copy semantic-layer draft</button>
   </div>
   <div id="cy-wrap">
     <div id="cy"></div>
@@ -1098,6 +1144,16 @@ _HTML = """<!DOCTYPE html>
       <div><span class="sw" style="border-color:#22c55e"></span>accepted</div>
       <div><span class="sw" style="border-color:#f59e0b;border-top-style:dashed"></span>uncertain</div>
     </div>
+  </div>
+  <div id="draft-side">
+    <div id="draft-head">
+      <h2>Semantic draft <span id="draft-count" style="color:#475569"></span></h2>
+      <div class="draft-btns">
+        <button id="draft-copy" onclick="copyDraft()" disabled>Copy JSON</button>
+        <button id="draft-export" onclick="exportSemanticLayer()" disabled>Export semantic layer</button>
+      </div>
+    </div>
+    <div id="draft-body"><span class="draft-empty">Run discovery — the proposed cubes and views appear here and update as you review joins.</span></div>
   </div>
 
   <!-- folder browser modal -->
@@ -2013,6 +2069,8 @@ _HTML = """<!DOCTYPE html>
       d.joins.accepted.forEach(j => relState[relKey(j)] = { j, status: 'accepted', relationship: j.relationship });
       d.joins.uncertain.forEach(j => relState[relKey(j)] = { j, status: 'uncertain', relationship: j.relationship });
       activeKey = null;
+      cubeExcl = new Set(); viewExcl = new Set();
+      refreshDraft();
       status.textContent = 'Done — ' + d.joins.accepted.length + ' accepted, ' +
                            d.joins.uncertain.length + ' uncertain.';
       rebuild();
@@ -2051,14 +2109,13 @@ _HTML = """<!DOCTYPE html>
     panel.innerHTML = html;
     const accepted = rels.filter(([, r]) => r.status === 'accepted').length;
     document.getElementById('rel-count').textContent = rels.length ? '(' + accepted + '/' + rels.length + ' approved)' : '';
-    document.getElementById('export-btn').style.display = accepted ? 'block' : 'none';
   }
 
   function setStatus(key, status) {
-    if (relState[key]) { relState[key].status = status; rebuild(); }
+    if (relState[key]) { relState[key].status = status; rebuild(); refreshDraft(); }
   }
   function setRelType(key, val) {
-    if (relState[key]) { relState[key].relationship = val; }
+    if (relState[key]) { relState[key].relationship = val; refreshDraft(); }
   }
 
   function highlightRel(key) {
@@ -2134,8 +2191,17 @@ _HTML = """<!DOCTYPE html>
     cy.on('tap', evt => { if (evt.target === cy) { activeKey = null; highlightRel(null); } });
   }
 
-  async function exportDraft() {
-    const status = document.getElementById('scan-status');
+  // ── semantic-layer draft preview ──
+  // `draft` is what the server generated; user removals live in two sets and are
+  // re-applied on every regenerate, so they survive join edits.
+  let draft = null;
+  let draftSeq = 0;              // drop responses that arrive after a newer request
+  let cubeExcl = new Set();      // "table.member" — removed from the cube (and so every view)
+  let viewExcl = new Set();      // "view|join_path|member" — removed from one view only
+
+  async function refreshDraft() {
+    if (!discData) return;
+    const seq = ++draftSeq;
     const joins = Object.values(relState)
       .filter(r => r.status === 'accepted')
       .map(r => ({ ...r.j, relationship: r.relationship }));
@@ -2145,15 +2211,160 @@ _HTML = """<!DOCTYPE html>
         body: JSON.stringify({ discovery: discData, joins })
       });
       const d = await r.json();
-      if (d.error) { status.textContent = 'Draft failed: ' + d.error; return; }
-      const text = JSON.stringify({ cubes: d.cubes, views: d.views }, null, 2);
-      const summary = d.cubes.length + ' cubes, ' + d.views.length + ' views' +
-                      (d.notes.length ? ' · ' + d.notes.length + ' note(s): ' + d.notes.join(' | ') : '');
-      navigator.clipboard.writeText(text).then(
-        () => { status.textContent = 'Semantic-layer draft copied — ' + summary; },
-        () => { window.prompt('Copy the semantic-layer draft:', text); }
-      );
-    } catch (e) { status.textContent = 'Draft failed: ' + e.message; }
+      if (seq !== draftSeq) return;
+      if (d.error) { draft = null; renderDraft(d.error); return; }
+      draft = d;
+      renderDraft();
+    } catch (e) { if (seq === draftSeq) { draft = null; renderDraft(e.message); } }
+  }
+
+  // the draft with removals applied — what Copy JSON exports
+  function effectiveDraft() {
+    const d = JSON.parse(JSON.stringify(draft));
+    d.cubes.forEach(cb => {
+      ['measures', 'dimensions'].forEach(kind => {
+        Object.keys(cb.data[kind]).forEach(n => {
+          if (cubeExcl.has(cb.name + '.' + n) && !cb.data[kind][n].primary_key) delete cb.data[kind][n];
+        });
+      });
+    });
+    d.views = d.views.map(v => {
+      v.data.cubes = v.data.cubes.map(e => {
+        const table = e.join_path.split('.').pop();
+        e.includes = e.includes.filter(n =>
+          !cubeExcl.has(table + '.' + n) && !viewExcl.has(v.name + '|' + e.join_path + '|' + n));
+        return e;
+      }).filter(e => e.includes.length);   // Cube rejects an empty includes list
+      return v;
+    }).filter(v => v.data.cubes.length);
+    return d;
+  }
+
+  // items: [{label, key, off}] — key null => not removable (primary key)
+  const chips = (items, cls) =>
+    '<div class="chips">' + items.map(it =>
+      '<span class="chip ' + cls + (it.off ? ' off' : '') + (it.key ? ' rm' : '') + '"' +
+      (it.key ? ' data-x="' + escapeHtml(it.key) + '" title="' + (it.off ? 'Click to restore' : 'Click to remove') + '"' : '') +
+      '>' + escapeHtml(it.label) + (it.key && !it.off ? ' <b>×</b>' : '') + '</span>').join('') + '</div>';
+
+  function renderDraft(error) {
+    const body = document.getElementById('draft-body');
+    document.getElementById('draft-copy').disabled = !draft;
+    document.getElementById('draft-export').disabled = !draft;
+    if (!draft) {
+      document.getElementById('draft-count').textContent = '';
+      body.innerHTML = '<div class="draft-note">Draft failed: ' + escapeHtml(error || 'unknown error') + '</div>';
+      return;
+    }
+    const eff = effectiveDraft();
+    const removed = cubeExcl.size + viewExcl.size;
+    document.getElementById('draft-count').textContent =
+      '(' + eff.views.length + ' views · ' + eff.cubes.length + ' cubes' +
+      (removed ? ' · ' + removed + ' removed' : '') + ')';
+    const cubes = {};
+    draft.cubes.forEach(c => cubes[c.name] = c.data);
+    let html = '';
+    draft.notes.forEach(n => html += '<div class="draft-note">' + escapeHtml(n) + '</div>');
+
+    html += '<div class="draft-sec">Views — public</div>';
+    if (!draft.views.length) html += '<span class="draft-empty">No fact table found.</span>';
+    draft.views.forEach(v => {
+      html += '<div class="draft-card view"><div class="draft-name">' + escapeHtml(v.name) + '</div>' +
+              '<div class="draft-desc">' + escapeHtml(v.data.description || '') + '</div>';
+      v.data.cubes.forEach(e => {
+        const table = e.join_path.split('.').pop();
+        const c = cubes[table] || { measures: {}, dimensions: {} };
+        const pfx = e.prefix ? table + '_' : '';
+        const item = n => {
+          const key = 'v|' + v.name + '|' + e.join_path + '|' + n;
+          return { label: pfx + n, key, off: viewExcl.has(key.slice(2)) };
+        };
+        // members removed at cube level vanish from views entirely
+        const inc = e.includes.filter(n => !cubeExcl.has(table + '.' + n));
+        const ms = inc.filter(n => n in c.measures);
+        const ds = inc.filter(n => !(n in c.measures));
+        const time = ds.filter(n => (c.dimensions[n] || {}).type === 'time');
+        const plain = ds.filter(n => (c.dimensions[n] || {}).type !== 'time');
+        html += '<div class="draft-path">' + escapeHtml(e.join_path) +
+                (e.prefix ? ' <span class="pfx">(prefixed)</span>' : '') + '</div>';
+        if (ms.length) html += chips(ms.map(item), 'm');
+        if (time.length) html += chips(time.map(item), 't');
+        if (plain.length) html += chips(plain.map(item), 'd');
+      });
+      html += '</div>';
+    });
+
+    html += '<div class="draft-sec">Cubes — private</div>';
+    draft.cubes.forEach(cb => {
+      const c = cb.data;
+      const item = (n, label) => {
+        const key = 'c|' + cb.name + '.' + n;
+        return { label, key, off: cubeExcl.has(key.slice(2)) };
+      };
+      const dims = Object.entries(c.dimensions);
+      const pk = dims.filter(([, d]) => d.primary_key).map(([n]) => ({ label: n, key: null }));
+      const other = dims.filter(([, d]) => !d.primary_key)
+                        .map(([n, d]) => item(n, n + (d.type === 'string' ? '' : ' · ' + d.type)));
+      const role = draft.roles[cb.name] || '';
+      const open = openCubes.has(cb.name) ? ' open' : '';
+      html += '<div class="draft-card"><details data-cube="' + escapeHtml(cb.name) + '"' + open + '>' +
+              '<summary><span class="draft-name">' + escapeHtml(cb.name) +
+              '</span><span class="role ' + role + '">' + role + '</span></summary>' +
+              '<div class="draft-desc">' + escapeHtml(c.description || '') + '</div>';
+      Object.entries(c.joins || {}).forEach(([t, j]) =>
+        html += '<div class="draft-join">→ ' + escapeHtml(t) + ' · ' + escapeHtml(j.relationship) + '</div>');
+      if (pk.length) html += '<div class="draft-path">primary key</div>' + chips(pk, 'k');
+      html += '<div class="draft-path">measures</div>' +
+              chips(Object.entries(c.measures).map(([n, m]) => item(n, n + ' · ' + m.type)), 'm');
+      if (other.length) html += '<div class="draft-path">dimensions</div>' + chips(other, 'd');
+      html += '</details></div>';
+    });
+    body.innerHTML = html;
+  }
+
+  // keep expanded cube cards open across re-renders
+  const openCubes = new Set();
+  document.getElementById('draft-body').addEventListener('toggle', e => {
+    const name = e.target.dataset && e.target.dataset.cube;
+    if (name) e.target.open ? openCubes.add(name) : openCubes.delete(name);
+  }, true);
+
+  // chip click: toggle removal (c|table.member or v|view|path|member)
+  document.getElementById('draft-body').addEventListener('click', e => {
+    const chip = e.target.closest('.chip[data-x]');
+    if (!chip) return;
+    const x = chip.dataset.x;
+    const set = x.startsWith('c|') ? cubeExcl : viewExcl;
+    const key = x.slice(2);
+    set.has(key) ? set.delete(key) : set.add(key);
+    renderDraft();
+  });
+
+  // download the reviewed draft as seed.py-shaped JSON (CUBE_CONFIGS + VIEW_CONFIGS)
+  function exportSemanticLayer() {
+    if (!draft) return;
+    const d = effectiveDraft();
+    const text = JSON.stringify({ cubes: d.cubes, views: d.views, notes: d.notes }, null, 2);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    a.download = 'semantic_layer.json';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    document.getElementById('scan-status').textContent =
+      'Exported semantic_layer.json — ' + d.cubes.length + ' cubes, ' + d.views.length + ' views.';
+  }
+
+  function copyDraft() {
+    if (!draft) return;
+    const d = effectiveDraft();
+    const text = JSON.stringify({ cubes: d.cubes, views: d.views }, null, 2);
+    const status = document.getElementById('scan-status');
+    navigator.clipboard.writeText(text).then(
+      () => { status.textContent = 'Semantic-layer draft copied to clipboard.'; },
+      () => { window.prompt('Copy the semantic-layer draft:', text); }
+    );
   }
 </script>
 </body>

@@ -20,6 +20,7 @@ app.get("/", response_class=HTMLResponse)(lambda: ui._HTML)
 app.get("/discovery/list")(ui.discovery_list)
 app.get("/discovery/browse")(ui.discovery_browse)
 app.post("/discovery/run")(ui.discovery_run)
+app.post("/discovery/semantic")(ui.discovery_semantic)
 
 
 if __name__ == "__main__":

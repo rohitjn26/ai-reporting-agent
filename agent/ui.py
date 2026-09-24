@@ -114,6 +114,12 @@ def _load_run_discovery():
     return run_discovery
 
 
+def _load_draft_semantic_layer():
+    _load_run_discovery()  # puts the repo root on sys.path
+    from discovery import draft_semantic_layer
+    return draft_semantic_layer
+
+
 @app.get("/discovery/list")
 def discovery_list(folder: str):
     """List *.csv files in a folder so the user can pick which to import."""
@@ -156,6 +162,19 @@ async def discovery_run(request: Request):
     try:
         run_discovery = _load_run_discovery()
         return await asyncio.to_thread(lambda: run_discovery(files).to_dict())
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/discovery/semantic")
+async def discovery_semantic(request: Request):
+    """Draft cubes + views from a discovery result and the user-approved joins."""
+    body = await request.json()
+    if not body.get("discovery"):
+        return {"error": "Run discovery first."}
+    try:
+        draft = _load_draft_semantic_layer()
+        return draft(body["discovery"], body.get("joins"))
     except Exception as e:
         return {"error": str(e)}
 
@@ -1070,7 +1089,7 @@ _HTML = """<!DOCTYPE html>
 
     <h2>Relationships <span id="rel-count" style="color:#475569"></span></h2>
     <div id="join-panel"><span style="color:#475569;font-size:0.82rem">Discovered joins appear here.</span></div>
-    <button class="primary" id="export-btn" onclick="exportDraft()" style="margin-top:10px;display:none">Copy approved draft</button>
+    <button class="primary" id="export-btn" onclick="exportDraft()" style="margin-top:10px;display:none">Copy semantic-layer draft</button>
   </div>
   <div id="cy-wrap">
     <div id="cy"></div>
@@ -2115,22 +2134,26 @@ _HTML = """<!DOCTYPE html>
     cy.on('tap', evt => { if (evt.target === cy) { activeKey = null; highlightRel(null); } });
   }
 
-  function exportDraft() {
-    const byCube = {};
-    Object.values(relState).forEach(r => {
-      if (r.status !== 'accepted') return;
-      const j = r.j;
-      byCube[j.fk.table] = byCube[j.fk.table] || { joins: {} };
-      byCube[j.fk.table].joins[j.pk.table] = {
-        sql: '${CUBE}.' + j.fk.column + ' = ${' + j.pk.table + '.' + j.pk.column + '}',
-        relationship: r.relationship
-      };
-    });
-    const text = JSON.stringify(byCube, null, 2);
-    navigator.clipboard.writeText(text).then(
-      () => { document.getElementById('scan-status').textContent = 'Approved draft copied to clipboard.'; },
-      () => { window.prompt('Copy the approved draft:', text); }
-    );
+  async function exportDraft() {
+    const status = document.getElementById('scan-status');
+    const joins = Object.values(relState)
+      .filter(r => r.status === 'accepted')
+      .map(r => ({ ...r.j, relationship: r.relationship }));
+    try {
+      const r = await fetch('/discovery/semantic', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ discovery: discData, joins })
+      });
+      const d = await r.json();
+      if (d.error) { status.textContent = 'Draft failed: ' + d.error; return; }
+      const text = JSON.stringify({ cubes: d.cubes, views: d.views }, null, 2);
+      const summary = d.cubes.length + ' cubes, ' + d.views.length + ' views' +
+                      (d.notes.length ? ' · ' + d.notes.length + ' note(s): ' + d.notes.join(' | ') : '');
+      navigator.clipboard.writeText(text).then(
+        () => { status.textContent = 'Semantic-layer draft copied — ' + summary; },
+        () => { window.prompt('Copy the semantic-layer draft:', text); }
+      );
+    } catch (e) { status.textContent = 'Draft failed: ' + e.message; }
   }
 </script>
 </body>

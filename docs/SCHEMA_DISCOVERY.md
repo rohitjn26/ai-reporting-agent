@@ -163,6 +163,17 @@ The emitted shape matches `VIEW_CONFIGS`:
 
 Flow to live Cube (a later step, out of v1 scope): `seed.py --update` → `reload_cube_schema`. The existing `build_utils.js` already handles the `join_path`-as-function and interpolating-`sql` gotchas; the tool only emits this json.
 
+## Semantic-layer draft (built, rules-based)
+
+`discovery/semantic.py` → `draft_semantic_layer(discovery_dict, joins=None)` turns a discovery result plus the user-approved joins into `CUBE_CONFIGS` / `VIEW_CONFIGS`-shaped drafts. No LLM; names and descriptions are plain placeholders for a later LLM pass.
+
+- **Roles:** *bridge* = composite grain of all-FK columns; *fact* = has an outgoing join and an additive measure (or nothing joins into it); isolated tables are facts; everything else is a *dimension*.
+- **Cubes:** one per table, `public: false`, `SELECT * FROM <table>`. PK from grain (composite → a `CONCAT` `pk` dimension; undetermined → note). FK columns are omitted (join plumbing). Text/date/bool → dimensions. Numbers on facts/bridges → `sum` + `avg` measures; name hints (`price`, `rate`, `grade`, …) mark non-additive → `avg` only; calendar/code ints stay dimensions. Dimension tables aggregate nothing but `count`.
+- **Views:** one per fact/bridge (`<table>_view`). BFS over `many_to_one`/`one_to_one` joins gives the `join_path`s; the root contributes measures + dimensions, joined cubes contribute dimensions only with `prefix: true`. Fan-out joins stay on the cube but out of views; ambiguous equal-length paths are noted.
+- On the e-commerce fixtures this re-derives the hand-written `sales` / `product_sales` split (orders view + order_items view).
+
+Surfaces: `python -m discovery <folder> --semantic`, `POST /discovery/semantic` (UI "Copy semantic-layer draft" sends the reviewed joins). Still a draft — pushing to the library (`seed.py --update`) is manual.
+
 ## Scale & performance
 
 At 10 tables × ~1M rows, **row count is not the bottleneck** — DuckDB handles that trivially (a containment anti-join over 1M rows is sub-second). The blow-up is the number of pairwise checks: ~45 table-pairs × ~20 columns ≈ 18,000 naive containment checks.
@@ -183,7 +194,7 @@ Key moves: cache the loaded data; build each PK column's distinct set once and r
 
 ## Open questions & next
 
-- **Measures/dimensions pass** — v1 stops at joins + additivity classification. The next pass is where the LLM is essential: classify columns into measure types, write descriptions + synonyms, and label the ambiguous paths.
+- **Measures/dimensions pass** — a rules-based draft now exists (above). The next pass is where the LLM is essential: classify columns into measure types, write descriptions + synonyms, and label the ambiguous paths.
 - **Composite foreign keys** — deferred for join *matching*, but composite grain is in scope (needed for the fan-out check and bridge detection). Watch for the case where a join genuinely needs a composite FK.
 - **Runtime wiring** — not yet connected to live Cube; output is a draft artifact. Loading CSVs into Postgres vs a second DuckDB Cube source is a later decision.
 - **Ambiguity review UX** — how competing paths are presented and picked, and how a chosen path emits into the view draft.

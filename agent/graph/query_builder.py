@@ -30,6 +30,7 @@ CubeQuery) so no network is needed.
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, Field
@@ -182,11 +183,17 @@ def validate_query(query: dict, metadata: list[dict]) -> list[str]:
 
 # ── the LLM call ──────────────────────────────────────────────────────────────
 
+# Cached per model: each ChatAnthropic owns an httpx connection pool, and
+# build_query is a hot tool path. Re-creating one per call would open (and then
+# discard) a fresh TLS connection every time; memoizing keeps the pool warm so
+# repeated calls reuse the same keep-alive connection.
+@lru_cache(maxsize=None)
 def _default_llm(model: str):
     from langchain_anthropic import ChatAnthropic
     return ChatAnthropic(model=model, temperature=0).with_structured_output(CubeQuery)
 
 
+@lru_cache(maxsize=None)
 def _default_view_llm(model: str):
     from langchain_anthropic import ChatAnthropic
     return ChatAnthropic(model=model, temperature=0).with_structured_output(ViewSelection)

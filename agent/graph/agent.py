@@ -2,6 +2,7 @@
 LangGraph ReAct agent wired to MCP tool servers + local chart/config tools.
 """
 import asyncio, json, os
+from functools import lru_cache
 import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
@@ -239,6 +240,13 @@ KEEP_RECENT     = 4
 _SUMMARY_MODEL  = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
 
 
+# Reused across summarise calls so the httpx connection pool stays warm
+# (see the query_builder note on connection churn).
+@lru_cache(maxsize=None)
+def _summariser(model: str):
+    return ChatAnthropic(model=model)
+
+
 def _extract_text(content) -> str:
     """Pull plain text from a message content field (str or list-of-blocks)."""
     if isinstance(content, str):
@@ -293,7 +301,7 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
         + conversation
     )
 
-    summariser = ChatAnthropic(model=_SUMMARY_MODEL)
+    summariser = _summariser(_SUMMARY_MODEL)
     response   = await summariser.ainvoke([HumanMessage(content=prompt)])
     summary    = response.content if isinstance(response.content, str) else _extract_text(response.content)
 

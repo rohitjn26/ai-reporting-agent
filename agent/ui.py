@@ -101,6 +101,65 @@ async def dashboard(dashboard_id: str):
         return _replay_error_page("dashboard", str(e))
 
 
+def _load_run_discovery():
+    """Import the standalone discovery package (repo root, sibling of agent/).
+
+    Appended (not inserted) to sys.path so the already-imported `mcp` SDK keeps
+    priority over the repo's local `mcp/` directory.
+    """
+    root = str(Path(__file__).parent.parent)
+    if root not in sys.path:
+        sys.path.append(root)
+    from discovery import run_discovery
+    return run_discovery
+
+
+@app.get("/discovery/list")
+def discovery_list(folder: str):
+    """List *.csv files in a folder so the user can pick which to import."""
+    p = Path(folder).expanduser()
+    if not p.is_dir():
+        return {"error": f"Not a folder: {p}"}
+    files = sorted(str(f) for f in p.glob("*.csv"))
+    return {"folder": str(p), "files": files}
+
+
+@app.get("/discovery/browse")
+def discovery_browse(path: str | None = None):
+    """List subfolders (and CSV count) so the UI can offer a folder picker."""
+    base = Path(path).expanduser() if path else Path.home()
+    try:
+        base = base.resolve()
+        if not base.is_dir():
+            base = base.parent
+        dirs = []
+        for child in sorted(base.iterdir(), key=lambda c: c.name.lower()):
+            try:
+                if child.is_dir() and not child.name.startswith("."):
+                    dirs.append({"name": child.name, "path": str(child)})
+            except (PermissionError, OSError):
+                continue
+        csv_count = len(list(base.glob("*.csv")))
+        parent = str(base.parent) if base.parent != base else None
+        return {"path": str(base), "parent": parent, "dirs": dirs, "csv_count": csv_count}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/discovery/run")
+async def discovery_run(request: Request):
+    """Run schema discovery over the chosen CSVs; return graph + joins + grains."""
+    body = await request.json()
+    files = body.get("files", [])
+    if len(files) < 2:
+        return {"error": "Pick at least two tables."}
+    try:
+        run_discovery = _load_run_discovery()
+        return await asyncio.to_thread(lambda: run_discovery(files).to_dict())
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _sse_headers():
     return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -842,20 +901,126 @@ _HTML = """<!DOCTYPE html>
     }
     #chart-placeholder svg { opacity: .25; }
     #chart-placeholder p { font-size: 0.85rem; }
+
+    /* ── Tabs ── */
+    nav.tabs { display: flex; gap: 4px; margin-left: 18px; }
+    nav.tabs button {
+      background: transparent; border: none; color: #94a3b8; cursor: pointer;
+      font: 0.85rem system-ui; padding: 6px 14px; border-radius: 6px;
+    }
+    nav.tabs button:hover { color: #e2e8f0; background: #273449; }
+    nav.tabs button.active { color: #f1f5f9; background: #334155; }
+
+    /* ── Schema discovery view ── */
+    #view-schema { flex: 1; display: none; min-height: 0; }
+    #view-schema.show { display: flex; }
+    #schema-side {
+      width: 340px; flex-shrink: 0; background: #111c30; border-right: 1px solid #334155;
+      display: flex; flex-direction: column; overflow-y: auto; padding: 16px;
+    }
+    #schema-side h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: .05em;
+      color: #64748b; margin: 14px 0 6px; }
+    #schema-side h2:first-child { margin-top: 0; }
+    .schema-row { display: flex; gap: 6px; }
+    #folder-input {
+      flex: 1; background: #0f172a; border: 1px solid #334155; border-radius: 6px;
+      color: #e2e8f0; padding: 8px 10px; font: 0.85rem system-ui;
+    }
+    #schema-side button.primary {
+      background: #2563eb; color: #fff; border: none; border-radius: 6px;
+      padding: 8px 12px; cursor: pointer; font: 0.85rem system-ui;
+    }
+    #schema-side button.primary:disabled { background: #334155; color: #64748b; cursor: default; }
+    #scan-status { font-size: 0.75rem; color: #64748b; margin-top: 6px; min-height: 14px; }
+    #file-list label {
+      display: flex; align-items: center; gap: 8px; padding: 4px 2px; font-size: 0.85rem;
+      color: #cbd5e1; cursor: pointer;
+    }
+    #run-btn { width: 100%; margin-top: 10px; }
+    .join-item {
+      border: 1px solid #334155; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px;
+      font-size: 0.8rem; background: #0f172a;
+    }
+    .join-item.accepted { border-left: 3px solid #22c55e; }
+    .join-item.uncertain { border-left: 3px solid #f59e0b; }
+    .join-item .jt { color: #e2e8f0; font-family: ui-monospace, monospace; }
+    .join-item .jm { color: #64748b; margin-top: 3px; }
+    #cy-wrap { flex: 1; position: relative; min-width: 0; }
+    #cy { position: absolute; inset: 0; }
+    #cy-empty {
+      position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+      color: #475569; font-size: 0.9rem;
+    }
+    .legend {
+      position: absolute; bottom: 12px; right: 12px; background: #1e293bdd; border: 1px solid #334155;
+      border-radius: 8px; padding: 8px 12px; font-size: 0.72rem; color: #94a3b8;
+    }
+    .legend .sw { display: inline-block; width: 18px; height: 0; vertical-align: middle;
+      margin-right: 6px; border-top-width: 2px; border-top-style: solid; }
+
+    /* relationship review cards */
+    .join-item { cursor: pointer; }
+    .join-item.active { outline: 2px solid #38bdf8; }
+    .join-item.rejected { opacity: .45; }
+    .join-item.rejected .jt { text-decoration: line-through; }
+    .join-actions { display: flex; gap: 6px; align-items: center; margin-top: 6px; }
+    .join-actions button {
+      background: #1e293b; border: 1px solid #334155; color: #cbd5e1; cursor: pointer;
+      border-radius: 5px; padding: 3px 8px; font: 0.72rem system-ui;
+    }
+    .join-actions button:hover { background: #273449; }
+    .join-actions button.on-accept { background: #14532d; border-color: #22c55e; color: #bbf7d0; }
+    .join-actions button.on-reject { background: #4c1d1d; border-color: #ef4444; color: #fecaca; }
+    .join-actions select {
+      background: #0f172a; border: 1px solid #334155; color: #cbd5e1; border-radius: 5px;
+      padding: 2px 4px; font: 0.72rem system-ui; margin-left: auto;
+    }
+
+    /* browse modal */
+    #browse-modal {
+      position: fixed; inset: 0; background: #000a; display: none;
+      align-items: center; justify-content: center; z-index: 1000;
+    }
+    #browse-modal.show { display: flex; }
+    #browse-box {
+      width: 520px; max-height: 70vh; background: #111c30; border: 1px solid #334155;
+      border-radius: 12px; display: flex; flex-direction: column; overflow: hidden;
+    }
+    #browse-head { padding: 12px 16px; border-bottom: 1px solid #334155; display: flex;
+      align-items: center; gap: 10px; }
+    #browse-path { flex: 1; font-family: ui-monospace, monospace; font-size: 0.78rem;
+      color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #browse-list { overflow-y: auto; padding: 6px; flex: 1; }
+    .browse-row { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+      border-radius: 6px; cursor: pointer; font-size: 0.85rem; color: #cbd5e1; }
+    .browse-row:hover { background: #1e293b; }
+    .browse-row .cnt { margin-left: auto; font-size: 0.72rem; color: #22c55e; }
+    #browse-foot { padding: 12px 16px; border-top: 1px solid #334155; display: flex;
+      gap: 8px; justify-content: flex-end; }
+    #browse-foot button {
+      border: none; border-radius: 6px; padding: 8px 14px; cursor: pointer; font: 0.85rem system-ui;
+    }
+    #browse-cancel { background: #334155; color: #e2e8f0; }
+    #browse-use { background: #2563eb; color: #fff; }
   </style>
+  <script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
 </head>
 <body>
 
 <header>
   <div class="dot"></div>
   <h1>Reporting Agent</h1>
+  <nav class="tabs">
+    <button id="tab-chat" class="active" onclick="switchTab('chat')">Chat</button>
+    <button id="tab-schema" onclick="switchTab('schema')">Schema</button>
+  </nav>
   <span class="stack-info">
     <a href="http://localhost:4000" target="_blank">Cube Playground</a> &nbsp;·&nbsp;
     <a href="http://localhost:3001/docs" target="_blank">Library API</a>
   </span>
 </header>
 
-<main>
+<main id="view-chat">
   <!-- Chat -->
   <div id="chat-panel">
     <div id="messages">
@@ -887,6 +1052,50 @@ _HTML = """<!DOCTYPE html>
     <iframe id="chart-frame" src="about:blank" style="display:none"></iframe>
   </div>
 </main>
+
+<!-- Schema discovery -->
+<div id="view-schema">
+  <div id="schema-side">
+    <h2>Data folder</h2>
+    <div class="schema-row">
+      <input id="folder-input" placeholder="/path/to/csv/folder"/>
+      <button class="primary" id="browse-btn" onclick="openBrowse()">Browse…</button>
+      <button class="primary" id="scan-btn" onclick="scanFolder()">Scan</button>
+    </div>
+    <div id="scan-status"></div>
+
+    <h2>Tables</h2>
+    <div id="file-list"><span style="color:#475569;font-size:0.82rem">Scan a folder to list CSVs.</span></div>
+    <button class="primary" id="run-btn" onclick="runDiscovery()" disabled>Run discovery</button>
+
+    <h2>Relationships <span id="rel-count" style="color:#475569"></span></h2>
+    <div id="join-panel"><span style="color:#475569;font-size:0.82rem">Discovered joins appear here.</span></div>
+    <button class="primary" id="export-btn" onclick="exportDraft()" style="margin-top:10px;display:none">Copy approved draft</button>
+  </div>
+  <div id="cy-wrap">
+    <div id="cy"></div>
+    <div id="cy-empty">The relationship graph will render here.</div>
+    <div class="legend">
+      <div><span class="sw" style="border-color:#22c55e"></span>accepted</div>
+      <div><span class="sw" style="border-color:#f59e0b;border-top-style:dashed"></span>uncertain</div>
+    </div>
+  </div>
+
+  <!-- folder browser modal -->
+  <div id="browse-modal">
+    <div id="browse-box">
+      <div id="browse-head">
+        <span id="browse-path">~</span>
+        <span id="browse-count" style="font-size:0.72rem;color:#22c55e"></span>
+      </div>
+      <div id="browse-list"></div>
+      <div id="browse-foot">
+        <button id="browse-cancel" onclick="closeBrowse()">Cancel</button>
+        <button id="browse-use" onclick="useBrowseFolder()">Use this folder</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <script>
   // Surface any script error visibly instead of silently killing the page
@@ -1685,6 +1894,244 @@ _HTML = """<!DOCTYPE html>
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 120) + 'px';
   });
+
+  // ── Schema discovery tab ─────────────────────────────────────────────────
+  let cy = null;
+
+  function switchTab(name) {
+    const chat = document.getElementById('view-chat');
+    const schema = document.getElementById('view-schema');
+    const isSchema = name === 'schema';
+    chat.style.display = isSchema ? 'none' : 'flex';
+    schema.classList.toggle('show', isSchema);
+    document.getElementById('tab-chat').classList.toggle('active', !isSchema);
+    document.getElementById('tab-schema').classList.toggle('active', isSchema);
+    if (isSchema && cy) cy.resize();  // canvas was hidden when laid out
+  }
+
+  async function scanFolder() {
+    const folder = document.getElementById('folder-input').value.trim();
+    const status = document.getElementById('scan-status');
+    const list = document.getElementById('file-list');
+    if (!folder) { status.textContent = 'Enter a folder path.'; return; }
+    status.textContent = 'Scanning…';
+    try {
+      const r = await fetch('/discovery/list?folder=' + encodeURIComponent(folder));
+      const d = await r.json();
+      if (d.error) { status.textContent = d.error; return; }
+      if (!d.files.length) { status.textContent = 'No CSV files found.'; list.innerHTML = ''; return; }
+      status.textContent = d.files.length + ' CSV file(s) found.';
+      list.innerHTML = d.files.map(f => {
+        const name = f.split('/').pop();
+        return '<label><input type="checkbox" class="file-cb" value="' + f.replace(/"/g,'&quot;') +
+               '" checked/> ' + name + '</label>';
+      }).join('');
+      document.getElementById('run-btn').disabled = false;
+    } catch (e) { status.textContent = 'Scan failed: ' + e.message; }
+  }
+
+  // ── folder browser modal ──
+  let browsePath = null;
+  function openBrowse() {
+    document.getElementById('browse-modal').classList.add('show');
+    loadBrowse(document.getElementById('folder-input').value.trim() || null);
+  }
+  function closeBrowse() { document.getElementById('browse-modal').classList.remove('show'); }
+  async function loadBrowse(path) {
+    const list = document.getElementById('browse-list');
+    list.innerHTML = '<div style="padding:10px;color:#64748b">Loading…</div>';
+    try {
+      const r = await fetch('/discovery/browse' + (path ? ('?path=' + encodeURIComponent(path)) : ''));
+      const d = await r.json();
+      if (d.error) { list.innerHTML = '<div style="padding:10px;color:#f87171">' + d.error + '</div>'; return; }
+      browsePath = d.path;
+      document.getElementById('browse-path').textContent = d.path;
+      document.getElementById('browse-count').textContent = d.csv_count ? (d.csv_count + ' CSV here') : '';
+      let rows = '';
+      if (d.parent) rows += browseRow('..', d.parent);
+      d.dirs.forEach(dir => rows += browseRow(dir.name, dir.path));
+      list.innerHTML = rows || '<div style="padding:10px;color:#475569">No subfolders.</div>';
+    } catch (e) { list.innerHTML = '<div style="padding:10px;color:#f87171">' + e.message + '</div>'; }
+  }
+  function browseRow(name, path) {
+    const p = path.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+    const n = name.replace(/</g, '&lt;');
+    return '<div class="browse-row" data-path="' + p + '">📁 ' + n + '</div>';
+  }
+  function useBrowseFolder() {
+    if (browsePath) document.getElementById('folder-input').value = browsePath;
+    closeBrowse();
+    scanFolder();
+  }
+  document.getElementById('browse-list').addEventListener('click', e => {
+    const row = e.target.closest('.browse-row');
+    if (row) loadBrowse(row.dataset.path);
+  });
+
+  // ── discovery run + relationship review state ──
+  let discData = null;   // last /discovery/run result
+  let relState = {};     // key -> { j, status, relationship }
+  let activeKey = null;
+
+  const relKey = j => j.fk.table + '.' + j.fk.column + '->' + j.pk.table + '.' + j.pk.column;
+  const edgeId = key => 'edge_' + key.replace(/[^a-zA-Z0-9]/g, '_');
+
+  async function runDiscovery() {
+    const files = Array.from(document.querySelectorAll('.file-cb:checked')).map(c => c.value);
+    const btn = document.getElementById('run-btn');
+    const status = document.getElementById('scan-status');
+    if (files.length < 2) { status.textContent = 'Pick at least two tables.'; return; }
+    btn.disabled = true; btn.textContent = 'Running…';
+    try {
+      const r = await fetch('/discovery/run', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({files})
+      });
+      const d = await r.json();
+      if (d.error) { status.textContent = 'Discovery failed: ' + d.error; return; }
+      discData = d;
+      relState = {};
+      d.joins.accepted.forEach(j => relState[relKey(j)] = { j, status: 'accepted', relationship: j.relationship });
+      d.joins.uncertain.forEach(j => relState[relKey(j)] = { j, status: 'uncertain', relationship: j.relationship });
+      activeKey = null;
+      status.textContent = 'Done — ' + d.joins.accepted.length + ' accepted, ' +
+                           d.joins.uncertain.length + ' uncertain.';
+      rebuild();
+    } catch (e) { status.textContent = 'Discovery failed: ' + e.message; }
+    finally { btn.disabled = false; btn.textContent = 'Run discovery'; }
+  }
+
+  function rebuild() { renderPanel(); renderGraph(); applyHighlight(); }
+
+  function renderPanel() {
+    const panel = document.getElementById('join-panel');
+    const rels = Object.entries(relState);
+    const order = { accepted: 0, uncertain: 1, rejected: 2 };
+    rels.sort((a, b) => order[a[1].status] - order[b[1].status]);
+    const relOpts = ['many_to_one', 'one_to_one', 'one_to_many'];
+    let html = '';
+    rels.forEach(([key, r]) => {
+      const j = r.j;
+      const opts = relOpts.map(o =>
+        '<option value="' + o + '"' + (o === r.relationship ? ' selected' : '') + '>' + o + '</option>').join('');
+      html +=
+        '<div class="join-item ' + r.status + (key === activeKey ? ' active' : '') +
+             '" data-key="' + key + '" onclick="highlightRel(this.dataset.key)">' +
+          '<div class="jt">' + j.fk.table + '.' + j.fk.column + ' → ' + j.pk.table + '.' + j.pk.column + '</div>' +
+          '<div class="jm">conf ' + j.confidence + ' · containment ' + j.containment + ' · ' + j.name_signal + '</div>' +
+          '<div class="join-actions" onclick="event.stopPropagation()">' +
+            '<button class="' + (r.status === 'accepted' ? 'on-accept' : '') + '" ' +
+              'onclick="setStatus(this.closest(\\'.join-item\\').dataset.key, \\'accepted\\')">Accept</button>' +
+            '<button class="' + (r.status === 'rejected' ? 'on-reject' : '') + '" ' +
+              'onclick="setStatus(this.closest(\\'.join-item\\').dataset.key, \\'rejected\\')">Reject</button>' +
+            '<select onchange="setRelType(this.closest(\\'.join-item\\').dataset.key, this.value)">' + opts + '</select>' +
+          '</div>' +
+        '</div>';
+    });
+    if (!html) html = '<span style="color:#475569;font-size:0.82rem">No relationships found.</span>';
+    panel.innerHTML = html;
+    const accepted = rels.filter(([, r]) => r.status === 'accepted').length;
+    document.getElementById('rel-count').textContent = rels.length ? '(' + accepted + '/' + rels.length + ' approved)' : '';
+    document.getElementById('export-btn').style.display = accepted ? 'block' : 'none';
+  }
+
+  function setStatus(key, status) {
+    if (relState[key]) { relState[key].status = status; rebuild(); }
+  }
+  function setRelType(key, val) {
+    if (relState[key]) { relState[key].relationship = val; }
+  }
+
+  function highlightRel(key) {
+    activeKey = key;
+    document.querySelectorAll('.join-item').forEach(el =>
+      el.classList.toggle('active', el.dataset.key === key));
+    applyHighlight();
+  }
+  function applyHighlight() {
+    if (!cy) return;
+    cy.edges().removeClass('hl dim');
+    if (!activeKey) return;
+    const e = cy.getElementById(edgeId(activeKey));
+    if (e && e.length) {
+      cy.edges().addClass('dim');
+      e.removeClass('dim').addClass('hl');
+      cy.animate({ center: { eles: e } }, { duration: 250 });
+    }
+  }
+
+  function renderGraph() {
+    const g = discData ? discData.graph : { nodes: [] };
+    document.getElementById('cy-empty').style.display = g.nodes.length ? 'none' : 'flex';
+    const els = [];
+    g.nodes.forEach(n => els.push({ data: {
+      id: n.id,
+      label: n.id + '\\n' + n.rows + ' rows' + (n.grain ? '\\n▸ ' + n.grain.join('+') : ''),
+      role: n.role || 'table'
+    }}));
+    Object.entries(relState).forEach(([key, r]) => {
+      if (r.status === 'rejected') return;
+      const j = r.j;
+      els.push({ data: {
+        id: edgeId(key), key: key, source: j.fk.table, target: j.pk.table,
+        label: j.fk.column, status: r.status
+      }});
+    });
+    if (cy) cy.destroy();
+    cy = cytoscape({
+      container: document.getElementById('cy'),
+      elements: els,
+      style: [
+        { selector: 'node', style: {
+            'label': 'data(label)', 'text-wrap': 'wrap', 'text-valign': 'center',
+            'text-halign': 'center', 'color': '#e2e8f0', 'font-size': '11px',
+            'text-max-width': '120px', 'background-color': '#1e293b',
+            'border-color': '#3b82f6', 'border-width': 2, 'shape': 'round-rectangle',
+            'width': '110px', 'height': '58px', 'padding': '6px' } },
+        { selector: 'node[role = "bridge"]', style: {
+            'border-color': '#a855f7', 'background-color': '#2a1e3b' } },
+        { selector: 'edge', style: {
+            'label': 'data(label)', 'font-size': '10px', 'color': '#94a3b8',
+            'text-background-color': '#0f172a', 'text-background-opacity': 1,
+            'text-background-padding': '2px', 'curve-style': 'bezier',
+            'target-arrow-shape': 'triangle', 'width': 2,
+            'line-color': '#22c55e', 'target-arrow-color': '#22c55e' } },
+        { selector: 'edge[status = "uncertain"]', style: {
+            'line-color': '#f59e0b', 'target-arrow-color': '#f59e0b', 'line-style': 'dashed' } },
+        { selector: 'edge.dim', style: { 'opacity': 0.2 } },
+        { selector: 'edge.hl', style: {
+            'width': 5, 'line-color': '#38bdf8', 'target-arrow-color': '#38bdf8',
+            'color': '#e2e8f0', 'z-index': 999 } }
+      ],
+      layout: { name: 'cose', padding: 30, nodeRepulsion: 9000, idealEdgeLength: 130,
+                animate: false }
+    });
+    cy.on('tap', 'edge', evt => {
+      const key = evt.target.data('key');
+      highlightRel(key);
+      const el = Array.from(document.querySelectorAll('.join-item')).find(e => e.dataset.key === key);
+      if (el) el.scrollIntoView({ block: 'nearest' });
+    });
+    cy.on('tap', evt => { if (evt.target === cy) { activeKey = null; highlightRel(null); } });
+  }
+
+  function exportDraft() {
+    const byCube = {};
+    Object.values(relState).forEach(r => {
+      if (r.status !== 'accepted') return;
+      const j = r.j;
+      byCube[j.fk.table] = byCube[j.fk.table] || { joins: {} };
+      byCube[j.fk.table].joins[j.pk.table] = {
+        sql: '${CUBE}.' + j.fk.column + ' = ${' + j.pk.table + '.' + j.pk.column + '}',
+        relationship: r.relationship
+      };
+    });
+    const text = JSON.stringify(byCube, null, 2);
+    navigator.clipboard.writeText(text).then(
+      () => { document.getElementById('scan-status').textContent = 'Approved draft copied to clipboard.'; },
+      () => { window.prompt('Copy the approved draft:', text); }
+    );
+  }
 </script>
 </body>
 </html>"""

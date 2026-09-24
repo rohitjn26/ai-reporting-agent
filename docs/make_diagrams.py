@@ -209,7 +209,7 @@ def eval_diagram():
     s.box("meta1", 70, 168, 150, 60, ["Cube /meta", "live schema"], "service")
     s.box("gen", 262, 162, 175, 72, ["generate.py", "back-translate", "title + synonym"], "tool")
     s.box("para", 480, 162, 170, 72, ["paraphrase.py", "reword prompt", "expected = COPIED"], "llm", badge="LLM")
-    s.box("verify", 675, 162, 170, 72, ["verifier", "round-trip check", "(planned)"], "llm", dashed=True, badge="LLM")
+    s.box("verify", 675, 162, 170, 72, ["verify.py", "independent re-derive", "drop drift"], "llm", badge="LLM")
     s.box("cache", 862, 158, 70, 92, ["cases", ".jsonl", "CACHE"], "data")
 
     s.arrow(s.anchor("meta1", "right"), s.anchor("gen", "left"), "no LLM")

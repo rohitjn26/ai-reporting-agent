@@ -202,3 +202,29 @@ def test_build_and_run_repairs_on_cube_error():
     q, res = qb.build_and_run("orders by status", META, run_fn, llm=llm)
     assert runs["n"] == 2 and "data" in res
     assert q["dimensions"] == ["orders.country"]     # the repaired query was used
+
+
+def test_view_catalog_lists_every_cube_with_its_description_not_members():
+    # a big view: 40 members from three cubes — the router sees all three, no member names
+    view = {"name": "study", "description": "Flu study data.",
+            "measures": [{"name": "study.participant_count", "aliasMember": "participant.count"}],
+            "dimensions": [{"name": f"study.x{i}", "aliasMember": f"{c}.x{i}"}
+                           for i, c in enumerate(["org"] * 13 + ["participant"] * 13 + ["site"] * 13)]}
+    cubes = [{"name": "participant", "title": "Participants",
+              "description": "Study participants (subjects, patients)."},
+             {"name": "site", "description": "Clinical sites."}]
+    cat = qb.render_view_catalog([view], cubes)
+    assert "View: study — Flu study data." in cat
+    assert "  - org" in cat                                  # no metadata -> name only
+    assert "  - participant (Participants): Study participants (subjects, patients)." in cat
+    assert "  - site: Clinical sites." in cat
+    assert "x12" not in cat and "…" not in cat                # members never listed, no cap
+
+
+def test_view_catalog_prefers_cubes_carried_in_view_meta():
+    # outside dev mode private cubes aren't in /meta; the view's meta still describes them
+    view = {"name": "study", "description": "Flu study.",
+            "meta": {"cubes": [{"name": "participant", "title": "Participants",
+                                "description": "People enrolled."}]},
+            "dimensions": [{"name": "study.x", "aliasMember": "participant.x"}]}
+    assert "  - participant (Participants): People enrolled." in qb.render_view_catalog([view])

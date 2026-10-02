@@ -93,6 +93,9 @@ export const transformView = (viewData) => {
   if (!isDescriptionEmpty(viewData.description)) view.description = viewData.description;
   if (viewData.title) view.title = viewData.title;
   if (viewData.public !== undefined) view.public = viewData.public;
+  // the view's cubes + their descriptions: private cubes are absent from /meta
+  // outside dev mode, so the view carries what the agent's router needs
+  if (viewData.meta) view.meta = viewData.meta;
   return view;
 };
 

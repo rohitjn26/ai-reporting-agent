@@ -174,7 +174,24 @@ async def discovery_semantic(request: Request):
         return {"error": "Run discovery first."}
     try:
         draft = _load_draft_semantic_layer()
-        return draft(body["discovery"], body.get("joins"), body.get("dataset") or None)
+        return draft(body["discovery"], body.get("joins"), body.get("dataset") or None,
+                     root=body.get("root") or None, descriptions=body.get("descriptions"))
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/discovery/describe")
+async def discovery_describe(request: Request):
+    """AI business names + descriptions per table (one LLM call each, in parallel).
+    The UI layers user edits over the result and sends both back via /discovery/semantic."""
+    body = await request.json()
+    if not body.get("discovery"):
+        return {"error": "Run discovery first."}
+    _load_run_discovery()  # puts the repo root on sys.path
+    from discovery.describe import describe_tables
+    try:
+        return await asyncio.to_thread(describe_tables, body["discovery"], body.get("joins") or [],
+                                       body.get("tables"), body.get("dataset") or None)
     except Exception as e:
         return {"error": str(e)}
 
@@ -358,26 +375,48 @@ async def resume_stream(request: Request, answer: str, thread_id: str = "default
     )
 
 
+# measure type -> how to aggregate the expression when testing it
+_TEST_AGG = {"sum": "SUM({})", "avg": "AVG({})", "min": "MIN({})", "max": "MAX({})",
+             "count": "COUNT({})", "count_distinct": "COUNT(DISTINCT {})",
+             "count_distinct_approx": "COUNT(DISTINCT {})"}
+
+
+async def _cube_source_sql(cube_name: str) -> str:
+    """The SQL a cube reads from (e.g. SELECT * FROM mdbl.c_site) — the cube
+    name isn't the table name once a dataset namespaces it."""
+    import httpx
+    lib = os.environ.get("LIBRARY_API_URL", "http://localhost:3001")
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{lib}/v1/CUBE_CONFIG")
+        r.raise_for_status()
+    cfg = next((x for x in r.json().get("data", []) if x["name"] == cube_name), None)
+    sql = ((cfg or {}).get("data") or {}).get("sql")
+    return sql or f"SELECT * FROM {cube_name.lower()}"  # unknown cube: try it as a table
+
+
 @app.get("/test-sql")
-async def test_sql(sql_expr: str, cube_name: str, field_type: str = "dimension"):
+async def test_sql(sql_expr: str, cube_name: str, field_type: str = "dimension", agg: str = ""):
     """
-    Run the user's SQL expression directly against Postgres and return sample rows.
+    Run the user's SQL expression directly against Postgres and return sample rows,
+    over the cube's own source SQL.
     For dimensions: groups by the expression and returns value + count.
-    For measures: evaluates the aggregate expression and returns the scalar.
+    For measures: applies the chosen aggregation (`agg`, e.g. sum, count) and
+    returns the scalar; type number (or none) runs the expression as written.
     """
     db_url = os.environ.get("DATA_DB_URL", "postgresql://postgres:postgres@localhost:5432/reporting")
-    table = cube_name.lower()
     try:
+        source = f"({await _cube_source_sql(cube_name)}) AS cube_src"
         conn = await asyncpg.connect(db_url)
         try:
             if field_type == "measure":
-                query = f"SELECT ({sql_expr}) AS result FROM {table} LIMIT 1"
+                expr = _TEST_AGG.get(agg.lower(), "{}").format(f"({sql_expr})")
+                query = f"SELECT {expr} AS result FROM {source} LIMIT 1"
                 rows = await conn.fetch(query)
                 data = [dict(r) for r in rows]
             else:
                 query = (
                     f"SELECT ({sql_expr}) AS sample_value, COUNT(*) AS count "
-                    f"FROM {table} "
+                    f"FROM {source} "
                     f"WHERE ({sql_expr}) IS NOT NULL "
                     f"GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
                 )
@@ -977,24 +1016,39 @@ _HTML = """<!DOCTYPE html>
     .legend .sw { display: inline-block; width: 18px; height: 0; vertical-align: middle;
       margin-right: 6px; border-top-width: 2px; border-top-style: solid; }
 
-    /* semantic draft panel */
+    /* graph toolbar */
+    .graph-tools { position: absolute; top: 12px; right: 12px; display: flex; gap: 6px; }
+    .graph-tools button {
+      background: #1e293bdd; border: 1px solid #334155; color: #cbd5e1; cursor: pointer;
+      border-radius: 6px; padding: 5px 10px; font: 0.75rem system-ui;
+    }
+    .graph-tools button:hover { background: #273449; color: #f1f5f9; }
+
+    /* semantic layer page */
+    #view-draft { flex: 1; display: none; min-height: 0; background: #0f172a; justify-content: center; }
+    #view-draft.show { display: flex; }
     #draft-side {
-      width: 380px; flex-shrink: 0; background: #111c30; border-left: 1px solid #334155;
-      display: flex; flex-direction: column; overflow-y: auto; padding: 16px;
+      width: 100%; max-width: 1100px; background: #111c30;
+      border-left: 1px solid #334155; border-right: 1px solid #334155;
+      display: flex; flex-direction: column; overflow-y: auto; padding: 16px 24px;
     }
     #draft-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
     #draft-head h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: .05em; color: #64748b; margin: 0; }
     .draft-btns { display: flex; gap: 6px; }
-    #dataset-row { display: flex; align-items: center; gap: 8px; }
-    #dataset-row label { font-size: 0.75rem; color: #94a3b8; }
+    #dataset-row, #root-row { display: flex; align-items: center; gap: 8px; }
+    #dataset-row label, #root-row label { font-size: 0.75rem; color: #94a3b8; }
     #dataset-input {
       flex: 1; background: #0f172a; border: 1px solid #334155; border-radius: 6px;
       color: #e2e8f0; padding: 5px 8px; font: 0.8rem ui-monospace, monospace;
     }
-    #dataset-hint { font-size: 0.68rem; color: #475569; margin: 4px 0 8px; }
+    #dataset-hint, #root-hint { font-size: 0.68rem; color: #475569; margin: 4px 0 8px; }
+    #root-select {
+      flex: 1; background: #0f172a; border: 1px solid #334155; border-radius: 6px;
+      color: #e2e8f0; padding: 5px 8px; font: 0.8rem ui-monospace, monospace;
+    }
     #draft-export { background: #2563eb !important; border-color: #2563eb !important; color: #fff !important; }
     #draft-export:disabled { background: #334155 !important; border-color: #334155 !important; color: #64748b !important; }
-    #draft-copy, #draft-export {
+    #draft-copy, #draft-export, #draft-describe {
       background: #1e293b; border: 1px solid #334155; color: #cbd5e1; cursor: pointer;
       border-radius: 5px; padding: 4px 10px; font: 0.75rem system-ui;
     }
@@ -1044,6 +1098,44 @@ _HTML = """<!DOCTYPE html>
     .join-actions button:hover { background: #273449; }
     .join-actions button.on-accept { background: #14532d; border-color: #22c55e; color: #bbf7d0; }
     .join-actions button.on-reject { background: #4c1d1d; border-color: #ef4444; color: #fecaca; }
+    /* several joins into one table: one is used by the cube, the rest are alternatives */
+    .join-item .jp { margin-top: 5px; font-size: 0.72rem; color: #94a3b8; }
+    .join-item .jp .used { color: #38bdf8; font-weight: 600; }
+    .join-item .jp button {
+      background: #1e293b; border: 1px solid #334155; color: #cbd5e1; cursor: pointer;
+      border-radius: 5px; padding: 2px 8px; font: 0.7rem system-ui; margin-left: 4px;
+    }
+    .join-item .jp button:hover { background: #273449; }
+    .join-item.alt { border-left-style: dashed; }
+    /* editable business names / descriptions (AI-filled, user-edited) */
+    .desc-edit { display: grid; grid-template-columns: 70px 1fr; gap: 4px 6px; margin: 6px 0; align-items: start; }
+    .desc-edit label { font-size: 0.68rem; color: #64748b; padding-top: 4px; }
+    .desc-edit input, .desc-edit textarea {
+      background: #0b1324; border: 1px solid #334155; border-radius: 5px; color: #e2e8f0;
+      padding: 3px 6px; font: 0.74rem system-ui; width: 100%; box-sizing: border-box;
+    }
+    .desc-edit textarea { resize: vertical; min-height: 34px; }
+    .desc-edit .edited { border-color: #f59e0b; }
+    .col-desc { display: grid; grid-template-columns: minmax(80px, 34%) 1fr; gap: 3px 6px; margin-top: 4px; }
+    .col-desc code { font-size: 0.68rem; color: #94a3b8; overflow-wrap: anywhere; padding-top: 4px; }
+    .col-desc input { background: #0b1324; border: 1px solid #334155; border-radius: 5px; color: #e2e8f0;
+      padding: 2px 6px; font: 0.7rem system-ui; }
+    .col-desc input.edited { border-color: #f59e0b; }
+    #describe-status { font-size: 0.7rem; color: #64748b; margin: -2px 0 8px; min-height: 12px; }
+    #draft-describe { background: #312e81 !important; border-color: #4f46e5 !important; color: #e0e7ff !important; }
+    /* search + bulk actions over the filtered list (relationships and draft) */
+    .search-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+    .search-row input {
+      flex: 1; min-width: 0; background: #0f172a; border: 1px solid #334155; border-radius: 6px;
+      color: #e2e8f0; padding: 5px 8px; font: 0.78rem system-ui;
+    }
+    .search-row input:focus { outline: none; border-color: #3b82f6; }
+    .search-row button {
+      background: #1e293b; border: 1px solid #334155; color: #cbd5e1; cursor: pointer;
+      border-radius: 5px; padding: 4px 8px; font: 0.7rem system-ui; white-space: nowrap;
+    }
+    .search-row button:hover { background: #273449; }
+    .search-row button:disabled { opacity: .4; cursor: default; }
     .join-actions select {
       background: #0f172a; border: 1px solid #334155; color: #cbd5e1; border-radius: 5px;
       padding: 2px 4px; font: 0.72rem system-ui; margin-left: auto;
@@ -1086,6 +1178,7 @@ _HTML = """<!DOCTYPE html>
   <nav class="tabs">
     <button id="tab-chat" class="active" onclick="switchTab('chat')">Chat</button>
     <button id="tab-schema" onclick="switchTab('schema')">Schema</button>
+    <button id="tab-draft" onclick="switchTab('draft')">Semantic layer</button>
   </nav>
   <span class="stack-info">
     <a href="http://localhost:4000" target="_blank">Cube Playground</a> &nbsp;·&nbsp;
@@ -1142,6 +1235,14 @@ _HTML = """<!DOCTYPE html>
     <button class="primary" id="run-btn" onclick="runDiscovery()" disabled>Run discovery</button>
 
     <h2>Relationships <span id="rel-count" style="color:#475569"></span></h2>
+    <div class="search-row">
+      <input id="rel-search" type="search" placeholder="Search joins — e.g. account creator, uncertain"
+             oninput="renderPanel()"/>
+    </div>
+    <div class="search-row">
+      <button id="rel-accept-shown" onclick="bulkStatus('accepted')" disabled>Accept all shown</button>
+      <button id="rel-reject-shown" onclick="bulkStatus('rejected')" disabled>Reject all shown</button>
+    </div>
     <div id="join-panel"><span style="color:#475569;font-size:0.82rem">Discovered joins appear here.</span></div>
   </div>
   <div id="cy-wrap">
@@ -1150,24 +1251,14 @@ _HTML = """<!DOCTYPE html>
     <div class="legend">
       <div><span class="sw" style="border-color:#22c55e"></span>accepted</div>
       <div><span class="sw" style="border-color:#f59e0b;border-top-style:dashed"></span>uncertain</div>
+      <div><span class="sw" style="border-color:#475569;border-top-style:dotted"></span>alternative (not used)</div>
+    </div>
+    <div class="graph-tools">
+      <button onclick="fitGraph()" title="Bring the whole graph back into view">⤢ Fit</button>
+      <button onclick="relayoutGraph()" title="Re-run the automatic layout, then fit">↻ Re-layout</button>
+      <button onclick="switchTab('draft')" title="Review and export the cubes and views">Semantic layer →</button>
     </div>
   </div>
-  <div id="draft-side">
-    <div id="draft-head">
-      <h2>Semantic draft <span id="draft-count" style="color:#475569"></span></h2>
-      <div class="draft-btns">
-        <button id="draft-copy" onclick="copyDraft()" disabled>Copy JSON</button>
-        <button id="draft-export" onclick="exportSemanticLayer()" disabled>Export semantic layer</button>
-      </div>
-    </div>
-    <div id="dataset-row">
-      <label for="dataset-input">Dataset</label>
-      <input id="dataset-input" placeholder="folder name" onchange="refreshDraft()"/>
-    </div>
-    <div id="dataset-hint">Postgres schema + cube/view name prefix — keeps this dataset apart from the live model.</div>
-    <div id="draft-body"><span class="draft-empty">Run discovery — the proposed cubes and views appear here and update as you review joins.</span></div>
-  </div>
-
   <!-- folder browser modal -->
   <div id="browse-modal">
     <div id="browse-box">
@@ -1182,6 +1273,41 @@ _HTML = """<!DOCTYPE html>
       </div>
     </div>
   </div>
+</div>
+
+<!-- Semantic layer: the draft built from the reviewed joins (own page — the
+     schema page is busy enough with the relationship list and graph) -->
+<div id="view-draft">
+  <div id="draft-side">
+    <div id="draft-head">
+      <h2>Semantic draft <span id="draft-count" style="color:#475569"></span></h2>
+      <div class="draft-btns">
+        <button id="draft-describe" onclick="generateDescriptions()" disabled
+                title="One AI call per table (Haiku) — business names, descriptions, synonyms">✨ Describe</button>
+        <button id="draft-copy" onclick="copyDraft()" disabled>Copy JSON</button>
+        <button id="draft-export" onclick="exportSemanticLayer()" disabled>Export semantic layer</button>
+      </div>
+    </div>
+    <div id="dataset-row">
+      <label for="dataset-input">Dataset</label>
+      <input id="dataset-input" placeholder="folder name" onchange="refreshDraft()"/>
+    </div>
+    <div id="dataset-hint">Postgres schema + cube/view name prefix — keeps this dataset apart from the live model.</div>
+    <div id="root-row">
+      <label for="root-select">View root</label>
+      <select id="root-select" onchange="refreshDraft()"></select>
+    </div>
+    <div id="root-hint">The view starts here and walks the joins down; lookups hang off the table that references them.</div>
+    <div id="describe-status"></div>
+    <div class="search-row">
+      <input id="draft-search" type="search" placeholder="Search members — e.g. c_task name, created"
+             oninput="renderDraft()"/>
+      <button id="draft-remove-shown" onclick="bulkMembers(true)" disabled>Remove shown</button>
+      <button id="draft-restore-shown" onclick="bulkMembers(false)" disabled>Restore shown</button>
+    </div>
+    <div id="draft-body"><span class="draft-empty">Run discovery — the proposed cubes and views appear here and update as you review joins.</span></div>
+  </div>
+
 </div>
 
 <script>
@@ -1455,6 +1581,12 @@ _HTML = """<!DOCTYPE html>
             <option value="count_distinct">count_distinct</option>
           </select>
         </div>
+        <div class="cef-row" id="cef-running-row">
+          <label class="cef-label">Running total</label>
+          <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#cbd5e1;cursor:pointer">
+            <input type="checkbox" id="cef-running"/> cumulative over time (e.g. total participants so far)
+          </label>
+        </div>
         <div class="cef-row">
           <label class="cef-label">Display title</label>
           <input class="iq-input" id="cef-title" placeholder="e.g. Min Order Value"/>
@@ -1483,6 +1615,7 @@ _HTML = """<!DOCTYPE html>
     const MEA_TYPES = ['sum','count','avg','min','max','count_distinct'];
 
     function refreshTypeOptions(fieldType) {
+      card.querySelector('#cef-running-row').style.display = fieldType === 'dimension' ? 'none' : '';
       const sel = card.querySelector('#cef-type');
       const opts = fieldType === 'dimension' ? DIM_TYPES : MEA_TYPES;
       sel.innerHTML = opts.map(o => `<option value="${o}">${o}</option>`).join('');
@@ -1535,6 +1668,7 @@ _HTML = """<!DOCTYPE html>
     if (suggested_key)   card.querySelector('#cef-key').value   = suggested_key;
     if (suggested_sql)   card.querySelector('#cef-sql').value   = suggested_sql;
     if (suggested_title) card.querySelector('#cef-title').value = suggested_title;
+    if (d.suggested_running_total) card.querySelector('#cef-running').checked = true;
     if (suggested_type) {
       const sel = card.querySelector('#cef-type');
       // set the matching option, or append it if not in the list
@@ -1557,7 +1691,8 @@ _HTML = """<!DOCTYPE html>
       resultEl.style.display = 'block';
       resultEl.innerHTML = '<div style="padding:8px 12px;background:#1a1a2e;color:#888">Running query…</div>';
       try {
-        const params = new URLSearchParams({ sql_expr: sql, cube_name: cube_name, field_type: ftype });
+        const params = new URLSearchParams({ sql_expr: sql, cube_name: cube_name, field_type: ftype,
+                                             agg: card.querySelector('#cef-type').value });
         const res = await fetch('/test-sql?' + params);
         const data = await res.json();
         if (!data.ok) {
@@ -1603,8 +1738,10 @@ _HTML = """<!DOCTYPE html>
       card.classList.add('answered');
       card.querySelectorAll('button, input, select, textarea').forEach(el => el.disabled = true);
 
-      const ans = JSON.stringify({ field_type: fieldType, action, key, sql, type, title });
-      addMsg('user', `${action === 'add' ? 'Add' : 'Replace'} ${fieldType} "${key}" (${type}, SQL: ${sql})`);
+      const running_total = fieldType === 'measure' && card.querySelector('#cef-running').checked;
+      const ans = JSON.stringify({ field_type: fieldType, action, key, sql, type, title, running_total });
+      addMsg('user', `${action === 'add' ? 'Add' : 'Replace'} ${fieldType} "${key}" (${type}` +
+                     `${running_total ? ', running total' : ''}, SQL: ${sql})`);
       onAnswer(ans);
     };
 
@@ -1986,15 +2123,20 @@ _HTML = """<!DOCTYPE html>
   let cy = null;
 
   function switchTab(name) {
-    const chat = document.getElementById('view-chat');
-    const schema = document.getElementById('view-schema');
-    const isSchema = name === 'schema';
-    chat.style.display = isSchema ? 'none' : 'flex';
-    schema.classList.toggle('show', isSchema);
-    document.getElementById('tab-chat').classList.toggle('active', !isSchema);
-    document.getElementById('tab-schema').classList.toggle('active', isSchema);
-    if (isSchema && cy) cy.resize();  // canvas was hidden when laid out
+    document.getElementById('view-chat').style.display = name === 'chat' ? 'flex' : 'none';
+    document.getElementById('view-schema').classList.toggle('show', name === 'schema');
+    document.getElementById('view-draft').classList.toggle('show', name === 'draft');
+    ['chat', 'schema', 'draft'].forEach(t =>
+      document.getElementById('tab-' + t).classList.toggle('active', t === name));
+    if (name === 'schema' && cy) cy.resize();  // canvas was hidden when laid out
   }
+
+  // graph: pan/zoom can lose the whole thing off-screen — fit brings it back,
+  // re-layout also re-spreads nodes that were dragged into a heap
+  const GRAPH_LAYOUT = { name: 'cose', padding: 30, nodeRepulsion: 9000, idealEdgeLength: 130,
+                         animate: false };
+  function fitGraph() { if (cy) { cy.resize(); cy.fit(undefined, 30); } }
+  function relayoutGraph() { if (cy) { cy.resize(); cy.layout(GRAPH_LAYOUT).run(); cy.fit(undefined, 30); } }
 
   async function scanFolder() {
     const folder = document.getElementById('folder-input').value.trim();
@@ -2078,10 +2220,15 @@ _HTML = """<!DOCTYPE html>
       if (d.error) { status.textContent = 'Discovery failed: ' + d.error; return; }
       discData = d;
       relState = {};
-      d.joins.accepted.forEach(j => relState[relKey(j)] = { j, status: 'accepted', relationship: j.relationship });
-      d.joins.uncertain.forEach(j => relState[relKey(j)] = { j, status: 'uncertain', relationship: j.relationship });
+      d.joins.accepted.forEach(j => relState[relKey(j)] = { j, status: 'accepted', relationship: j.relationship, primary: !!j.primary });
+      d.joins.uncertain.forEach(j => relState[relKey(j)] = { j, status: 'uncertain', relationship: j.relationship, primary: false });
       activeKey = null;
       cubeExcl = new Set(); viewExcl = new Set();
+      document.getElementById('root-select').innerHTML = '';  // recommended root on first draft
+      aiDesc = { tables: {} }; descEdits = { tables: {}, views: {} };
+      loadDescriptions();  // AI text + edits from an earlier visit to this folder
+      document.getElementById('describe-status').textContent = Object.keys(aiDesc.tables).length
+        ? 'Restored descriptions for ' + Object.keys(aiDesc.tables).length + ' tables from this browser.' : '';
       const folder = document.getElementById('folder-input').value.trim().replace(/[/]+$/, '');
       document.getElementById('dataset-input').value = folder.split('/').pop() || '';
       refreshDraft();
@@ -2092,24 +2239,91 @@ _HTML = """<!DOCTYPE html>
     finally { btn.disabled = false; btn.textContent = 'Run discovery'; }
   }
 
-  function rebuild() { renderPanel(); renderGraph(); applyHighlight(); }
+  function rebuild() { ensurePrimaries(); renderPanel(); renderGraph(); applyHighlight(); }
+
+  // A cube holds one join per target table. When several accepted columns point at
+  // the same table (creator/owner/updater -> account) exactly one is "primary" — used
+  // by the cube and views. Discovery recommends the highest-cardinality column; the
+  // user can switch. Mirrors discovery.joins.pick_primary.
+  const targetKey = j => j.fk.table + '->' + j.pk.table;
+  const SIGNAL_RANK = { suffix_id: 3, table: 2, exact: 1, none: 0 };
+  function acceptedGroups() {
+    const groups = {};
+    Object.entries(relState).forEach(([key, r]) => {
+      if (r.status === 'accepted') (groups[targetKey(r.j)] = groups[targetKey(r.j)] || []).push(key);
+    });
+    return groups;
+  }
+  function ensurePrimaries() {
+    Object.values(relState).forEach(r => { if (r.status !== 'accepted') r.primary = r.role = false; });
+    Object.values(acceptedGroups()).forEach(keys => {
+      const on = keys.filter(k => relState[k].primary);
+      if (on.length === 1) return;
+      const rank = k => [relState[k].j.fk_ndv || 0, SIGNAL_RANK[relState[k].j.name_signal] || 0];
+      const best = keys.reduce((a, b) => {
+        const ra = rank(a), rb = rank(b);
+        return (rb[0] > ra[0] || (rb[0] === ra[0] && rb[1] > ra[1])) ? b : a;
+      });
+      keys.forEach(k => relState[k].primary = k === best);
+    });
+    Object.values(relState).forEach(r => { if (r.primary) r.role = false; });
+  }
+  function setPrimary(key) {
+    const r = relState[key];
+    if (!r || r.status !== 'accepted') return;
+    (acceptedGroups()[targetKey(r.j)] || []).forEach(k => relState[k].primary = k === key);
+    rebuild(); refreshDraft();
+  }
+  // a second join into the same table, used alongside the main one ("role")
+  function toggleRole(key) {
+    const r = relState[key];
+    if (!r || r.status !== 'accepted' || r.primary) return;
+    r.role = !r.role;
+    rebuild(); refreshDraft();
+  }
 
   function renderPanel() {
     const panel = document.getElementById('join-panel');
-    const rels = Object.entries(relState);
+    let rels = Object.entries(relState);
     const order = { accepted: 0, uncertain: 1, rejected: 2 };
-    rels.sort((a, b) => order[a[1].status] - order[b[1].status]);
+    // alternatives into the same table sit together
+    rels.sort((a, b) => order[a[1].status] - order[b[1].status] ||
+                        targetKey(a[1].j).localeCompare(targetKey(b[1].j)));
+    const groups = acceptedGroups();
+    const q = searchTerms('rel-search');
+    const all = rels.length;
+    rels = rels.filter(([, r]) => matchesAll(q,
+      r.j.fk.table + '.' + r.j.fk.column + ' ' + r.j.pk.table + '.' + r.j.pk.column + ' ' + r.status +
+      (r.primary && r.status === 'accepted' ? ' primary' : '') + (r.role ? ' also' : '')));
+    shownRels = rels.map(([key]) => key);
+    document.getElementById('rel-accept-shown').disabled = !shownRels.length;
+    document.getElementById('rel-reject-shown').disabled = !shownRels.length;
     const relOpts = ['many_to_one', 'one_to_one', 'one_to_many'];
     let html = '';
     rels.forEach(([key, r]) => {
       const j = r.j;
       const opts = relOpts.map(o =>
         '<option value="' + o + '"' + (o === r.relationship ? ' selected' : '') + '>' + o + '</option>').join('');
+      const siblings = r.status === 'accepted' ? (groups[targetKey(j)] || []) : [];
+      let pick = '';
+      if (siblings.length > 1) {
+        pick = '<div class="jp" onclick="event.stopPropagation()">' + (r.primary
+          ? '<span class="used">✓ used in views</span> · ' + (siblings.length - 1) + ' alternative' +
+            (siblings.length > 2 ? 's' : '') + ' into ' + j.pk.table
+          : (r.role ? '<span class="used">✓ also used</span> (own copy of ' + j.pk.table + ')'
+                    : 'alternative into ' + j.pk.table) +
+            '<button onclick="setPrimary(this.closest(\\'.join-item\\').dataset.key)">Use for views</button>' +
+            '<button title="Keep the main join AND this one — it gets its own copy of ' + j.pk.table + '" ' +
+              'onclick="toggleRole(this.closest(\\'.join-item\\').dataset.key)">' +
+              (r.role ? 'Don\\'t use' : 'Also use') + '</button>') +
+          '</div>';
+      }
       html +=
-        '<div class="join-item ' + r.status + (key === activeKey ? ' active' : '') +
+        '<div class="join-item ' + r.status + (pick && !r.primary ? ' alt' : '') + (key === activeKey ? ' active' : '') +
              '" data-key="' + key + '" onclick="highlightRel(this.dataset.key)">' +
           '<div class="jt">' + j.fk.table + '.' + j.fk.column + ' → ' + j.pk.table + '.' + j.pk.column + '</div>' +
-          '<div class="jm">conf ' + j.confidence + ' · containment ' + j.containment + ' · ' + j.name_signal + '</div>' +
+          '<div class="jm">conf ' + j.confidence + ' · containment ' + j.containment + ' · ' + j.name_signal +
+            (j.fk_ndv != null ? ' · ' + j.fk_ndv + ' distinct' : '') + '</div>' + pick +
           '<div class="join-actions" onclick="event.stopPropagation()">' +
             '<button class="' + (r.status === 'accepted' ? 'on-accept' : '') + '" ' +
               'onclick="setStatus(this.closest(\\'.join-item\\').dataset.key, \\'accepted\\')">Accept</button>' +
@@ -2119,10 +2333,22 @@ _HTML = """<!DOCTYPE html>
           '</div>' +
         '</div>';
     });
-    if (!html) html = '<span style="color:#475569;font-size:0.82rem">No relationships found.</span>';
+    if (!html) html = '<span style="color:#475569;font-size:0.82rem">' +
+                      (all ? 'No joins match the search.' : 'No relationships found.') + '</span>';
     panel.innerHTML = html;
-    const accepted = rels.filter(([, r]) => r.status === 'accepted').length;
-    document.getElementById('rel-count').textContent = rels.length ? '(' + accepted + '/' + rels.length + ' approved)' : '';
+    const accepted = Object.values(relState).filter(r => r.status === 'accepted').length;
+    document.getElementById('rel-count').textContent = all
+      ? '(' + accepted + '/' + all + ' approved' + (q.length ? ' · ' + rels.length + ' shown' : '') + ')' : '';
+  }
+
+  // search: space-separated words, all must appear (case-insensitive)
+  const searchTerms = id => document.getElementById(id).value.toLowerCase().split(/\\s+/).filter(Boolean);
+  const matchesAll = (terms, text) => { const t = text.toLowerCase(); return terms.every(w => t.includes(w)); };
+
+  let shownRels = [];   // relationship keys passing the current search
+  function bulkStatus(status) {
+    shownRels.forEach(k => { if (relState[k]) relState[k].status = status; });
+    rebuild(); refreshDraft();
   }
 
   function setStatus(key, status) {
@@ -2164,7 +2390,8 @@ _HTML = """<!DOCTYPE html>
       const j = r.j;
       els.push({ data: {
         id: edgeId(key), key: key, source: j.fk.table, target: j.pk.table,
-        label: j.fk.column, status: r.status
+        label: j.fk.column, status: r.status,
+        alt: r.status === 'accepted' && !r.primary && !r.role ? 'yes' : 'no'
       }});
     });
     if (cy) cy.destroy();
@@ -2188,13 +2415,14 @@ _HTML = """<!DOCTYPE html>
             'line-color': '#22c55e', 'target-arrow-color': '#22c55e' } },
         { selector: 'edge[status = "uncertain"]', style: {
             'line-color': '#f59e0b', 'target-arrow-color': '#f59e0b', 'line-style': 'dashed' } },
+        { selector: 'edge[alt = "yes"]', style: {
+            'line-color': '#475569', 'target-arrow-color': '#475569', 'line-style': 'dotted' } },
         { selector: 'edge.dim', style: { 'opacity': 0.2 } },
         { selector: 'edge.hl', style: {
             'width': 5, 'line-color': '#38bdf8', 'target-arrow-color': '#38bdf8',
             'color': '#e2e8f0', 'z-index': 999 } }
       ],
-      layout: { name: 'cose', padding: 30, nodeRepulsion: 9000, idealEdgeLength: 130,
-                animate: false }
+      layout: GRAPH_LAYOUT
     });
     cy.on('tap', 'edge', evt => {
       const key = evt.target.data('key');
@@ -2213,23 +2441,120 @@ _HTML = """<!DOCTYPE html>
   let cubeExcl = new Set();      // "table.member" — removed from the cube (and so every view)
   let viewExcl = new Set();      // "view|join_path|member" — removed from one view only
 
+  // ── business names / descriptions ──
+  // aiDesc is the last AI pass; descEdits holds only what the user changed and
+  // always wins, so a re-generate never overwrites an edit.
+  let aiDesc = { tables: {} };
+  let descEdits = { tables: {}, views: {} };
+
+  // Kept in this browser per CSV folder, so a reload doesn't throw away paid-for
+  // AI text or edits. Storage can be unavailable (private mode) — then it's just in memory.
+  const descKey = () => 'schema-desc:' + document.getElementById('folder-input').value.trim().replace(/[/]+$/, '');
+  function saveDescriptions() {
+    try { localStorage.setItem(descKey(), JSON.stringify({ aiDesc, descEdits })); } catch (e) {}
+  }
+  function loadDescriptions() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(descKey()) || 'null');
+      if (saved) { aiDesc = saved.aiDesc || aiDesc; descEdits = saved.descEdits || descEdits; }
+    } catch (e) {}
+  }
+
+  function mergedDescriptions() {
+    const tables = {};
+    new Set([...Object.keys(aiDesc.tables), ...Object.keys(descEdits.tables)]).forEach(t => {
+      const a = aiDesc.tables[t] || {}, e = descEdits.tables[t] || {};
+      const cols = {};
+      new Set([...Object.keys(a.columns || {}), ...Object.keys(e.columns || {})]).forEach(c =>
+        cols[c] = { ...(a.columns || {})[c], ...(e.columns || {})[c] });
+      tables[t] = { ...a, ...e, columns: cols };
+    });
+    return { tables, views: descEdits.views };
+  }
+
+  const acceptedJoins = () => Object.values(relState)
+    .filter(r => r.status === 'accepted')
+    .map(r => ({ ...r.j, relationship: r.relationship, primary: r.primary, role: !!r.role && !r.primary }));
+
+  async function generateDescriptions() {
+    if (!discData) return;
+    const btn = document.getElementById('draft-describe');
+    const st = document.getElementById('describe-status');
+    // after a run, only tables without AI text are sent — a failure is retried
+    // without paying for the rest again; once all are done it re-describes all
+    const all = Object.keys(discData.tables);
+    const missing = all.filter(t => !aiDesc.tables[t]);
+    const tables = missing.length ? missing : all;
+    btn.disabled = true;
+    st.textContent = 'Describing ' + tables.length + ' table' + (tables.length > 1 ? 's' : '') + '…';
+    try {
+      const r = await fetch('/discovery/describe', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ discovery: discData, joins: acceptedJoins(), tables,
+                               dataset: document.getElementById('dataset-input').value.trim() })
+      });
+      const d = await r.json();
+      if (d.error) { st.textContent = 'Describe failed: ' + d.error; return; }
+      aiDesc = { tables: { ...(missing.length ? aiDesc.tables : {}), ...(d.tables || {}) } };
+      const errs = Object.entries(d.errors || {});
+      st.textContent = 'Described ' + Object.keys(d.tables || {}).length + ' tables' +
+        (errs.length ? ' · failed: ' + errs.map(([t, m]) => t + ' (' + m + ')').join(', ') : '') +
+        ' — edit below; your edits win.';
+      saveDescriptions();
+      refreshDraft();
+    } catch (e) { st.textContent = 'Describe failed: ' + e.message; }
+    finally { btn.disabled = !draft; }
+  }
+
+  // editor inputs carry data-edit: "t|table|field", "c|table|column", "v|root|field"
+  function setDescEdit(spec, value) {
+    const [kind, name, field] = spec.split('|');
+    if (kind === 'v') {
+      (descEdits.views[name] = descEdits.views[name] || {})[field] = value;
+    } else {
+      const t = descEdits.tables[name] = descEdits.tables[name] || {};
+      if (kind === 'c') (t.columns = t.columns || {})[field] = { description: value };
+      else t[field] = field === 'synonyms' ? value.split(',').map(x => x.trim()).filter(Boolean) : value;
+    }
+    saveDescriptions();
+    refreshDraft();
+  }
+  const isEdited = spec => {
+    const [kind, name, field] = spec.split('|');
+    if (kind === 'v') return !!(descEdits.views[name] && field in descEdits.views[name]);
+    const t = descEdits.tables[name] || {};
+    return kind === 'c' ? !!(t.columns && field in t.columns) : field in t;
+  };
+  const inputAttr = (spec, value) =>
+    ' data-edit="' + escapeHtml(spec) + '" value="' + escapeHtml(value || '') + '"' +
+    (isEdited(spec) ? ' class="edited" title="Edited — overrides the AI text"' : '');
+  const textareaHtml = (spec, value) =>
+    '<textarea data-edit="' + escapeHtml(spec) + '"' +
+    (isEdited(spec) ? ' class="edited" title="Edited — overrides the AI text"' : '') + '>' +
+    escapeHtml(value || '') + '</textarea>';
+
   async function refreshDraft() {
     if (!discData) return;
     const seq = ++draftSeq;
-    const joins = Object.values(relState)
-      .filter(r => r.status === 'accepted')
-      .map(r => ({ ...r.j, relationship: r.relationship }));
+    ensurePrimaries();
+    const joins = acceptedJoins();
     try {
       const r = await fetch('/discovery/semantic', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ discovery: discData, joins,
-                               dataset: document.getElementById('dataset-input').value.trim() })
+                               dataset: document.getElementById('dataset-input').value.trim(),
+                               root: document.getElementById('root-select').value,
+                               descriptions: mergedDescriptions() })
       });
       const d = await r.json();
       if (seq !== draftSeq) return;
       if (d.error) { draft = null; renderDraft(d.error); return; }
       draft = d;
       if (d.dataset) document.getElementById('dataset-input').value = d.dataset;  // show the sanitised name
+      const rs = document.getElementById('root-select');
+      rs.innerHTML = Object.keys(discData.tables).sort().map(t =>
+        '<option value="' + escapeHtml(t) + '"' + (t === d.root ? ' selected' : '') + '>' +
+        escapeHtml(t) + '</option>').join('');
       renderDraft();
     } catch (e) { if (seq === draftSeq) { draft = null; renderDraft(e.message); } }
   }
@@ -2275,6 +2600,13 @@ _HTML = """<!DOCTYPE html>
     const body = document.getElementById('draft-body');
     document.getElementById('draft-copy').disabled = !draft;
     document.getElementById('draft-export').disabled = !draft;
+    const dbtn = document.getElementById('draft-describe');
+    dbtn.disabled = !draft;
+    if (discData) {
+      const missing = Object.keys(discData.tables).filter(t => !aiDesc.tables[t]).length;
+      const done = Object.keys(aiDesc.tables).length;
+      dbtn.textContent = !done ? '✨ Describe' : missing ? '✨ Describe missing (' + missing + ')' : '✨ Re-describe all';
+    }
     if (!draft) {
       document.getElementById('draft-count').textContent = '';
       body.innerHTML = '<div class="draft-note">Draft failed: ' + escapeHtml(error || 'unknown error') + '</div>';
@@ -2287,18 +2619,25 @@ _HTML = """<!DOCTYPE html>
       (removed ? ' · ' + removed + ' removed' : '') + ')';
     const cubes = {};
     draft.cubes.forEach(c => cubes[c.name] = c.data);
+    const q = searchTerms('draft-search');
+    shownMembers = [];
+    // keep only chips matching the search; `where` (view/path or cube) counts toward the match
+    const keep = (items, where) => items.filter(it => {
+      const hit = matchesAll(q, where + ' ' + it.label);
+      if (hit && it.key) shownMembers.push(it.key);
+      return hit;
+    });
     let html = '';
     draft.notes.forEach(n => html += '<div class="draft-note">' + escapeHtml(n) + '</div>');
 
     html += '<div class="draft-sec">Views — public</div>';
-    if (!draft.views.length) html += '<span class="draft-empty">No fact table found.</span>';
+    if (!draft.views.length) html += '<span class="draft-empty">No views.</span>';
     draft.views.forEach(v => {
-      html += '<div class="draft-card view"><div class="draft-name">' + escapeHtml(v.name) + '</div>' +
-              '<div class="draft-desc">' + escapeHtml(v.data.description || '') + '</div>';
+      let paths = '';
       v.data.cubes.forEach(e => {
         const table = e.join_path.split('.').pop();
         const c = cubes[table] || { measures: {}, dimensions: {} };
-        const pfx = e.prefix ? table + '_' : '';
+        const pfx = e.prefix ? (e.alias || table) + '_' : '';
         const item = n => {
           const key = 'v|' + bare(v.name) + '|' + barePath(e.join_path) + '|' + n;
           return { label: pfx + n, key, off: viewExcl.has(key.slice(2)) };
@@ -2307,15 +2646,25 @@ _HTML = """<!DOCTYPE html>
         const inc = e.includes.filter(n => !cubeExcl.has(bare(table) + '.' + n));
         const ms = inc.filter(n => n in c.measures);
         const ds = inc.filter(n => !(n in c.measures));
-        const time = ds.filter(n => (c.dimensions[n] || {}).type === 'time');
-        const plain = ds.filter(n => (c.dimensions[n] || {}).type !== 'time');
-        html += '<div class="draft-path">' + escapeHtml(e.join_path) +
-                (e.prefix ? ' <span class="pfx">(prefixed)</span>' : '') + '</div>';
-        if (ms.length) html += chips(ms.map(item), 'm');
-        if (time.length) html += chips(time.map(item), 't');
-        if (plain.length) html += chips(plain.map(item), 'd');
+        const where = v.name + ' ' + e.join_path + ' ' + (e.alias || '');
+        const m = keep(ms.map(item), where);
+        const t = keep(ds.filter(n => (c.dimensions[n] || {}).type === 'time').map(item), where);
+        const d = keep(ds.filter(n => (c.dimensions[n] || {}).type !== 'time').map(item), where);
+        if (q.length && !(m.length || t.length || d.length)) return;
+        paths += '<div class="draft-path">' + escapeHtml(e.join_path) +
+                 (e.prefix ? ' <span class="pfx">(prefixed)</span>' : '') + '</div>';
+        if (m.length) paths += chips(m, 'm');
+        if (t.length) paths += chips(t, 't');
+        if (d.length) paths += chips(d, 'd');
       });
-      html += '</div>';
+      if (q.length && !paths) return;
+      const root = bare(v.name).replace(/_view$/, '');
+      html += '<div class="draft-card view"><div class="draft-name">' + escapeHtml(v.name) + '</div>' +
+              '<div class="desc-edit">' +
+                '<label>Title</label><input' + inputAttr('v|' + root + '|title', v.data.title) +
+                ' placeholder="e.g. Flu Study"/>' +
+                '<label>Description</label>' + textareaHtml('v|' + root + '|description', v.data.description) +
+              '</div>' + paths + '</div>';
     });
 
     html += '<div class="draft-sec">Cubes — private</div>';
@@ -2326,25 +2675,65 @@ _HTML = """<!DOCTYPE html>
         return { label, key, off: cubeExcl.has(key.slice(2)) };
       };
       const dims = Object.entries(c.dimensions);
-      const pk = dims.filter(([, d]) => d.primary_key).map(([n]) => ({ label: n, key: null }));
-      const other = dims.filter(([, d]) => !d.primary_key)
-                        .map(([n, d]) => item(n, n + (d.type === 'string' ? '' : ' · ' + d.type)));
+      const pk = keep(dims.filter(([, d]) => d.primary_key).map(([n]) => ({ label: n, key: null })), cb.name);
+      const other = keep(dims.filter(([, d]) => !d.primary_key)
+                        .map(([n, d]) => item(n, n + (d.type === 'string' ? '' : ' · ' + d.type))), cb.name);
+      const meas = keep(Object.entries(c.measures).map(([n, m]) => item(n, n + ' · ' + m.type)), cb.name);
+      if (q.length && !(pk.length || other.length || meas.length)) return;
       const role = draft.roles[cb.name] || '';
-      const open = openCubes.has(cb.name) ? ' open' : '';
+      // searching opens matching cubes so the hits are visible
+      const open = (q.length || openCubes.has(cb.name)) ? ' open' : '';
+      const t = bare(cb.name);
+      const md = mergedDescriptions().tables[t] || {};
+      let editor;
+      if (discData && discData.tables[t]) {
+        const cols = Object.entries(c.dimensions).filter(([, d]) => !d.primary_key);
+        editor = '<div class="desc-edit">' +
+            '<label>Title</label><input' + inputAttr('t|' + t + '|title', md.title || c.title) +
+            ' placeholder="e.g. Participants"/>' +
+            '<label>Description</label>' + textareaHtml('t|' + t + '|description', md.description || c.description) +
+            '<label>Also called</label><input' + inputAttr('t|' + t + '|synonyms', (md.synonyms || []).join(', ')) +
+            ' placeholder="subjects, patients — comma separated"/>' +
+          '</div>' +
+          (cols.length ? '<details><summary class="draft-path">column descriptions (' + cols.length + ')</summary>' +
+            '<div class="col-desc">' + cols.map(([n, d]) =>
+              '<code>' + escapeHtml(n) + '</code><input' +
+              inputAttr('c|' + t + '|' + n, ((md.columns || {})[n] || {}).description || d.description) + '/>').join('') +
+            '</div></details>' : '');
+      } else {
+        editor = '<div class="draft-desc">' + escapeHtml(c.description || '') + '</div>';  // copy cube
+      }
       html += '<div class="draft-card"><details data-cube="' + escapeHtml(cb.name) + '"' + open + '>' +
-              '<summary><span class="draft-name">' + escapeHtml(cb.name) +
-              '</span><span class="role ' + role + '">' + role + '</span></summary>' +
-              '<div class="draft-desc">' + escapeHtml(c.description || '') + '</div>';
+              '<summary><span class="draft-name">' + escapeHtml(cb.name) + '</span>' +
+              (c.title ? ' <span class="pfx">' + escapeHtml(c.title) + '</span>' : '') +
+              '<span class="role ' + role + '">' + role + '</span></summary>' + editor;
       Object.entries(c.joins || {}).forEach(([t, j]) =>
         html += '<div class="draft-join">→ ' + escapeHtml(t) + ' · ' + escapeHtml(j.relationship) + '</div>');
       if (pk.length) html += '<div class="draft-path">primary key</div>' + chips(pk, 'k');
-      html += '<div class="draft-path">measures</div>' +
-              chips(Object.entries(c.measures).map(([n, m]) => item(n, n + ' · ' + m.type)), 'm');
+      if (meas.length) html += '<div class="draft-path">measures</div>' + chips(meas, 'm');
       if (other.length) html += '<div class="draft-path">dimensions</div>' + chips(other, 'd');
       html += '</details></div>';
     });
+    if (q.length && !shownMembers.length) html += '<span class="draft-empty">No members match the search.</span>';
     body.innerHTML = html;
+    document.getElementById('draft-remove-shown').disabled = !shownMembers.length;
+    document.getElementById('draft-restore-shown').disabled = !shownMembers.length;
   }
+
+  let shownMembers = [];   // removal keys ("c|…" / "v|…") of chips passing the search
+  function bulkMembers(remove) {
+    shownMembers.forEach(x => {
+      const set = x.startsWith('c|') ? cubeExcl : viewExcl;
+      remove ? set.add(x.slice(2)) : set.delete(x.slice(2));
+    });
+    renderDraft();
+  }
+
+  // description editors: commit on change (blur / enter), not per keystroke
+  document.getElementById('draft-body').addEventListener('change', e => {
+    const spec = e.target.dataset && e.target.dataset.edit;
+    if (spec) setDescEdit(spec, e.target.value.trim());
+  });
 
   // keep expanded cube cards open across re-renders
   const openCubes = new Set();

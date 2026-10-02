@@ -4,8 +4,9 @@ edit_cube_config — interactive cube config editor.
 Fetches the current cube's fields, then does a single interrupt()
 so the UI can render a form card. The user fills in all details
 (field type, add/replace, key, SQL, aggregation/dim type, title)
-and submits a JSON object. The tool parses that and returns the
-full proposed measures + dimensions dicts to the main agent.
+and submits a JSON object. The tool parses that and returns just that
+one field as a change for preview_cube_config_update, which merges it into
+the existing config — so nothing else can be dropped along the way.
 """
 import json, os
 import httpx
@@ -31,13 +32,15 @@ async def edit_cube_config(
     suggested_sql: str = "",
     suggested_type: str = "",
     suggested_title: str = "",
+    suggested_running_total: bool = False,
 ) -> str:
     """
     Interactively gather everything needed to edit a cube config.
     Shows the user a form card to specify field type (measure/dimension),
     add-or-replace, key name, SQL expression, aggregation/dim type, and title.
-    Returns the full proposed measures + dimensions dicts for the main agent
-    to pass to preview_cube_config_update.
+    Returns the one changed field as `measures` or `dimensions` (a change, not
+    the full list) for the main agent to pass to preview_cube_config_update
+    as is.
 
     Args:
         cube_name:            name of the cube to edit (e.g. "orders")
@@ -47,6 +50,8 @@ async def edit_cube_config(
         suggested_sql:        pre-fill form — best-guess SQL expression
         suggested_type:       pre-fill form — aggregation or dimension type
         suggested_title:      pre-fill form — human-readable display title
+        suggested_running_total: pre-fill form — a cumulative / running total
+                              over time (count or sum with an unbounded window)
     """
     # ── fetch current config ──────────────────────────────────────────────────
     all_configs = await _lib_get("/v1/CUBE_CONFIG")
@@ -75,6 +80,7 @@ async def edit_cube_config(
     if suggested_sql:        interrupt_payload["suggested_sql"]        = suggested_sql
     if suggested_type:       interrupt_payload["suggested_type"]       = suggested_type
     if suggested_title:      interrupt_payload["suggested_title"]      = suggested_title
+    if suggested_running_total: interrupt_payload["suggested_running_total"] = True
 
     raw_answer = interrupt(interrupt_payload)
 
@@ -94,15 +100,18 @@ async def edit_cube_config(
     if not key:
         return json.dumps({"error": "No field key provided."})
 
-    pool = dict(measures if field_type == "measure" else dimensions)
-    pool[key] = {"sql": sql_expr, "type": ftype, "title": title}
+    spec = {"sql": sql_expr, "type": ftype, "title": title}
+    if field_type == "measure" and ans.get("running_total"):
+        # Cube has no "cumulative" type: a running total is the measure summed
+        # over everything up to each time bucket
+        spec["rolling_window"] = {"trailing": "unbounded"}
 
     return json.dumps({
-        "config_id":            config_id,
-        "cube_name":            cube_name,
-        "field_type":           field_type,
-        "field_key":            key,
-        "action":               action,
-        "updated_measures":     pool       if field_type == "measure"   else measures,
-        "updated_dimensions":   pool       if field_type == "dimension" else dimensions,
+        "config_id":   config_id,
+        "cube_name":   cube_name,
+        "field_type":  field_type,
+        "field_key":   key,
+        "action":      action,
+        # a change, not the full list — preview merges it into the existing fields
+        ("measures" if field_type == "measure" else "dimensions"): {key: spec},
     }, indent=2)

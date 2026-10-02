@@ -134,14 +134,21 @@ dimension that does NOT exist in the schema):
      (e.g. for "bi-month": CASE WHEN EXTRACT(MONTH FROM created_at) IN (1,2) THEN 'Jan-Feb' ...)
    - suggested_type: the most likely type (e.g. "string" for grouping dims, "sum" for revenue measures)
    - suggested_title: a clean human-readable label
+   - suggested_running_total: true for "cumulative" / "running total" / "so far" requests.
+     There is no cumulative type: use type count (sql: the primary key, e.g. id) or sum
+     with this flag. A measure's sql is a column or row expression — never COUNT()/SUM().
    The form will open pre-filled — the user can review and adjust before applying.
 
 When the user asks to MODIFY an existing cube config, use this exact flow — never skip steps:
 1. Call edit_cube_config(cube_name, intent). This will ask the user clarifying questions
    (measure vs dimension, add vs replace, name, SQL, type, title) via the chat UI.
    Wait for it to return the full change spec — do NOT call preview before it finishes.
-2. Call preview_cube_config_update using the config_id, updated_measures, and
-   updated_dimensions returned by edit_cube_config. This stages the change without saving.
+2. Call preview_cube_config_update with the config_id and the `measures` or
+   `dimensions` returned by edit_cube_config, passed through exactly as returned.
+   They are a CHANGE (one field), not the full list — preview keeps every other
+   field. Never re-type or abbreviate the cube's fields. Only pass
+   remove_measures / remove_dimensions when the user explicitly asked to delete.
+   This stages the change without saving.
 3. Summarise what changed and ask: "Should I commit this to the database?"
 4. Only after the user confirms, call commit_cube_config_update.
 5. Call reload_cube_schema so the change is live in Cube.js immediately.
@@ -305,12 +312,12 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
     return True
 
 
-async def _fetch_cube_metadata() -> list[dict]:
-    """Fetch the Cube data model (/meta cubes list) for the query builder.
+async def _fetch_cube_metadata() -> tuple[list[dict], list[dict]]:
+    """Fetch the Cube data model (/meta) for the query builder -> (views, cubes).
 
     Views are the only surface the agent should query. In dev mode /meta also lists
-    private base cubes (isVisible/public=false), so filter to visible entries — this
-    is what feeds build_query's view routing, so raw cubes must never leak in here.
+    the private base cubes (isVisible/public=false); those never reach query
+    building, but their descriptions tell the view router what each view covers.
     """
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
@@ -318,9 +325,9 @@ async def _fetch_cube_metadata() -> list[dict]:
             headers={"Authorization": f"Bearer {CUBE_API_SECRET}"},
         )
         resp.raise_for_status()
-        cubes = resp.json().get("cubes", [])
-    return [c for c in cubes
-            if c.get("isVisible", c.get("public", True)) is not False]
+        entries = resp.json().get("cubes", [])
+    hidden = lambda c: c.get("isVisible", c.get("public", True)) is False
+    return [c for c in entries if not hidden(c)], [c for c in entries if hidden(c)]
 
 
 @tool
@@ -346,9 +353,10 @@ async def build_query(request: str, context: str = "") -> str:
         that cannot be combined in one query — do NOT call query_cube; relay the
         boundary to the user.
     """
-    metadata = await _fetch_cube_metadata()
+    metadata, cubes = await _fetch_cube_metadata()
     # build_query is sync (structured LLM call) — run off the event loop.
-    query = await asyncio.to_thread(qb.build_query, request, metadata, context=context or None)
+    query = await asyncio.to_thread(qb.build_query, request, metadata,
+                                    context=context or None, cubes=cubes)
     if isinstance(query, dict) and query.get("_view_error"):
         # A single query can't span two views. Stop the tool chain here and hand the
         # boundary back to the model to explain — don't let it fall through to query_cube.

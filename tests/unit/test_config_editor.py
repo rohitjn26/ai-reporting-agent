@@ -47,7 +47,7 @@ async def test_unknown_cube_returns_error_with_available_names(monkeypatch, patc
     assert "orders" in out["error"]
 
 
-async def test_add_measure_returns_updated_pool(monkeypatch, patch_lib):
+async def test_add_measure_returns_only_the_change(monkeypatch, patch_lib):
     _patch_form_answer(monkeypatch, json.dumps({
         "field_type": "measure", "action": "add", "key": "aov",
         "sql": "SUM(amount)/COUNT(id)", "type": "number", "title": "Avg Order Value",
@@ -58,23 +58,21 @@ async def test_add_measure_returns_updated_pool(monkeypatch, patch_lib):
     assert out["field_type"] == "measure"
     assert out["field_key"] == "aov"
     assert out["action"] == "add"
-    # new measure added alongside the existing one
-    assert set(out["updated_measures"]) == {"count", "aov"}
-    assert out["updated_measures"]["aov"] == {
+    # just the new field — preview merges it, so existing ones can't be dropped
+    assert out["measures"] == {"aov": {
         "sql": "SUM(amount)/COUNT(id)", "type": "number", "title": "Avg Order Value"
-    }
-    # dimensions untouched
-    assert set(out["updated_dimensions"]) == {"status"}
+    }}
+    assert "dimensions" not in out
 
 
-async def test_add_dimension_updates_dimension_pool(monkeypatch, patch_lib):
+async def test_add_dimension_returns_only_the_change(monkeypatch, patch_lib):
     _patch_form_answer(monkeypatch, json.dumps({
         "field_type": "dimension", "action": "add", "key": "bi_month",
         "sql": "CASE WHEN ... END", "type": "string", "title": "Bi-Month",
     }))
     out = json.loads(await _run(cube_name="orders", intent="add a bi-month bucket"))
-    assert set(out["updated_dimensions"]) == {"status", "bi_month"}
-    assert set(out["updated_measures"]) == {"count"}  # unchanged
+    assert set(out["dimensions"]) == {"bi_month"}
+    assert "measures" not in out
 
 
 async def test_accepts_dict_answer_not_just_json_string(monkeypatch, patch_lib):
@@ -85,7 +83,7 @@ async def test_accepts_dict_answer_not_just_json_string(monkeypatch, patch_lib):
     })
     out = json.loads(await _run(cube_name="orders", intent="make count distinct"))
     assert out["action"] == "replace"
-    assert out["updated_measures"]["count"]["type"] == "count_distinct"
+    assert out["measures"]["count"]["type"] == "count_distinct"
 
 
 async def test_missing_key_is_rejected(monkeypatch, patch_lib):
@@ -98,3 +96,14 @@ async def test_unparseable_answer_is_reported(monkeypatch, patch_lib):
     _patch_form_answer(monkeypatch, "this is not json")
     out = json.loads(await _run(cube_name="orders", intent="add field"))
     assert "Could not parse form answer" in out["error"]
+
+
+async def test_running_total_becomes_an_unbounded_rolling_window(monkeypatch, patch_lib):
+    _patch_form_answer(monkeypatch, json.dumps({
+        "field_type": "measure", "action": "add", "key": "cumulative_count",
+        "sql": "id", "type": "count", "title": "Participants so far", "running_total": True,
+    }))
+    out = json.loads(await _run(cube_name="orders", intent="cumulative count"))
+    assert out["measures"]["cumulative_count"] == {
+        "sql": "id", "type": "count", "title": "Participants so far",
+        "rolling_window": {"trailing": "unbounded"}}

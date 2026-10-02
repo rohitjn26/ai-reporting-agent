@@ -81,6 +81,14 @@ A funnel: cheap pruning kills ~99% of column pairs before any data comparison; e
 
 Name similarity is a **prior, not proof**: not sufficient (matching names can be coincidental — `quantity ⊆ id`) and not necessary (real FKs break naming, e.g. `custno → customers.id`). Containment is the verdict; names rank and disambiguate.
 
+**Acceptance** (`classify_joins`), per FK column, among targets with containment ≥ 0.98 and a unique key:
+
+- **High-entropy key** (string keys ≥ 16 chars — ObjectIds, UUIDs) with one such target → accepted on containment alone. Values that random can't be contained by chance, so `author → account.id` needs no name.
+- **Several targets** → the single best name signal wins (`suffix_id` `customer_id→customers` > `table` `c_task→c_task`, `c_account→account` > `exact`); a tie goes to review.
+- **Low-entropy key** (small ints, short codes) → needs a name signal. `shelf ⊆ store.id` over 1..20 is plausibly chance, so it goes to review.
+
+Several FK columns into one table (`creator`/`owner`/`updater → account`) are all accepted. A Cube cube holds one join per target, so the draft keeps the best-named one and notes the rest.
+
 ## Fan-out, grain & additivity
 
 A join fans out when the declared "one" side isn't actually unique on the key; each matched row multiplies and any measure summed over it over-counts. Under Cube's LEFT joins, orphans don't cancel it — fan-out is a pure over-count.
@@ -165,12 +173,20 @@ Flow to live Cube (a later step, out of v1 scope): `seed.py --update` → `reloa
 
 ## Semantic-layer draft (built, rules-based)
 
-`discovery/semantic.py` → `draft_semantic_layer(discovery_dict, joins=None)` turns a discovery result plus the user-approved joins into `CUBE_CONFIGS` / `VIEW_CONFIGS`-shaped drafts. No LLM; names and descriptions are plain placeholders for a later LLM pass.
+`discovery/semantic.py` → `draft_semantic_layer(discovery_dict, joins=None, dataset=None, root=None)` turns a discovery result plus the user-approved joins into `CUBE_CONFIGS` / `VIEW_CONFIGS`-shaped drafts. No LLM; names and descriptions are plain placeholders for a later LLM pass.
 
 - **Roles:** *bridge* = composite grain of all-FK columns; *fact* = has an outgoing join and an additive measure (or nothing joins into it); isolated tables are facts; everything else is a *dimension*.
 - **Cubes:** one per table, `public: false`, `SELECT * FROM <table>`. PK from grain (composite → a `CONCAT` `pk` dimension; undetermined → note). FK columns are omitted (join plumbing). Text/date/bool → dimensions. Numbers on facts/bridges → `sum` + `avg` measures; name hints (`price`, `rate`, `grade`, …) mark non-additive → `avg` only; calendar/code ints stay dimensions. Dimension tables aggregate nothing but `count`.
-- **Views:** one per fact/bridge (`<table>_view`). BFS over `many_to_one`/`one_to_one` joins gives the `join_path`s; the root contributes measures + dimensions, joined cubes contribute dimensions only with `prefix: true`. Fan-out joins stay on the cube but out of views; ambiguous equal-length paths are noted.
-- On the e-commerce fixtures this re-derives the hand-written `sales` / `product_sales` split (orders view + order_items view).
+- **Views:** one per connected group of tables (`<root>_view`), rooted at the table from which the most tables are reachable going down (ties → the smaller table), or at the root picked in the Schema tab. A Cube view is a tree, and two branches that meet only at a coarse ancestor cross-multiply there (org has one row, so every step response would pair with every task). So:
+  - **Spine (down, `one_to_many`):** each table sits under its *deepest* parent, i.e. the longest FK chain to the root. Only FKs filled in on ≥ 50% of rows count (events → task_response at 2% would drop the other events), hubs referenced by most tables (`account` via `creator`/`owner`) never act as parents, and at equal depth the bigger parent wins (participant over task). The spine is the chain from each fact (a table nothing references) up to the root. Spine tables contribute measures + dimensions; Cube dedups measures by primary key across `one_to_many`.
+  - **Lookups (up, `many_to_one`):** every well-filled FK from a spine table must resolve along the tree. If the target isn't already an ancestor (or below it on the spine), it attaches under the shallowest spine table referencing it, plus a copy for each branch that can't reach that one (event gets its own `c_task`). Lookups contribute dimensions only.
+  - **Copy cubes:** a Cube view reaches each cube by one path only, so every extra placement is its own cube (`<host>_<table>`, same SQL) and the host's join is repointed to it.
+  - The parent side declares the `one_to_many` join the view walks down. Fan-out joins stay on the cube but out of views. Every member is prefixed with its table (or copy) name.
+- On the e-commerce fixtures this gives one `customers_view`: customers → orders → order_items, with products as a lookup.
+
+**Business descriptions (AI, editable).** `discovery/describe.py` → `describe_tables(...)`: one Haiku call per table (parallel; `$DESCRIBE_MODEL`) over its name, related tables and column profile (type, distinct count, null %, 3 samples cut to 40 chars) → a business title, description, synonyms, and a title + description per column. `draft_semantic_layer(..., descriptions=...)` applies them: cube title/description (+ "Also called: …"), dimensions, and measures derived from them (`count` → "Number of participants (subjects, patients)"). In the Schema tab, **✨ Describe** fills them in and every field is editable; edits are kept apart from the AI text and always win, so re-describing never overwrites them. Samples leave the machine — fine for synthetic data, a consideration for real data.
+
+**View `meta`.** Each view carries its cubes (name, title, description) in `meta`. Private cubes are absent from Cube's `/meta` outside dev mode, and the agent's view router reads each view's description plus these cube descriptions — never member lists.
 
 Surfaces: `python -m discovery <folder> --semantic [--dataset NAME]`, `POST /discovery/semantic`, and the Schema tab's live draft panel (remove members per view or per cube, then **Export semantic layer** → `<dataset>.json`).
 

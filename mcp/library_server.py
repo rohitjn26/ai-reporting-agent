@@ -5,7 +5,7 @@ Exposes: list_cube_configs, get_cube_config_detail, create_cube_config,
 SSE endpoint:    http://0.0.0.0:5002/sse
 Health endpoint: http://0.0.0.0:5002/health
 """
-import logging, os, json
+import logging, os, json, re
 from typing import Optional
 
 
@@ -15,11 +15,15 @@ class _NoHealthFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_NoHealthFilter())
 
+# Cube's measure types. A running total is NOT a type — it's a count/sum with
+# rolling_window: {trailing: "unbounded"} (see _validate_fields).
 _VALID_MEASURE_TYPES = {
     "sum", "count", "count_distinct", "count_distinct_approx",
     "avg", "min", "max", "number", "string", "time", "boolean",
-    "running_total", "cumulative",
 }
+# types that aggregate their sql themselves — so the sql must be a plain column/expression
+_AGGREGATING_TYPES = {"sum", "count", "count_distinct", "count_distinct_approx", "avg", "min", "max"}
+_AGGREGATE_IN_SQL = re.compile(r"\b(count|sum|avg|min|max)\s*\(", re.IGNORECASE)
 _VALID_DIMENSION_TYPES = {"string", "number", "time", "boolean", "geo"}
 
 
@@ -29,13 +33,25 @@ def _validate_fields(measures: dict | None, dimensions: dict | None) -> list[str
         if not isinstance(cfg, dict):
             errors.append(f"measure '{key}' must be an object")
             continue
-        if not cfg.get("sql"):
+        mtype = cfg.get("type")
+        if not cfg.get("sql") and mtype != "count":  # a plain count needs no sql
             errors.append(f"measure '{key}' is missing 'sql'")
-        if cfg.get("type") and cfg["type"] not in _VALID_MEASURE_TYPES:
+        if mtype and mtype not in _VALID_MEASURE_TYPES:
             errors.append(
-                f"measure '{key}' has invalid type '{cfg['type']}'. "
-                f"Allowed: {sorted(_VALID_MEASURE_TYPES)}"
+                f"measure '{key}' has invalid type '{mtype}'. "
+                f"Allowed: {sorted(_VALID_MEASURE_TYPES)}. For a running total use type "
+                f"count or sum with rolling_window: {{\"trailing\": \"unbounded\"}}."
             )
+        if mtype in _AGGREGATING_TYPES and _AGGREGATE_IN_SQL.search(cfg.get("sql") or ""):
+            errors.append(
+                f"measure '{key}': type '{mtype}' already aggregates, so its sql must be a "
+                f"column or row expression, not {cfg['sql']!r} — e.g. type count with sql id, "
+                f"or type number for a hand-written aggregate."
+            )
+        rw = cfg.get("rolling_window")
+        if rw is not None and not (isinstance(rw, dict) and (rw.get("trailing") or rw.get("leading"))):
+            errors.append(f"measure '{key}': rolling_window needs trailing or leading, "
+                          f"e.g. {{\"trailing\": \"unbounded\"}}")
     for key, cfg in (dimensions or {}).items():
         if not isinstance(cfg, dict):
             errors.append(f"dimension '{key}' must be an object")
@@ -171,6 +187,21 @@ async def create_cube_config(
     return json.dumps(result, indent=2)
 
 
+def merge_fields(current: dict, changes: dict | None, remove: list | None) -> tuple[dict, dict]:
+    """Apply a patch to a measures/dimensions dict -> (merged, summary).
+    Fields in `changes` are added or replaced by key; only keys named in
+    `remove` are deleted. Everything else is kept as is."""
+    merged = dict(current or {})
+    summary = {"added": [], "replaced": [], "removed": []}
+    for key, cfg in (changes or {}).items():
+        summary["replaced" if key in merged else "added"].append(key)
+        merged[key] = cfg
+    for key in remove or []:
+        if merged.pop(key, None) is not None:
+            summary["removed"].append(key)
+    return merged, summary
+
+
 @mcp.tool()
 async def preview_cube_config_update(
     config_id: str,
@@ -178,12 +209,20 @@ async def preview_cube_config_update(
     sql: Optional[str] = None,
     measures: Optional[dict] = None,
     dimensions: Optional[dict] = None,
+    remove_measures: Optional[list[str]] = None,
+    remove_dimensions: Optional[list[str]] = None,
     description: Optional[str] = None,
 ) -> str:
     """
     Stage a cube config update for review — does NOT write to the database.
-    Returns the current config alongside the proposed config so the user can compare.
-    After the user confirms, call commit_cube_config_update to persist the change.
+
+    `measures` / `dimensions` are CHANGES, not the full list: pass only the
+    fields to add or replace (by key) — every other existing field is kept.
+    To delete a field, name it in `remove_measures` / `remove_dimensions`;
+    nothing is ever removed otherwise.
+
+    Returns the current and proposed config plus a summary of what changes.
+    After the user confirms, call commit_cube_config_update to persist it.
     """
     current = await _get(f"/v1/CUBE_CONFIG/{config_id}")
     current_data = dict(current.get("data", {}))
@@ -191,17 +230,15 @@ async def preview_cube_config_update(
     proposed_data = dict(current_data)
     if sql is not None:
         proposed_data["sql"] = sql
-    if measures is not None:
-        proposed_data["measures"] = measures
-    if dimensions is not None:
-        proposed_data["dimensions"] = dimensions
+    proposed_data["measures"], m_sum = merge_fields(
+        current_data.get("measures"), measures, remove_measures)
+    proposed_data["dimensions"], d_sum = merge_fields(
+        current_data.get("dimensions"), dimensions, remove_dimensions)
     if description is not None:
         proposed_data["description"] = description
 
-    validation_errors = _validate_fields(
-        proposed_data.get("measures"),
-        proposed_data.get("dimensions"),
-    )
+    # only the fields being changed are checked — existing ones already compiled
+    validation_errors = _validate_fields(measures, dimensions)
     if validation_errors:
         return json.dumps({
             "error": "Validation failed — fix these before committing:",
@@ -214,6 +251,7 @@ async def preview_cube_config_update(
     return json.dumps({
         "config_id":  config_id,
         "status":     "staged — not yet saved",
+        "changes":    {"measures": m_sum, "dimensions": d_sum},
         "current":    {"name": current.get("name"),  "data": current_data},
         "proposed":   {"name": proposed_name,        "data": proposed_data},
     }, indent=2)

@@ -77,6 +77,8 @@ _SELECT_SYSTEM = """You route a data request to exactly ONE view.
 
 A view is a self-contained analytical area. A single query can NEVER combine
 members from two different views — they cannot be joined at query time.
+The cubes listed under a view are ALREADY joined inside it: a request touching
+several of one view's cubes (tasks, steps and responses) is fine for that view.
 
 - If one view covers the ENTIRE request, return its name in `view`.
 - If answering would require members from two or more views, return view=null
@@ -115,22 +117,36 @@ def render_schema(metadata: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def render_view_catalog(metadata: list[dict]) -> str:
-    """Compact catalog for routing — view names, descriptions, and a taste of the
-    members so the selector can tell which view owns the request."""
+def _view_cubes(view: dict) -> list[str]:
+    """Cubes a view is built from, in first-seen order — each view member's
+    `aliasMember` ("orders.status") names the cube it comes from."""
+    seen: list[str] = []
+    for m in view.get("measures", []) + view.get("dimensions", []):
+        src = (m.get("aliasMember") or "").split(".")[0]
+        if src and src not in seen:
+            seen.append(src)
+    return seen
+
+
+def render_view_catalog(metadata: list[dict], cubes: list[dict] | None = None) -> str:
+    """Catalog for routing: each view's description plus every cube it's built
+    from, with that cube's description. Members are left out on purpose: a view
+    can have hundreds, and which *things* it covers is what tells views apart.
+    `cubes` is the private cube metadata (from /meta); without it, cube names only."""
+    info = {c["name"]: c for c in cubes or []}
     lines = []
     for c in metadata:
         desc = f" — {c['description']}" if c.get("description") else ""
         lines.append(f"\nView: {c['name']}{desc}")
-        for kind in ("measures", "dimensions"):
-            members = c.get(kind, [])
-            if not members:
-                continue
-            titles = ", ".join(
-                (m.get("shortTitle") or m.get("title") or m["name"]) for m in members[:12]
-            )
-            more = " …" if len(members) > 12 else ""
-            lines.append(f"  {kind.capitalize()}: {titles}{more}")
+        # a view published from a draft carries its cubes in meta (works outside
+        # dev mode, where private cubes never reach /meta)
+        carried = {m["name"]: m for m in ((c.get("meta") or {}).get("cubes") or [])}
+        for name in carried or _view_cubes(c):
+            cube = carried.get(name) or info.get(name, {})
+            title = cube.get("title") or name
+            cdesc = f": {cube['description']}" if cube.get("description") else ""
+            label = f"{name} ({title})" if title != name else name
+            lines.append(f"  - {label}{cdesc}")
     return "\n".join(lines)
 
 
@@ -206,11 +222,12 @@ def select_view(
     context: str | None = None,
     model: str | None = None,
     llm=None,
+    cubes: list[dict] | None = None,
 ) -> ViewSelection:
     """Route a request to exactly one view. Returns ViewSelection(view=None) when
     the request would need to span views (Cube can't answer that in one query)."""
     llm = llm or _default_view_llm(model or os.environ.get("VIEW_SELECTOR_MODEL", "claude-haiku-4-5-20251001"))
-    msgs = [("system", _SELECT_SYSTEM), ("human", f"Views:\n{render_view_catalog(metadata)}")]
+    msgs = [("system", _SELECT_SYSTEM), ("human", f"Views:\n{render_view_catalog(metadata, cubes)}")]
     if context:
         msgs.append(("human", f"Recent conversation (for follow-ups):\n{context}"))
     msgs.append(("human", f"Request: {request}"))
@@ -224,13 +241,14 @@ def _resolve_view(
     context: str | None,
     model: str | None,
     view_llm,
+    cubes: list[dict] | None = None,
 ) -> tuple[list[dict] | None, str | None]:
     """Pick the single view this request lives in and return (view_metadata, error).
     With 0–1 views there's nothing to route. `error` is set (and metadata None)
     when no single view fits, so callers can surface the boundary honestly."""
     if len(metadata) <= 1:
         return metadata, None
-    sel = select_view(request, metadata, context=context, model=model, llm=view_llm)
+    sel = select_view(request, metadata, context=context, model=model, llm=view_llm, cubes=cubes)
     if not sel.view:
         return None, sel.reason or "request spans multiple views and can't be answered in one query"
     view_meta = [c for c in metadata if c.get("name") == sel.view]
@@ -263,12 +281,14 @@ def build_query(
     llm=None,
     view_llm=None,
     max_repairs: int = 1,
+    cubes: list[dict] | None = None,
 ) -> dict:
     """NL → validated Cube query dict. Routes to a single view first (a query can
     never span views), builds against only that view's slice, then repairs static
     validation problems once. When no single view fits, returns {"_view_error": ...}
     for the caller to surface — nothing else in the dict."""
-    view_meta, view_error = _resolve_view(request, metadata, context=context, model=model, view_llm=view_llm)
+    view_meta, view_error = _resolve_view(request, metadata, context=context, model=model,
+                                          view_llm=view_llm, cubes=cubes)
     if view_error:
         return {"_view_error": view_error}
 
@@ -301,12 +321,14 @@ def build_and_run(
     model: str | None = None,
     llm=None,
     view_llm=None,
+    cubes: list[dict] | None = None,
 ) -> tuple[dict, dict]:
     """Route to one view, build_query, execute via run_fn, and on a Cube runtime
     error repair ONCE using the error message. run_fn(query) -> result dict (with
     'error' on failure). Returns (final_query, result). When no single view fits,
     returns ({"_view_error": ...}, {"error": ...}) without calling run_fn."""
-    view_meta, view_error = _resolve_view(request, metadata, context=context, model=model, view_llm=view_llm)
+    view_meta, view_error = _resolve_view(request, metadata, context=context, model=model,
+                                          view_llm=view_llm, cubes=cubes)
     if view_error:
         return {"_view_error": view_error}, {"error": view_error}
 

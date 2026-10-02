@@ -47,6 +47,9 @@ asyncModule(async () => {
         cube(cubeName, {
           sql: () => cubeData.sql,
           public: cubeData.public !== false,
+          // private cubes' descriptions reach /meta, where the view router reads them
+          ...(cubeData.title ? { title: cubeData.title } : {}),
+          ...(cubeData.description ? { description: cubeData.description } : {}),
           refreshKey: { every: '10 second' },
           dimensions: transformDimensions(cubeData.dimensions || {}),
           measures:   transformMeasures(cubeData.measures   || {}),

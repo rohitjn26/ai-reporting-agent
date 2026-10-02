@@ -12,11 +12,8 @@ from pathlib import Path
 import duckdb
 
 from .grain import GrainResult, detect_all
-from .joins import JoinCandidate, discover_joins
+from .joins import JoinCandidate, classify_joins, discover_joins
 from .profile import TableProfile, load_folder, profile_all
-
-# a data-only match with no name signal is suspicious (e.g. quantity ⊆ id)
-ACCEPT_MIN_CONFIDENCE = 0.75
 
 
 @dataclass
@@ -86,17 +83,7 @@ def run_discovery(files: list[str | Path],
     grains = detect_all(con, profiles)
     candidates = discover_joins(con, profiles, grains)
 
-    accepted, uncertain = [], []
-    for j in candidates:
-        if j.name_signal != "none" and j.confidence >= ACCEPT_MIN_CONFIDENCE:
-            accepted.append(j)
-        else:
-            uncertain.append(j)  # data-only or low-confidence -> human decides
-
-    # a FK column with a confident accepted join is "explained" — drop its
-    # no-name-signal coincidental matches to other tables.
-    explained = {(j.fk_table, j.fk_column) for j in accepted}
-    uncertain = [j for j in uncertain if (j.fk_table, j.fk_column) not in explained]
+    accepted, uncertain = classify_joins(candidates)
 
     sources = {Path(f).stem: str(Path(f).resolve()) for f in files}
     return DiscoveryResult(profiles, grains, accepted, uncertain, sources)

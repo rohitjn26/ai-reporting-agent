@@ -1,7 +1,9 @@
 """Join discovery: a funnel from cheap name/metadata pruning to exact checks.
 
-Name similarity is a specificity-weighted prior, not proof. Containment over
-real data is the verdict; direction falls out of which side is unique.
+Containment over real data is the verdict; direction falls out of which side
+is unique. Names are only a tiebreaker: they pick between targets when a column
+is contained in several tables, and vouch for low-entropy keys (small ints,
+short codes) where containment alone can be a coincidence.
 See docs/SCHEMA_DISCOVERY.md.
 """
 
@@ -16,7 +18,9 @@ from .grain import GrainResult
 from .profile import TableProfile
 
 # thresholds
-MIN_CONTAINMENT = 0.90     # FK values that must exist in the PK to accept
+MIN_CONTAINMENT = 0.90     # FK values that must exist in the PK to be a candidate
+ACCEPT_CONTAINMENT = 0.98  # ...and to be accepted without review
+HIGH_ENTROPY_MIN_LEN = 16  # string keys this long (ObjectIds, UUIDs) can't match by chance
 NAME_SIGNAL_TABLE_FRACTION = 0.5  # a col name in >= this fraction of tables is generic
 MIN_FK_NDV_NO_SIGNAL = 10  # below this, a no-name-signal match is a coincidence (e.g. quantity)
 
@@ -30,8 +34,11 @@ class JoinCandidate:
     containment: float
     orphan_rows: int
     pk_unique: bool
-    name_signal: str          # "suffix_id" | "exact" | "none"
+    name_signal: str          # "suffix_id" | "table" | "exact" | "none"
     confidence: float
+    high_entropy: bool = False  # key values too random to be contained by coincidence
+    fk_ndv: int = 0             # distinct FK values — ranks columns into the same table
+    primary: bool = False       # the one join a cube uses for this target (see pick_primary)
     relationship: str = "many_to_one"
 
     @property
@@ -51,6 +58,9 @@ class JoinCandidate:
             "containment": round(self.containment, 4),
             "orphan_rows": self.orphan_rows,
             "name_signal": self.name_signal,
+            "high_entropy": self.high_entropy,
+            "fk_ndv": self.fk_ndv,
+            "primary": self.primary,
             "relationship": self.relationship,
             "confidence": round(self.confidence, 3),
             "join": self.cube_join,
@@ -70,6 +80,10 @@ def _name_signal(fk_table: str, fk_col: str, pk_table: str, pk_col: str) -> str:
     expected = {f"{_singular(pk_table).lower()}_id", f"{pk_table.lower()}_id"}
     if fk in expected:
         return "suffix_id"
+    # column named after the target table: c_task -> c_task, c_account -> account
+    tbl = {pk_table.lower(), _singular(pk_table).lower()}
+    if fk in tbl or any(fk.endswith("_" + t) for t in tbl):
+        return "table"
     if fk == pk_col.lower() and fk not in ("id",):
         return "exact"
     return "none"
@@ -80,6 +94,12 @@ def _column_name_frequency(profiles: dict[str, TableProfile]) -> Counter:
     for p in profiles.values():
         freq.update(p.columns.keys())
     return freq
+
+
+def _min_length(con: duckdb.DuckDBPyConnection, table: str, col: str) -> int:
+    row = con.execute(f"SELECT MIN(LENGTH({_quote(col)}::VARCHAR)) "
+                      f"FROM {_quote(table)}").fetchone()
+    return row[0] or 0
 
 
 def _containment(con: duckdb.DuckDBPyConnection,
@@ -116,6 +136,13 @@ def discover_joins(con: duckdb.DuckDBPyConnection,
     # a table's own single-column grain key is a PK, not a FK into another table
     own_key = {g.table: g.key[0] for g in grains.values() if g.kind == "single" and g.key}
 
+    # a PK whose values are all long strings can't be hit by chance
+    high_entropy = {
+        (t, c): profiles[t].columns[c].family == "string"
+        and _min_length(con, t, c) >= HIGH_ENTROPY_MIN_LEN
+        for t, c in pk_columns
+    }
+
     candidates: list[JoinCandidate] = []
     for fk_table, fp in profiles.items():
         for fk_col, fkp in fp.columns.items():
@@ -143,8 +170,10 @@ def discover_joins(con: duckdb.DuckDBPyConnection,
                     signal = "none"
 
                 # low-cardinality guard: a no-signal match on a tiny-domain column
-                # (e.g. quantity ⊆ id) is coincidental, not a relationship
-                if signal == "none" and fkp.ndv < MIN_FK_NDV_NO_SIGNAL:
+                # (e.g. quantity ⊆ id) is coincidental — unless the key is
+                # high-entropy, where even one shared value is no accident
+                entropic = high_entropy[(pk_table, pk_col)]
+                if signal == "none" and not entropic and fkp.ndv < MIN_FK_NDV_NO_SIGNAL:
                     continue
 
                 # --- exact containment (the verdict) ---
@@ -152,19 +181,86 @@ def discover_joins(con: duckdb.DuckDBPyConnection,
                 if containment < MIN_CONTAINMENT:
                     continue
 
-                confidence = _score(signal, containment, pkp.unique_ratio)
+                confidence = _score(signal, containment, pkp.unique_ratio, entropic)
                 candidates.append(JoinCandidate(
                     fk_table=fk_table, fk_column=fk_col,
                     pk_table=pk_table, pk_column=pk_col,
                     containment=containment, orphan_rows=orphans,
                     pk_unique=(pkp.unique_ratio >= 0.999),
                     name_signal=signal, confidence=confidence,
+                    high_entropy=entropic, fk_ndv=fkp.ndv,
                 ))
 
     candidates.sort(key=lambda c: c.confidence, reverse=True)
     return candidates
 
 
-def _score(signal: str, containment: float, pk_unique_ratio: float) -> float:
-    name_w = {"suffix_id": 1.0, "exact": 0.6, "none": 0.0}[signal]
-    return round(0.5 * containment + 0.35 * name_w + 0.15 * pk_unique_ratio, 3)
+_SIGNAL_RANK = {"suffix_id": 3, "table": 2, "exact": 1, "none": 0}
+
+
+def _score(signal: str, containment: float, pk_unique_ratio: float,
+           high_entropy: bool = False) -> float:
+    """Display score for review. Acceptance is decided by classify_joins, not this."""
+    name_w = _SIGNAL_RANK[signal] / 3
+    evidence = 1.0 if high_entropy else name_w
+    return round(0.5 * containment + 0.35 * evidence + 0.15 * pk_unique_ratio, 3)
+
+
+def classify_joins(candidates: list[JoinCandidate]
+                   ) -> tuple[list[JoinCandidate], list[JoinCandidate]]:
+    """Split candidates into (accepted, uncertain) per FK column.
+
+    A candidate is eligible when its containment is >= ACCEPT_CONTAINMENT and
+    the target is unique. Per FK column:
+      - high-entropy key, one eligible target  -> accept on containment alone
+      - several eligible targets               -> the single best name signal wins
+      - low-entropy key                        -> needs a name signal to win
+    Anything else goes to review. Multiple columns joining the same table
+    (creator/owner/updater -> account) are separate FK columns, so each is kept.
+    """
+    by_col: dict[tuple[str, str], list[JoinCandidate]] = {}
+    for c in candidates:
+        by_col.setdefault((c.fk_table, c.fk_column), []).append(c)
+
+    accepted: list[JoinCandidate] = []
+    for group in by_col.values():
+        eligible = [c for c in group
+                    if c.containment >= ACCEPT_CONTAINMENT and c.pk_unique]
+        if not eligible:
+            continue
+        if len(eligible) == 1 and eligible[0].high_entropy:
+            accepted.append(eligible[0])
+            continue
+        best = max(_SIGNAL_RANK[c.name_signal] for c in eligible)
+        top = [c for c in eligible if _SIGNAL_RANK[c.name_signal] == best]
+        if best > 0 and len(top) == 1:
+            accepted.append(top[0])
+
+    for c in pick_primary(accepted):
+        c.primary = True
+
+    chosen = {id(c) for c in accepted}
+    # a FK column with an accepted join is explained — drop its other matches
+    explained = {(c.fk_table, c.fk_column) for c in accepted}
+    uncertain = [c for c in candidates
+                 if id(c) not in chosen and (c.fk_table, c.fk_column) not in explained]
+    return accepted, uncertain
+
+
+def primary_rank(fk_ndv: int, signal: str) -> tuple[int, int]:
+    """Higher is better: most distinct FK values first, then the better name."""
+    return fk_ndv, _SIGNAL_RANK[signal]
+
+
+def pick_primary(joins: list[JoinCandidate]) -> list[JoinCandidate]:
+    """One join per (fk_table, pk_table). A Cube cube holds one join per target,
+    so when several columns reference the same table (creator/owner/updater ->
+    account) recommend the highest-cardinality one; ties go to the better name,
+    then the first seen."""
+    best: dict[tuple[str, str], JoinCandidate] = {}
+    for j in joins:
+        k = (j.fk_table, j.pk_table)
+        if k not in best or primary_rank(j.fk_ndv, j.name_signal) > \
+                primary_rank(best[k].fk_ndv, best[k].name_signal):
+            best[k] = j
+    return list(best.values())

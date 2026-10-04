@@ -22,6 +22,7 @@ app.get("/discovery/browse")(ui.discovery_browse)
 app.post("/discovery/run")(ui.discovery_run)
 app.post("/discovery/semantic")(ui.discovery_semantic)
 app.post("/discovery/describe")(ui.discovery_describe)
+app.post("/discovery/judge")(ui.discovery_judge)
 
 
 if __name__ == "__main__":

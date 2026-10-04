@@ -156,8 +156,9 @@ def test_high_entropy_keys_accepted_on_containment_alone(objectid):
 
 
 def test_low_entropy_key_needs_a_name(tmp_path):
-    # shelf (1..15) is fully contained in store.id (1..20) with no name signal:
-    # with small ints that's plausibly chance, so it goes to review, not accepted
+    # shelf (1..15) is fully contained in store.id (1..20) with no name signal.
+    # store.id has no holes, so the data can't prove it; it fits only one table,
+    # so it goes to review rather than being dropped or accepted
     import random
     random.seed(5)
     _csv(tmp_path / "store.csv", ["id", "city"], [[i, f"C{i}"] for i in range(1, 21)])
@@ -174,6 +175,84 @@ def test_table_named_column_is_a_name_signal():
     assert _name_signal("x", "c_account", "account", "id") == "table"
     assert _name_signal("x", "customer_id", "customers", "id") == "suffix_id"
     assert _name_signal("x", "reviewer", "account", "id") == "none"
+
+
+# ── hole check + one-table-vs-many (data-only evidence) ──────────────────────
+
+def test_chance_log10_math():
+    from discovery.joins import chance_log10
+    assert chance_log10(1000, 1000, 1.0) == 0.0          # no holes: nothing provable
+    assert chance_log10(100, 50, 0.5) == 0.0             # exactly what luck gives
+    assert chance_log10(30, 30, 0.5) == pytest.approx(30 * __import__("math").log10(0.5))
+    assert chance_log10(10, 10, 0.0) == float("-inf")    # target has nothing there
+
+
+@pytest.fixture
+def stock(tmp_path):
+    """The screenshot case: products.stock_quantity (small ints) falls inside
+    every gap-free integer id range, so it matches four unrelated tables."""
+    import random
+    random.seed(11)
+    _csv(tmp_path / "customers.csv", ["customer_id", "name"], [[i, f"C{i}"] for i in range(1, 301)])
+    _csv(tmp_path / "products.csv", ["product_id", "stock_quantity"],
+         [[i, random.randint(1, 60)] for i in range(1, 101)])
+    _csv(tmp_path / "orders.csv", ["order_id", "customer_id"],
+         [[i, random.randint(1, 300)] for i in range(1, 501)])
+    _csv(tmp_path / "order_items.csv", ["order_item_id", "order_id", "product_id"],
+         [[i, random.randint(1, 500), random.randint(1, 100)] for i in range(1, 1201)])
+    _csv(tmp_path / "product_reviews.csv", ["review_id", "product_id", "customer_id"],
+         [[i, random.randint(1, 100), random.randint(1, 300)] for i in range(1, 401)])
+    return sorted(tmp_path.glob("*.csv"))
+
+
+def test_number_matching_many_hole_free_ids_is_dropped(stock):
+    r = run_discovery(stock)
+    assert not any(j.fk_column == "stock_quantity" for j in r.accepted + r.uncertain)
+    # the real joins are untouched
+    assert _pairs(r.accepted) == {
+        ("orders", "customer_id", "customers"),
+        ("order_items", "order_id", "orders"),
+        ("order_items", "product_id", "products"),
+        ("product_reviews", "product_id", "products"),
+        ("product_reviews", "customer_id", "customers"),
+    }
+
+
+def test_hole_free_target_gives_no_proof(stock):
+    r = run_discovery(stock)
+    j = next(j for j in r.accepted if j.fk_column == "order_id")
+    assert j.chance_rate == 1.0 and j.chance_log10 == 0.0
+    assert j.evidence == "name"                 # accepted on its name, as before
+
+
+@pytest.fixture
+def holes(tmp_path):
+    """customers ids have holes (every 3rd id deleted). `buyer` references them
+    with no name hint; `units` is an unrelated number in the same range."""
+    import random
+    random.seed(13)
+    ids = [i for i in range(1, 301) if i % 3]          # 1,2,4,5,7,8,... (holes at 3,6,9…)
+    _csv(tmp_path / "customers.csv", ["id", "name"], [[i, f"C{i}"] for i in ids])
+    _csv(tmp_path / "sale.csv", ["id", "buyer", "units"],
+         [[i, random.choice(ids), random.randint(1, 300)] for i in range(1, 801)])
+    return sorted(tmp_path.glob("*.csv"))
+
+
+def test_unnamed_fk_is_accepted_when_holes_prove_it(holes):
+    r = run_discovery(holes)
+    assert _pairs(r.accepted) == {("sale", "buyer", "customers")}
+    j = r.accepted[0]
+    assert j.evidence == "proven" and j.name_signal == "none"
+    assert j.values_found == 1.0 and j.chance_rate == pytest.approx(2 / 3, abs=0.01)
+    assert j.chance_log10 < -6
+    # the unrelated number lands in the holes, so it never even becomes a candidate
+    assert not any(j.fk_column == "units" for j in r.accepted + r.uncertain)
+
+
+def test_evidence_fields_in_output(holes):
+    d = run_discovery(holes).to_dict()["joins"]["accepted"][0]
+    assert d["evidence"] == "proven"
+    assert {"values_found", "chance_rate", "chance_log10", "coverage"} <= set(d)
 
 
 # ── semantic-layer draft (discovery/semantic.py) ─────────────────────────────
@@ -489,3 +568,76 @@ def test_spine_never_hangs_a_table_under_an_incomplete_fk(tmp_path):
     assert "org.site.participant" in paths and "org.site.participant.response" in paths
     assert not any(p.startswith("org.account.") for p in paths)
     assert "org.site.participant.account" in paths          # still reachable, as a lookup
+
+
+# ── AI judge for uncertain joins (discovery/judge.py) ────────────────────────
+
+class _JudgeLLM:
+    """Fake structured LLM: answers from a {column: (target, confidence)} map."""
+    def __init__(self, answers):
+        self.answers, self.prompts = answers, []
+
+    def invoke(self, msgs):
+        from discovery.judge import JoinVerdict
+        prompt = msgs[-1][1]
+        self.prompts.append(prompt)
+        col = prompt.split("Column to judge: ")[1].split("\n")[0]
+        target, conf = self.answers[col]
+        return JoinVerdict(target=target, confidence=conf, reason=f"because {col}")
+
+
+@pytest.fixture
+def shelf(tmp_path):
+    """sale.shelf (1..15) fits gap-free store.id with no name signal: the data
+    can't decide, so it stays uncertain — the case the AI judge is for."""
+    import random
+    random.seed(5)
+    _csv(tmp_path / "store.csv", ["id", "city"], [[i, f"C{i}"] for i in range(1, 21)])
+    _csv(tmp_path / "sale.csv", ["id", "shelf", "amount"],
+         [[i, random.randint(1, 15), random.randint(100, 999)] for i in range(1, 201)])
+    return sorted(tmp_path.glob("*.csv"))
+
+
+def test_judge_prompt_carries_profile_evidence_and_candidates(shelf):
+    from discovery.judge import column_prompt
+    d = run_discovery(shelf).to_dict()
+    j = d["joins"]["uncertain"][0]
+    p = column_prompt(d, "sale", "shelf", [j], dataset="shop")
+    assert "Column to judge: sale.shelf" in p and "Dataset: shop" in p
+    assert "store.id" in p and "luck would find 100%" in p and "values found 100%" in p
+    assert "Table store (20 rows)" in p and "id (key)" in p
+    assert p.rstrip().endswith("Answer with target = one of: store, or none.")
+
+
+def test_judge_verdicts_none_and_pick(shelf):
+    from discovery import judge
+    judge._cache.clear()
+    d = run_discovery(shelf).to_dict()
+    out = judge.judge_joins(d, llm=_JudgeLLM({"sale.shelf": ("none", "high")}), model="m1")
+    assert out["errors"] == {}
+    assert out["verdicts"]["sale.shelf"] == {"target": None, "pk_column": None,
+                                            "confidence": "high", "reason": "because sale.shelf"}
+    judge._cache.clear()
+    out = judge.judge_joins(d, llm=_JudgeLLM({"sale.shelf": ("store", "medium")}), model="m1")
+    assert out["verdicts"]["sale.shelf"]["target"] == "store"
+    assert out["verdicts"]["sale.shelf"]["pk_column"] == "id"
+
+
+def test_judge_rejects_invented_target_and_filters_columns(shelf):
+    from discovery import judge
+    judge._cache.clear()
+    d = run_discovery(shelf).to_dict()
+    out = judge.judge_joins(d, llm=_JudgeLLM({"sale.shelf": ("warehouse", "high")}), model="m1")
+    assert out["verdicts"] == {} and "not a candidate" in out["errors"]["sale.shelf"]
+    assert judge.judge_joins(d, columns=["sale.other"], llm=_JudgeLLM({}), model="m1") == \
+        {"verdicts": {}, "errors": {}}
+
+
+def test_judge_caches_same_prompt(shelf):
+    from discovery import judge
+    judge._cache.clear()
+    d = run_discovery(shelf).to_dict()
+    llm = _JudgeLLM({"sale.shelf": ("none", "high")})
+    judge.judge_joins(d, llm=llm, model="m1")
+    judge.judge_joins(d, llm=llm, model="m1")
+    assert len(llm.prompts) == 1

@@ -18,12 +18,15 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 import socket
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 import uvicorn
 
-from graph.agent import build_agent, maybe_summarise, close_checkpointer, MODEL_LABEL
+from graph.agent import (build_agent, maybe_summarise, close_checkpointer, MODEL_LABEL,
+                         _fetch_cube_metadata, run_cube_query)
+from graph import feedback
+from graph import query_builder as qb
 import chart.server as _chart_server
 
 os.environ.setdefault("CHART_OPEN_BROWSER", "false")
@@ -196,6 +199,35 @@ async def discovery_describe(request: Request):
         return {"error": str(e)}
 
 
+_QUERY_KEYS = ("measures", "dimensions", "filters", "time_dimensions", "order", "limit")
+
+
+def _plan_event(trace_id: str | None, query: dict, source: str) -> str:
+    """SSE 'query_plan' card. source: 'build_query' (validated builder) or 'agent'
+    (the agent called query_cube directly, skipping build_query)."""
+    return "data: " + json.dumps({
+        "type": "query_plan", "trace_id": trace_id, "source": source,
+        "measures": query.get("measures", []), "dimensions": query.get("dimensions", []),
+        "filters": query.get("filters", []), "time_dimensions": query.get("time_dimensions", []),
+        "problems": query.get("_validation_problems", []),
+    }) + "\n\n"
+
+
+def _last_user_request(agent, config, user_message: str | None) -> str:
+    """The user's request for a trace: this turn's message, or (on /resume) the
+    last real human message in the thread."""
+    if user_message:
+        return user_message
+    try:
+        for m in reversed(agent.get_state(config).values.get("messages", [])):
+            if isinstance(m, HumanMessage) and isinstance(m.content, str) \
+                    and not m.content.startswith("[Conversation summary]"):
+                return m.content
+    except Exception:
+        pass
+    return ""
+
+
 def _sse_headers():
     return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -212,9 +244,39 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
     # Tell the UI which model is handling this turn (routed Haiku vs Sonnet).
     if model_name:
         yield f"data: {json.dumps({'type': 'model', 'model': model_name})}\n\n"
-    # SQL of the most recent query_cube — only surfaced when it feeds a chart,
-    # so intermediate/exploratory queries don't clutter the UI with SQL.
+    # SQL of the most recent successful query_cube — surfaced once, when a chart
+    # is created or the turn ends, so exploratory queries don't each get a card.
     pending_sql = None
+    # Feedback capture: each build_query result becomes a trace; the next
+    # successful query_cube is recorded against it as the query that actually ran.
+    # If the agent skips build_query and calls query_cube directly, that query
+    # (pending_direct) becomes its own trace when flushed, so it can still be rated.
+    user_message = None
+    if isinstance(input_, dict) and input_.get("messages"):
+        user_message = getattr(input_["messages"][-1], "content", None)
+    tool_inputs: dict = {}      # run_id -> tool input (captured at tool start)
+    trace_id = None
+    pending_direct = None
+
+    async def flush_query():
+        """Emit the query card (direct queries only) and SQL for the last query run."""
+        nonlocal pending_sql, pending_direct
+        if pending_direct:
+            tid = None
+            try:
+                store = feedback.get_store()
+                tid = await asyncio.to_thread(
+                    store.record_trace, request=_last_user_request(agent, config, user_message),
+                    query=pending_direct, thread_id=thread_id, user_message=user_message,
+                    model=MODEL_LABEL)
+                await asyncio.to_thread(store.attach_execution, tid, pending_direct, pending_sql)
+            except Exception as e:  # feedback must never break a turn
+                print(f"[feedback] trace not recorded: {e}")
+            yield _plan_event(tid, pending_direct, source="agent")
+            pending_direct = None
+        if pending_sql:
+            yield f"data: {json.dumps({'type': 'sql', 'sql': pending_sql})}\n\n"
+            pending_sql = None
     try:
         async for event in agent.astream_events(input_, config=config, version="v2"):
             if await request.is_disconnected():
@@ -237,7 +299,10 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
             elif kind == "on_tool_start":
                 run_id = event.get("run_id", "")
                 tool_input = event["data"].get("input", {})
-                yield f"data: {json.dumps({'type': 'tool_start', 'name': name, 'run_id': run_id, 'input': str(tool_input)[:120]})}\n\n"
+                tool_inputs[run_id] = tool_input
+                shown = {k: v for k, v in tool_input.items() if k != "state"} \
+                    if isinstance(tool_input, dict) else tool_input
+                yield f"data: {json.dumps({'type': 'tool_start', 'name': name, 'run_id': run_id, 'input': str(shown)[:120]})}\n\n"
 
             elif kind == "on_tool_end":
                 run_id = event.get("run_id", "")
@@ -249,10 +314,17 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                     try:
                         output = event["data"].get("output", "")
                         parsed = json.loads(output.content if hasattr(output, "content") else output)
-                        sql = parsed.get("sql", "")
-                        if sql:
-                            # Buffer it — only emit if a chart is created from it.
-                            pending_sql = sql
+                        if not parsed.get("error"):
+                            sql = parsed.get("sql", "")
+                            pending_sql = sql or None   # buffered; see flush_query
+                            executed = tool_inputs.get(run_id) or event["data"].get("input") or {}
+                            if isinstance(executed, dict):   # drop LangGraph-injected state
+                                executed = {k: v for k, v in executed.items() if k in _QUERY_KEYS}
+                            if trace_id and isinstance(executed, dict):
+                                await asyncio.to_thread(feedback.get_store().attach_execution,
+                                                        trace_id, executed, sql)
+                            elif isinstance(executed, dict):
+                                pending_direct = executed   # agent bypassed build_query
                     except Exception:
                         pass
                 # Surface what build_query chose (measures/dimensions/filters) so the
@@ -263,7 +335,17 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                     try:
                         parsed = json.loads(output_text)
                         if not parsed.get("_view_error") and (parsed.get("measures") or parsed.get("dimensions")):
-                            yield f"data: {json.dumps({'type': 'query_plan', 'measures': parsed.get('measures', []), 'dimensions': parsed.get('dimensions', []), 'filters': parsed.get('filters', []), 'time_dimensions': parsed.get('time_dimensions', []), 'problems': parsed.get('_validation_problems', [])})}\n\n"
+                            tin = tool_inputs.get(run_id) or event["data"].get("input") or {}
+                            try:
+                                trace_id = await asyncio.to_thread(
+                                    feedback.get_store().record_trace,
+                                    request=tin.get("request") or user_message or "",
+                                    context=tin.get("context"), query=parsed, thread_id=thread_id,
+                                    user_message=user_message, model=qb_model())
+                            except Exception as e:  # feedback must never break a turn
+                                print(f"[feedback] trace not recorded: {e}")
+                                trace_id = None
+                            yield _plan_event(trace_id, parsed, source="build_query")
                     except Exception:
                         pass
                 if name == "preview_cube_config_update" and not error:
@@ -284,10 +366,9 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                     except Exception:
                         pass
                 if name == "create_chart":
-                    # Show the SQL behind the final visualization (if any).
-                    if pending_sql:
-                        yield f"data: {json.dumps({'type': 'sql', 'sql': pending_sql})}\n\n"
-                        pending_sql = None
+                    # Show the query/SQL behind the final visualization (if any).
+                    async for ev in flush_query():
+                        yield ev
                     yield f"data: {json.dumps({'type': 'chart', 'url': '/chart'})}\n\n"
                 # Render a saved graph or dashboard live in the preview panel.
                 # The tool output is the created/fetched resource JSON (has "id").
@@ -327,6 +408,10 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
         yield f"data: {json.dumps({'type': 'error', 'text': err_text})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
         return
+
+    # A query answered without a chart (e.g. a table in prose) still shows its SQL.
+    async for ev in flush_query():
+        yield ev
 
     # After the stream ends, check whether the graph paused on an interrupt.
     try:
@@ -373,6 +458,106 @@ async def resume_stream(request: Request, answer: str, thread_id: str = "default
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
+
+
+# ── human feedback on built queries (see graph/feedback.py) ──────────────────
+
+def qb_model() -> str:
+    return os.environ.get("QUERY_BUILDER_MODEL", "claude-haiku-4-5-20251001")
+
+
+async def _view_meta(view: str | None) -> list[dict]:
+    """The live metadata for one view (all views when it can't be pinned down)."""
+    views, _ = await _fetch_cube_metadata()
+    picked = [v for v in views if v.get("name") == view]
+    return picked or views
+
+
+def _members(view_meta: list[dict]) -> dict:
+    """Pick-lists for the correction editor."""
+    pick = lambda m: {"name": m["name"], "title": m.get("shortTitle") or m.get("title") or m["name"],
+                      "type": m.get("type")}
+    return {
+        "measures":   [pick(m) for c in view_meta for m in c.get("measures", [])],
+        "dimensions": [pick(d) for c in view_meta for d in c.get("dimensions", [])],
+    }
+
+
+@app.get("/feedback/trace/{trace_id}")
+async def feedback_trace(trace_id: str):
+    """A trace plus its view's members — everything the 'Fix it' editor needs."""
+    trace = await asyncio.to_thread(feedback.get_store().get_trace, trace_id)
+    if not trace:
+        return JSONResponse({"error": "trace not found"}, status_code=404)
+    try:
+        members = _members(await _view_meta(trace.get("view")))
+    except Exception as e:
+        return JSONResponse({"error": f"could not load schema: {e}"}, status_code=502)
+    return {"trace": trace, "members": members, "tags": sorted(feedback.TAGS)}
+
+
+async def _check_correction(trace: dict, query: dict) -> list[str]:
+    """A correction must validate against its view — same rules as a built query,
+    including the single-view containment check."""
+    return qb.validate_query(query, await _view_meta(trace.get("view")))
+
+
+@app.post("/feedback/preview")
+async def feedback_preview(request: Request):
+    """Validate and run a corrected query so the user sees the result before saving."""
+    body = await request.json()
+    trace = await asyncio.to_thread(feedback.get_store().get_trace, body.get("trace_id", ""))
+    if not trace:
+        return JSONResponse({"error": "trace not found"}, status_code=404)
+    query = body.get("query") or {}
+    problems = await _check_correction(trace, query)
+    if problems:
+        return {"problems": problems}
+    return await run_cube_query(query, limit=20)
+
+
+@app.post("/feedback")
+async def feedback_submit(request: Request):
+    """Save 👍/👎 (+ tags, note, optional corrected query) for a trace."""
+    body = await request.json()
+    store = feedback.get_store()
+    trace = await asyncio.to_thread(store.get_trace, body.get("trace_id", ""))
+    if not trace:
+        return JSONResponse({"error": "trace not found"}, status_code=404)
+    corrected = body.get("corrected_query") or None
+    if corrected:
+        problems = await _check_correction(trace, corrected)
+        if problems:
+            return JSONResponse({"error": "corrected query is invalid", "problems": problems},
+                                status_code=400)
+        ran = await run_cube_query(corrected, limit=1)
+        if ran.get("error"):
+            return JSONResponse({"error": f"corrected query failed in Cube: {ran['error']}"},
+                                status_code=400)
+    try:
+        saved = await asyncio.to_thread(
+            store.add_feedback, trace["id"], verdict=body.get("verdict", ""),
+            tags=body.get("tags") or [], corrected_query=corrected, note=body.get("note"))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True, **saved}
+
+
+@app.get("/feedback")
+async def feedback_list(status: str | None = None, limit: int = 100):
+    """Review queue: feedback rows (filter with ?status=pending)."""
+    return {"feedback": await asyncio.to_thread(feedback.get_store().list_feedback, status, limit)}
+
+
+@app.post("/feedback/{feedback_id}/review")
+async def feedback_review(feedback_id: str, request: Request):
+    """Approve or reject a feedback row — only approved rows become examples."""
+    body = await request.json()
+    try:
+        await asyncio.to_thread(feedback.get_store().review, feedback_id, body.get("status", ""))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"ok": True}
 
 
 # measure type -> how to aggregate the expression when testing it
@@ -667,6 +852,58 @@ _HTML = """<!DOCTYPE html>
     .query-plan .qp-dimension { background: #2e1065; border: 1px solid #6d28d9; color: #c4b5fd; }
     .query-plan .qp-filter    { background: #1e293b; border: 1px solid #334155; color: #94a3b8; }
     .query-plan .qp-problem   { color: #f59e0b; font-size: 0.72rem; }
+
+    /* ── Feedback on the query plan ── */
+    .fb-bar { display: flex; align-items: center; gap: 6px; border-top: 1px solid #21262d; padding-top: 6px; }
+    .fb-q, .fb-hint { font-size: 0.7rem; color: #64748b; }
+    .fb-btn {
+      background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+      padding: 1px 8px; cursor: pointer; font-size: 0.85rem;
+    }
+    .fb-btn:hover { border-color: #6366f1; }
+    .fb-done { font-size: 0.72rem; color: #4ade80; }
+    .fb-err { font-size: 0.72rem; color: #f59e0b; }
+    .fb-err ul { margin: 4px 0 0 16px; }
+    .fb-panel {
+      display: flex; flex-direction: column; gap: 8px;
+      border-top: 1px solid #21262d; padding-top: 8px;
+    }
+    .fb-title { font-size: 0.72rem; color: #cbd5e1; font-weight: 600; }
+    .fb-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+    .fb-tag {
+      background: #161b22; border: 1px solid #30363d; color: #94a3b8;
+      border-radius: 12px; padding: 2px 10px; font-size: 0.7rem; cursor: pointer;
+    }
+    .fb-tag.on { background: #3b0764; border-color: #a855f7; color: #e9d5ff; }
+    .fb-x {
+      background: none; border: none; color: inherit; opacity: .6;
+      margin-left: 4px; cursor: pointer; font-size: 0.8rem; padding: 0;
+    }
+    .fb-x:hover { opacity: 1; }
+    .fb-add, .fb-mini {
+      background: #0d1117; border: 1px dashed #30363d; color: #94a3b8;
+      border-radius: 6px; font-size: 0.7rem; padding: 2px 4px; max-width: 220px;
+    }
+    .fb-vals { width: 150px; border-style: solid; }
+    .fb-filter-add { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    .fb-note {
+      background: #0d1117; border: 1px solid #30363d; color: #e2e8f0; border-radius: 6px;
+      font: inherit; font-size: 0.75rem; padding: 6px 8px; min-height: 40px; resize: vertical;
+    }
+    .fb-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .fb-mini-btn {
+      background: #161b22; border: 1px solid #30363d; color: #cbd5e1;
+      border-radius: 6px; font-size: 0.7rem; padding: 3px 10px; cursor: pointer;
+    }
+    .fb-primary {
+      background: #4f46e5; border: 1px solid #6366f1; color: #fff;
+      border-radius: 6px; font-size: 0.7rem; padding: 3px 12px; cursor: pointer;
+    }
+    .fb-primary:disabled { opacity: .5; cursor: default; }
+    .fb-table-wrap { overflow-x: auto; max-height: 220px; overflow-y: auto; }
+    .fb-table-wrap table { border-collapse: collapse; width: 100%; font-size: 0.72rem; color: #cbd5e1; }
+    .fb-table-wrap th { background: #1e293b; text-align: left; padding: 3px 8px; font-weight: 600; }
+    .fb-table-wrap td { padding: 3px 8px; border-bottom: 1px solid #21262d; }
 
     .config-preview {
       max-width: 96%;
@@ -1794,7 +2031,9 @@ _HTML = """<!DOCTYPE html>
     const row = (label, html) =>
       '<div class="qp-row"><span class="qp-label">' + label + '</span>' + html + '</div>';
 
-    let out = '<div class="qp-header">\\uD83E\\uDDED Query plan — what the model chose</div>';
+    let out = '<div class="qp-header">\\uD83E\\uDDED ' + (d.source === 'agent'
+      ? 'Query the agent ran'
+      : 'Query plan — what the model chose') + '</div>';
     if (d.measures && d.measures.length)   out += row('Measures',   chips(d.measures, 'qp-measure'));
     if (d.dimensions && d.dimensions.length) out += row('Dimensions', chips(d.dimensions, 'qp-dimension'));
 
@@ -1812,8 +2051,214 @@ _HTML = """<!DOCTYPE html>
       out += '<div class="qp-problem">\\u26A0 ' + d.problems.map(escapeHtml).join('; ') + '</div>';
 
     card.innerHTML = out;
+    if (d.trace_id) attachFeedback(card, d.trace_id);
     wrap.appendChild(card);
     messagesEl.appendChild(wrap);
+    scrollBottom();
+  }
+
+  // ── human feedback on the query plan (👍 / 👎 + "fix it" editor) ───────────
+  async function postJson(url, body) {
+    let j = {};
+    try {
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                     body: JSON.stringify(body) });
+      try { j = await res.json(); } catch (e) {}
+      if (!res.ok && !j.error) j.error = 'HTTP ' + res.status;
+    } catch (e) { j.error = String(e); }
+    return j;
+  }
+
+  function fbError(r) {
+    const probs = (r.problems || []).map(p => '<li>' + escapeHtml(String(p)) + '</li>').join('');
+    return '<div class="fb-err">&#9888; ' + escapeHtml(String(r.error || 'Invalid query')) +
+           (probs ? '<ul>' + probs + '</ul>' : '') + '</div>';
+  }
+
+  function attachFeedback(card, traceId) {
+    const bar = document.createElement('div');
+    bar.className = 'fb-bar';
+    bar.innerHTML =
+      '<span class="fb-q">Right query?</span>' +
+      '<button class="fb-btn" data-v="up" title="Correct — reuse it as an example">&#128077;</button>' +
+      '<button class="fb-btn" data-v="down" title="Not right — tell us what to fix">&#128078;</button>';
+    card.appendChild(bar);
+    bar.querySelector('[data-v=up]').onclick = async () => {
+      bar.innerHTML = '<span class="fb-q">Saving…</span>';
+      const r = await postJson('/feedback', { trace_id: traceId, verdict: 'up' });
+      bar.innerHTML = r.ok ? '<span class="fb-done">&#10003; Thanks — saved as a good example</span>' : fbError(r);
+    };
+    bar.querySelector('[data-v=down]').onclick = () => openFixPanel(card, bar, traceId);
+  }
+
+  const FB_GRANS = ['', 'day', 'week', 'month', 'quarter', 'year'];
+  const FB_OPS = ['equals', 'notEquals', 'contains', 'notContains', 'gt', 'gte', 'lt', 'lte', 'set', 'notSet'];
+
+  async function openFixPanel(card, bar, traceId) {
+    const panel = document.createElement('div');
+    panel.className = 'fb-panel';
+    panel.innerHTML = '<span class="fb-q">Loading…</span>';
+    bar.replaceWith(panel);
+    scrollBottom();
+
+    let info;
+    try {
+      const res = await fetch('/feedback/trace/' + encodeURIComponent(traceId));
+      info = await res.json();
+      if (!res.ok) throw new Error(info.error || ('HTTP ' + res.status));
+    } catch (e) { panel.innerHTML = fbError({ error: String(e.message || e) }); return; }
+
+    const t = info.trace;
+    const original = JSON.parse(JSON.stringify(t.executed_query || t.built_query || {}));
+    const q = JSON.parse(JSON.stringify(original));
+    for (const k of ['measures', 'dimensions', 'filters', 'time_dimensions']) q[k] = q[k] || [];
+    const M = info.members;
+    const timeDims = M.dimensions.filter(d => d.type === 'time');
+    const allMembers = M.measures.concat(M.dimensions);
+    const tags = new Set();
+    let note = '';
+
+    // what will be saved: drop empties and order keys whose member was removed
+    function cleaned() {
+      const out = JSON.parse(JSON.stringify(q));
+      const used = new Set(out.measures.concat(out.dimensions, out.time_dimensions.map(x => x.dimension)));
+      if (out.order) {
+        for (const k of Object.keys(out.order)) if (!used.has(k)) delete out.order[k];
+        if (!Object.keys(out.order).length) delete out.order;
+      }
+      for (const k of ['dimensions', 'filters', 'time_dimensions']) if (!out[k].length) delete out[k];
+      for (const td of out.time_dimensions || []) if (!td.granularity) delete td.granularity;
+      return out;
+    }
+    const isChanged = () => JSON.stringify(cleaned()) !== JSON.stringify(original);
+
+    const opts = (list, chosen) => list.filter(m => !chosen.includes(m.name))
+      .map(m => '<option value="' + escapeHtml(m.name) + '">' + escapeHtml(m.title) +
+                ' (' + escapeHtml(m.name) + ')</option>').join('');
+    const x = (attrs) => '<button class="fb-x" ' + attrs + ' title="Remove">&times;</button>';
+
+    function memberRow(label, key, list, cls) {
+      const chips = q[key].map((m, i) =>
+        '<span class="qp-chip ' + cls + '">' + escapeHtml(m) + x('data-rm="' + key + '" data-i="' + i + '"') + '</span>').join('');
+      return '<div class="qp-row"><span class="qp-label">' + label + '</span><div class="qp-chips">' + chips +
+             '<select class="fb-add" data-add="' + key + '"><option value="">+ add</option>' +
+             opts(list, q[key]) + '</select></div></div>';
+    }
+
+    function timeRow() {
+      const rows = q.time_dimensions.map((td, i) =>
+        '<span class="qp-chip qp-dimension">' + escapeHtml(td.dimension) +
+        ' <select class="fb-mini" data-gran="' + i + '">' +
+        FB_GRANS.map(g => '<option value="' + g + '"' + ((td.granularity || '') === g ? ' selected' : '') + '>' +
+                         (g || 'no grain') + '</option>').join('') + '</select>' +
+        x('data-rm="time_dimensions" data-i="' + i + '"') + '</span>').join('');
+      const add = timeDims.length ? '<select class="fb-add" data-add="time_dimensions"><option value="">+ add</option>' +
+        opts(timeDims, q.time_dimensions.map(td => td.dimension)) + '</select>' : '';
+      return '<div class="qp-row"><span class="qp-label">Time</span><div class="qp-chips">' + rows + add + '</div></div>';
+    }
+
+    function filterRow() {
+      const chips = q.filters.map((f, i) =>
+        '<span class="qp-chip qp-filter">' +
+        escapeHtml([f.member, f.operator, (f.values || []).join(', ')].filter(Boolean).join(' ')) +
+        x('data-rm="filters" data-i="' + i + '"') + '</span>').join('');
+      return '<div class="qp-row"><span class="qp-label">Filters</span><div class="qp-chips">' + chips +
+        '<span class="fb-filter-add">' +
+        '<select class="fb-mini" data-f="member"><option value="">member…</option>' + opts(allMembers, []) + '</select>' +
+        '<select class="fb-mini" data-f="op">' + FB_OPS.map(o => '<option>' + o + '</option>').join('') + '</select>' +
+        '<input class="fb-mini fb-vals" data-f="values" placeholder="values, comma-separated"/>' +
+        '<button class="fb-mini-btn" data-act="add-filter">add</button></span></div></div>';
+    }
+
+    function render() {
+      panel.innerHTML =
+        '<div class="fb-title">What was wrong?</div>' +
+        '<div class="fb-tags">' + info.tags.map(tg =>
+          '<button class="fb-tag' + (tags.has(tg) ? ' on' : '') + '" data-tag="' + tg + '">' +
+          tg.split('_').join(' ') + '</button>').join('') + '</div>' +
+        '<div class="fb-title">Fix the query <span class="fb-hint">— optional, but a correction teaches the agent the most' +
+        (t.view ? ' · view <b>' + escapeHtml(t.view) + '</b>' : '') + '</span></div>' +
+        memberRow('Measures', 'measures', M.measures, 'qp-measure') +
+        memberRow('Dimensions', 'dimensions', M.dimensions, 'qp-dimension') +
+        timeRow() + filterRow() +
+        '<textarea class="fb-note" placeholder="Note (optional)"></textarea>' +
+        '<div class="fb-actions">' +
+        '<button class="fb-mini-btn" data-act="run">&#9654; Run corrected query</button>' +
+        '<button class="fb-primary" data-act="save">Save feedback</button>' +
+        '<button class="fb-mini-btn" data-act="cancel">Cancel</button>' +
+        (isChanged() ? '<span class="fb-hint">query edited</span>' : '') + '</div>' +
+        '<div class="fb-result"></div>';
+      panel.querySelector('.fb-note').value = note;
+    }
+
+    const result = () => panel.querySelector('.fb-result');
+
+    function showRows(r) {
+      const rows = r.rows || [];
+      if (!rows.length) { result().innerHTML = '<div class="fb-hint">Query ran — no rows.</div>'; return; }
+      const cols = Object.keys(rows[0]);
+      result().innerHTML = '<div class="fb-table-wrap"><table class="md-table"><thead><tr>' +
+        cols.map(c => '<th>' + escapeHtml(c) + '</th>').join('') + '</tr></thead><tbody>' +
+        rows.slice(0, 10).map(row => '<tr>' + cols.map(c => '<td>' + escapeHtml(String(row[c] ?? '')) + '</td>').join('') + '</tr>').join('') +
+        '</tbody></table></div>' +
+        (rows.length > 10 ? '<div class="fb-hint">first 10 of ' + rows.length + ' rows</div>' : '');
+    }
+
+    panel.addEventListener('input', (e) => { if (e.target.classList.contains('fb-note')) note = e.target.value; });
+
+    panel.addEventListener('change', (e) => {
+      const el = e.target;
+      if (el.dataset.add && el.value) {
+        if (el.dataset.add === 'time_dimensions') q.time_dimensions.push({ dimension: el.value, granularity: 'month' });
+        else q[el.dataset.add].push(el.value);
+        render();
+      } else if (el.dataset.gran !== undefined) {
+        q.time_dimensions[+el.dataset.gran].granularity = el.value || undefined;
+        render();
+      }
+    });
+
+    panel.addEventListener('click', async (e) => {
+      const el = e.target.closest('button');
+      if (!el) return;
+      if (el.dataset.tag) {
+        tags.has(el.dataset.tag) ? tags.delete(el.dataset.tag) : tags.add(el.dataset.tag);
+        el.classList.toggle('on');
+      } else if (el.dataset.rm) {
+        q[el.dataset.rm].splice(+el.dataset.i, 1);
+        render();
+      } else if (el.dataset.act === 'add-filter') {
+        const get = (f) => panel.querySelector('[data-f=' + f + ']').value;
+        const member = get('member'), op = get('op');
+        if (!member) return;
+        const f = { member: member, operator: op };
+        if (op !== 'set' && op !== 'notSet')
+          f.values = get('values').split(',').map(s => s.trim()).filter(Boolean);
+        q.filters.push(f);
+        render();
+      } else if (el.dataset.act === 'run') {
+        result().innerHTML = '<span class="fb-q">Running…</span>';
+        const r = await postJson('/feedback/preview', { trace_id: traceId, query: cleaned() });
+        if (r.problems || r.error) result().innerHTML = fbError(r); else showRows(r);
+      } else if (el.dataset.act === 'save') {
+        el.disabled = true;
+        const body = { trace_id: traceId, verdict: 'down', tags: [...tags], note: note };
+        if (isChanged()) body.corrected_query = cleaned();
+        const r = await postJson('/feedback', body);
+        if (r.ok) {
+          panel.innerHTML = '<span class="fb-done">&#10003; Thanks — ' +
+            (body.corrected_query ? 'correction saved; the agent will use it for similar requests'
+                                  : 'feedback saved') +
+            (r.status === 'pending' ? ' (after review)' : '') + '</span>';
+        } else { el.disabled = false; result().innerHTML = fbError(r); }
+      } else if (el.dataset.act === 'cancel') {
+        panel.remove();
+        attachFeedback(card, traceId);
+      }
+      scrollBottom();
+    });
+
+    render();
     scrollBottom();
   }
 

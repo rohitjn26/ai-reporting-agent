@@ -3,12 +3,13 @@ LangGraph ReAct agent wired to MCP tool servers + local chart/config tools.
 """
 import asyncio, json, os
 from functools import lru_cache
+from typing import Annotated
 import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt import InjectedState, create_react_agent
 from langgraph.checkpoint.memory import MemorySaver
 
 # Durable checkpointer (prod). Imported lazily-tolerant: if the postgres extras
@@ -26,6 +27,8 @@ from chart.renderer import render_chart
 from chart.server import serve_chart
 from graph.config_editor import edit_cube_config
 from graph import query_builder as qb
+from graph import feedback
+from graph import guard
 
 CUBE_MCP_URL    = os.environ.get("CUBE_MCP_URL",    "http://localhost:5001/sse")
 LIBRARY_MCP_URL = os.environ.get("LIBRARY_MCP_URL", "http://localhost:5002/sse")
@@ -44,7 +47,25 @@ MODEL_LABEL = next((n for n in ("haiku", "sonnet", "opus", "fable") if n in MODE
 _agent = None
 
 SYSTEM_PROMPT = """\
-You are a data reporting agent. When the user asks for a chart or data insight:
+You are a data reporting agent.
+
+HARD RULE — every data question goes through build_query:
+- For ANY request that needs data (a chart, a table, a number, "which X has the most Y",
+  a follow-up like "now by month"), your FIRST tool call is build_query. No exceptions.
+- Do NOT call get_cube_metadata to work out a query yourself, and do NOT write
+  measures/dimensions for query_cube yourself. build_query already reads the schema,
+  maps synonyms, validates every field, and uses examples users have verified —
+  skipping it drops all of that.
+- query_cube only ever receives the fields build_query returned. This is enforced:
+  query_cube rejects any field build_query didn't choose. You may still change filter
+  values, limit, order direction, granularity or date range, or drop fields. To use a
+  different field (including to fix a query_cube error), call build_query again with
+  the change or the error in `context`.
+- get_cube_metadata is only for questions ABOUT the schema ("what fields are there?",
+  "what does the sales view cover?") or for the config-edit flows — never as a step
+  toward answering a data question.
+
+When the user asks for a chart or data insight:
 
 1. Call build_query with the user's request. Put any relevant details from earlier turns
    in `context` (a prior query to tweak, a country filter, "line chart", etc.). It fetches
@@ -119,7 +140,8 @@ DASHBOARDS (a grid of saved graphs, each re-queried live when viewed):
 
 IMPORTANT query rules:
 - If query_cube fails, read the error carefully. Do NOT retry the same query.
-  Fix the member names or filters based on the error, then try once more.
+  If a filter value or option is wrong, fix it and try once more; if a member is
+  wrong, call build_query again with the error in `context`.
   If it still fails, tell the user what went wrong instead of looping.
 - NEVER call reload_cube_schema when answering a data/chart question.
   reload_cube_schema is only for after committing a config change.
@@ -330,6 +352,35 @@ async def _fetch_cube_metadata() -> tuple[list[dict], list[dict]]:
     return [c for c in entries if not hidden(c)], [c for c in entries if hidden(c)]
 
 
+async def run_cube_query(query: dict, limit: int = 50) -> dict:
+    """Run a build_query-shaped query against Cube's REST API -> {rows, sql} or {error}.
+
+    Used to preview a user's corrected query before it is saved as feedback.
+    """
+    q = {k: v for k, v in query.items() if not k.startswith("_") and k != "time_dimensions"}
+    if query.get("time_dimensions"):
+        q["timeDimensions"] = query["time_dimensions"]
+    q["limit"] = min(int(q.get("limit") or limit), limit)
+    headers = {"Authorization": f"Bearer {CUBE_API_SECRET}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        for _ in range(10):  # Cube answers "Continue wait" while a query is still running
+            resp = await client.post(f"{CUBE_URL}/cubejs-api/v1/load", json={"query": q}, headers=headers)
+            body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            if body.get("error") != "Continue wait":
+                break
+            await asyncio.sleep(0.5)
+        if resp.status_code >= 400 or body.get("error"):
+            return {"error": body.get("error") or resp.text[:500]}
+        sql = ""
+        try:
+            sres = await client.get(f"{CUBE_URL}/cubejs-api/v1/sql",
+                                    params={"query": json.dumps(q)}, headers=headers)
+            sql = sres.json()["sql"]["sql"][0]
+        except Exception:
+            pass
+    return {"rows": body.get("data", []), "sql": sql}
+
+
 @tool
 async def build_query(request: str, context: str = "") -> str:
     """
@@ -337,8 +388,9 @@ async def build_query(request: str, context: str = "") -> str:
 
     Fetches the live schema, maps the request onto existing measures/dimensions
     (using each field's description/synonyms), validates every member against the
-    schema, and auto-repairs invalid members. Call this FIRST for any data/chart
-    request, then pass the returned fields to query_cube.
+    schema, and auto-repairs invalid members. ALWAYS call this FIRST for any
+    data/chart/table/number request — never build a query_cube call yourself or
+    from get_cube_metadata. Then pass the returned fields to query_cube unchanged.
 
     Args:
         request: the user's data request in natural language, e.g. "revenue by country"
@@ -355,8 +407,11 @@ async def build_query(request: str, context: str = "") -> str:
     """
     metadata, cubes = await _fetch_cube_metadata()
     # build_query is sync (structured LLM call) — run off the event loop.
+    # examples_fn: past requests users confirmed/corrected on the chosen view,
+    # shown to the model as few-shot examples (graph/feedback.py).
     query = await asyncio.to_thread(qb.build_query, request, metadata,
-                                    context=context or None, cubes=cubes)
+                                    context=context or None, cubes=cubes,
+                                    examples_fn=feedback.examples_for)
     if isinstance(query, dict) and query.get("_view_error"):
         # A single query can't span two views. Stop the tool chain here and hand the
         # boundary back to the model to explain — don't let it fall through to query_cube.
@@ -370,6 +425,37 @@ async def build_query(request: str, context: str = "") -> str:
             ),
         })
     return json.dumps(query)
+
+
+def guarded_query_cube(mcp_query_cube):
+    """Wrap the MCP query_cube tool with the build_query provenance guard
+    (graph/guard.py). Same name, args and description, so the UI and prompt are
+    unchanged; `state` is injected by LangGraph and never shown to the model."""
+
+    @tool
+    async def query_cube(
+        measures: list[str],
+        state: Annotated[dict, InjectedState],
+        dimensions: list[str] = [],
+        filters: list[dict] = [],
+        time_dimensions: list[dict] = [],
+        limit: int = 1000,
+        order: dict = {},
+    ) -> str:
+        """Execute a Cube.js query and return results as JSON."""
+        args = {"measures": measures, "dimensions": dimensions, "filters": filters,
+                "time_dimensions": time_dimensions, "limit": limit, "order": order}
+        problem = guard.check_provenance(args, state.get("messages", []))
+        if problem:
+            print(f"[guard] query_cube rejected: {problem[:120]}")
+            return json.dumps({"error": problem, "guard": "build_query_required"})
+        return await mcp_query_cube.ainvoke(args)
+
+    query_cube.description = (
+        (mcp_query_cube.description or query_cube.description)
+        + "\n\nOnly accepts fields returned by build_query — call build_query first."
+    )
+    return query_cube
 
 
 @tool
@@ -456,6 +542,9 @@ async def build_agent():
         "library": {"url": LIBRARY_MCP_URL, "transport": "sse"},
     })
     mcp_tools = await mcp_client.get_tools()
+    # query_cube is swapped for a guarded wrapper: it refuses fields that didn't
+    # come from build_query (see graph/guard.py).
+    mcp_tools = [guarded_query_cube(t) if t.name == "query_cube" else t for t in mcp_tools]
     all_tools = mcp_tools + [build_query, create_chart, edit_cube_config]
 
     _agent = create_react_agent(

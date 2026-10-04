@@ -29,6 +29,7 @@ CubeQuery) so no network is needed.
 """
 from __future__ import annotations
 
+import json
 import os
 from functools import lru_cache
 from typing import Any, Callable, Optional
@@ -257,9 +258,34 @@ def _resolve_view(
     return view_meta, None
 
 
+def render_examples(examples: list[dict]) -> str:
+    """Past requests on this view with the query a user confirmed or corrected."""
+    return "\n\n".join(
+        f"Request: {ex['request']}\nQuery: {json.dumps(ex['query'], sort_keys=True)}"
+        for ex in examples
+    )
+
+
+def _get_examples(examples_fn, request: str, view_meta: list[dict]) -> list[dict]:
+    """Few-shot examples from human feedback. Never lets a store failure break a query."""
+    if not examples_fn:
+        return []
+    try:
+        return list(examples_fn(request, view_meta) or [])
+    except Exception:
+        return []
+
+
 def _invoke(llm, request: str, schema_text: str, context: str | None,
-            prior: dict | None, feedback: list[str] | None) -> CubeQuery:
+            prior: dict | None, feedback: list[str] | None,
+            examples: list[dict] | None = None) -> CubeQuery:
     msgs = [("system", _SYSTEM), ("human", f"Schema:\n{schema_text}")]
+    if examples:
+        msgs.append(("human",
+            "Verified examples — past requests on this data where a user confirmed or "
+            "corrected the query. When the new request means the same thing, use the same "
+            "members; don't copy filters or values the new request doesn't ask for.\n\n"
+            + render_examples(examples)))
     if context:
         msgs.append(("human", f"Recent conversation (for follow-ups):\n{context}"))
     if prior is not None and feedback:
@@ -282,11 +308,16 @@ def build_query(
     view_llm=None,
     max_repairs: int = 1,
     cubes: list[dict] | None = None,
+    examples_fn: Callable[[str, list[dict]], list[dict]] | None = None,
 ) -> dict:
     """NL → validated Cube query dict. Routes to a single view first (a query can
     never span views), builds against only that view's slice, then repairs static
     validation problems once. When no single view fits, returns {"_view_error": ...}
-    for the caller to surface — nothing else in the dict."""
+    for the caller to surface — nothing else in the dict.
+
+    `examples_fn(request, view_meta)` (optional) returns past verified
+    {request, query} pairs for the chosen view — human feedback reused as
+    few-shot examples (see graph/feedback.py)."""
     view_meta, view_error = _resolve_view(request, metadata, context=context, model=model,
                                           view_llm=view_llm, cubes=cubes)
     if view_error:
@@ -294,14 +325,15 @@ def build_query(
 
     llm = llm or _default_llm(model or os.environ.get("QUERY_BUILDER_MODEL", "claude-haiku-4-5-20251001"))
     schema_text = render_schema(view_meta)
+    examples = _get_examples(examples_fn, request, view_meta)
 
-    result = _invoke(llm, request, schema_text, context, None, None)
+    result = _invoke(llm, request, schema_text, context, None, None, examples)
     query = result.to_query()
     problems = validate_query(query, view_meta)
 
     repairs = 0
     while problems and repairs < max_repairs:
-        result = _invoke(llm, request, schema_text, context, query, problems)
+        result = _invoke(llm, request, schema_text, context, query, problems, examples)
         query = result.to_query()
         problems = validate_query(query, view_meta)
         repairs += 1
@@ -322,6 +354,7 @@ def build_and_run(
     llm=None,
     view_llm=None,
     cubes: list[dict] | None = None,
+    examples_fn: Callable[[str, list[dict]], list[dict]] | None = None,
 ) -> tuple[dict, dict]:
     """Route to one view, build_query, execute via run_fn, and on a Cube runtime
     error repair ONCE using the error message. run_fn(query) -> result dict (with
@@ -336,11 +369,14 @@ def build_and_run(
     schema_text = render_schema(view_meta)
 
     # view_meta is a single view, so build_query won't re-route.
-    query = build_query(request, view_meta, context=context, llm=llm)
+    examples = _get_examples(examples_fn, request, view_meta)
+    query = build_query(request, view_meta, context=context, llm=llm,
+                        examples_fn=(lambda *_: examples) if examples else None)
     result = run_fn(query)
 
     if isinstance(result, dict) and result.get("error"):
-        fixed = _invoke(llm, request, schema_text, context, query, [f"Cube error: {result['error']}"])
+        fixed = _invoke(llm, request, schema_text, context, query,
+                        [f"Cube error: {result['error']}"], examples)
         query = fixed.to_query()
         result = run_fn(query)
     return query, result

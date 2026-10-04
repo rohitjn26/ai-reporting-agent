@@ -82,6 +82,24 @@ orchestrates tools.
 
 ---
 
+## Learning from human feedback
+
+- **Every built query is a trace** (`graph/feedback.py`): the request, the view, the query
+  `build_query` built, then the query that actually ran plus Cube's SQL.
+- **The query-plan card has 👍 / 👎.** 👎 opens tags (*wrong measure*, *wrong view*, …) and a
+  "Fix it" editor: swap measures/dimensions/time/filters from the view's members, run it, save.
+  A correction must pass `validate_query` (single view included) and run in Cube before it's kept.
+- **Feedback becomes few-shot examples.** For a new request, `build_query` pulls the most similar
+  past requests on the same view (BM25 over the request text) and shows the confirmed/corrected
+  queries to the model. Corrections weigh 1.0, a bare 👍 0.5, a 👎 with no fix is never shown.
+  Examples that no longer validate (renamed member) are dropped, so schema drift can't teach
+  stale names.
+- **Storage:** Postgres (`FEEDBACK_DB_URL`, else `CHECKPOINT_DB_URL`) or a local SQLite file.
+  `FEEDBACK_REQUIRE_REVIEW=true` holds feedback as *pending* until approved via
+  `POST /feedback/{id}/review`; `FEEDBACK_EXAMPLES_K=0` turns retrieval off (useful for A/B).
+
+---
+
 ## Soundbites
 
 - *"The LLM chooses semantic fields; it never writes SQL or touches the DB."*

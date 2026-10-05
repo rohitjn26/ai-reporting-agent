@@ -23,6 +23,7 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 
 from langchain_core.messages import HumanMessage
 from graph.agent import build_agent
+from graph import tracing
 
 BANNER = """
 ╔══════════════════════════════════════════════════╗
@@ -72,7 +73,8 @@ async def run_agent():
         print("Agent: ", end="", flush=True)
         try:
             result = await agent.ainvoke(
-                {"messages": [HumanMessage(content=user_input)]}
+                {"messages": [HumanMessage(content=user_input)]},
+                config={"callbacks": tracing.callbacks(), "metadata": tracing.metadata(tags=["cli"])},
             )
             last = result["messages"][-1]
             content = last.content if hasattr(last, "content") else str(last)
@@ -87,6 +89,8 @@ async def run_agent():
         except Exception as e:
             print(f"[error] {e}")
         print()
+
+    tracing.flush()
 
 
 if __name__ == "__main__":

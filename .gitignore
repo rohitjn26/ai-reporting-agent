@@ -22,6 +22,9 @@ library-db-data/
 .DS_Store
 Thumbs.db
 
+# Local human-feedback store (SQLite fallback)
+agent/.feedback.db
+
 # Logs
 *.log
 

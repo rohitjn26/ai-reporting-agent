@@ -228,6 +228,22 @@ def _last_user_request(agent, config, user_message: str | None) -> str:
     return ""
 
 
+@app.post("/discovery/judge")
+async def discovery_judge(request: Request):
+    """AI verdict per uncertain join column: which candidate table (if any) it
+    really references. Suggestions only — the user applies them in the panel."""
+    body = await request.json()
+    if not body.get("discovery"):
+        return {"error": "Run discovery first."}
+    _load_run_discovery()  # puts the repo root on sys.path
+    from discovery.judge import judge_joins
+    try:
+        return await asyncio.to_thread(judge_joins, body["discovery"], body.get("columns"),
+                                       body.get("dataset") or None)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _sse_headers():
     return {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
@@ -1359,6 +1375,9 @@ _HTML = """<!DOCTYPE html>
       padding: 2px 6px; font: 0.7rem system-ui; }
     .col-desc input.edited { border-color: #f59e0b; }
     #describe-status { font-size: 0.7rem; color: #64748b; margin: -2px 0 8px; min-height: 12px; }
+    #judge-status { font-size: 0.7rem; color: #64748b; margin: -2px 0 8px; min-height: 12px; }
+    .join-item .jai { font-size: 0.7rem; margin-top: 3px; color: #c4b5fd; }
+    .join-item .jai.no { color: #fca5a5; }
     #draft-describe { background: #312e81 !important; border-color: #4f46e5 !important; color: #e0e7ff !important; }
     /* search + bulk actions over the filtered list (relationships and draft) */
     .search-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
@@ -1480,6 +1499,13 @@ _HTML = """<!DOCTYPE html>
       <button id="rel-accept-shown" onclick="bulkStatus('accepted')" disabled>Accept all shown</button>
       <button id="rel-reject-shown" onclick="bulkStatus('rejected')" disabled>Reject all shown</button>
     </div>
+    <div class="search-row">
+      <button id="rel-ask-ai" onclick="askAiJoins()" disabled
+              title="An LLM reads each uncertain column, its table and the candidates, and suggests one (or none)">&#129302; Ask AI about uncertain</button>
+      <button id="rel-apply-ai" onclick="applyAiJoins()" disabled
+              title="Accept the AI's pick and reject the rest, for medium/high-confidence verdicts">Apply AI picks</button>
+    </div>
+    <div id="judge-status"></div>
     <div id="join-panel"><span style="color:#475569;font-size:0.82rem">Discovered joins appear here.</span></div>
   </div>
   <div id="cy-wrap">
@@ -2645,6 +2671,7 @@ _HTML = """<!DOCTYPE html>
   // ── discovery run + relationship review state ──
   let discData = null;   // last /discovery/run result
   let relState = {};     // key -> { j, status, relationship }
+  let aiJudge = {};      // "table.column" -> { target, pk_column, confidence, reason }
   let activeKey = null;
 
   const relKey = j => j.fk.table + '.' + j.fk.column + '->' + j.pk.table + '.' + j.pk.column;
@@ -2668,6 +2695,8 @@ _HTML = """<!DOCTYPE html>
       d.joins.accepted.forEach(j => relState[relKey(j)] = { j, status: 'accepted', relationship: j.relationship, primary: !!j.primary });
       d.joins.uncertain.forEach(j => relState[relKey(j)] = { j, status: 'uncertain', relationship: j.relationship, primary: false });
       activeKey = null;
+      aiJudge = {};
+      document.getElementById('judge-status').textContent = '';
       cubeExcl = new Set(); viewExcl = new Set();
       document.getElementById('root-select').innerHTML = '';  // recommended root on first draft
       aiDesc = { tables: {} }; descEdits = { tables: {}, views: {} };
@@ -2743,6 +2772,9 @@ _HTML = """<!DOCTYPE html>
     shownRels = rels.map(([key]) => key);
     document.getElementById('rel-accept-shown').disabled = !shownRels.length;
     document.getElementById('rel-reject-shown').disabled = !shownRels.length;
+    const hasUncertain = Object.values(relState).some(r => r.status === 'uncertain');
+    document.getElementById('rel-ask-ai').disabled = !hasUncertain;
+    document.getElementById('rel-apply-ai').disabled = !Object.keys(aiJudge).length;
     const relOpts = ['many_to_one', 'one_to_one', 'one_to_many'];
     let html = '';
     rels.forEach(([key, r]) => {
@@ -2768,7 +2800,12 @@ _HTML = """<!DOCTYPE html>
              '" data-key="' + key + '" onclick="highlightRel(this.dataset.key)">' +
           '<div class="jt">' + j.fk.table + '.' + j.fk.column + ' → ' + j.pk.table + '.' + j.pk.column + '</div>' +
           '<div class="jm">conf ' + j.confidence + ' · containment ' + j.containment + ' · ' + j.name_signal +
-            (j.fk_ndv != null ? ' · ' + j.fk_ndv + ' distinct' : '') + '</div>' + pick +
+            (j.fk_ndv != null ? ' · ' + j.fk_ndv + ' distinct' : '') + '</div>' +
+          (j.evidence ? '<div class="jm">' + ({ proven: 'proof: data rules out luck', name: 'proof: name only',
+                                                 none: 'proof: none' })[j.evidence] +
+            (j.chance_rate != null ? ' · luck would match ' + Math.round(j.chance_rate * 100) + '%' +
+                                     ', found ' + Math.round((j.values_found || 0) * 100) + '%' : '') +
+            '</div>' : '') + aiLine(r) + pick +
           '<div class="join-actions" onclick="event.stopPropagation()">' +
             '<button class="' + (r.status === 'accepted' ? 'on-accept' : '') + '" ' +
               'onclick="setStatus(this.closest(\\'.join-item\\').dataset.key, \\'accepted\\')">Accept</button>' +
@@ -2791,6 +2828,56 @@ _HTML = """<!DOCTYPE html>
   const matchesAll = (terms, text) => { const t = text.toLowerCase(); return terms.every(w => t.includes(w)); };
 
   let shownRels = [];   // relationship keys passing the current search
+  // ── AI verdicts on uncertain joins (suggestions; the user applies them) ──
+  const colKey = j => j.fk.table + '.' + j.fk.column;
+
+  function aiLine(r) {
+    const v = aiJudge[colKey(r.j)];
+    if (!v) return '';
+    const conf = ' (' + v.confidence + ')';
+    const why = escapeHtml(v.reason || '');
+    if (v.target === r.j.pk.table)
+      return '<div class="jai">&#129302; AI: this is the one' + conf + ' — ' + why + '</div>';
+    if (v.target)
+      return '<div class="jai no">&#129302; AI: not this — prefers ' + escapeHtml(v.target) + conf + '</div>';
+    return '<div class="jai no">&#129302; AI: not a reference' + conf + ' — ' + why + '</div>';
+  }
+
+  async function askAiJoins() {
+    const btn = document.getElementById('rel-ask-ai');
+    const st = document.getElementById('judge-status');
+    if (!discData) return;
+    btn.disabled = true; st.textContent = 'Asking AI…';
+    try {
+      const r = await fetch('/discovery/judge', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ discovery: discData,
+                               dataset: document.getElementById('dataset-input').value.trim() })
+      });
+      const d = await r.json();
+      if (d.error) { st.textContent = 'AI review failed: ' + d.error; return; }
+      aiJudge = d.verdicts || {};
+      const errs = Object.keys(d.errors || {});
+      st.textContent = 'AI reviewed ' + Object.keys(aiJudge).length + ' column(s)' +
+                       (errs.length ? '; failed: ' + errs.join(', ') : '') + '.';
+      rebuild();
+    } catch (e) { st.textContent = 'AI review failed: ' + e.message; }
+    finally { btn.disabled = false; }
+  }
+
+  function applyAiJoins() {
+    let n = 0;
+    Object.values(relState).forEach(r => {
+      const v = aiJudge[colKey(r.j)];
+      if (r.status !== 'uncertain' || !v || v.confidence === 'low') return;
+      r.status = v.target === r.j.pk.table ? 'accepted' : 'rejected';
+      n++;
+    });
+    document.getElementById('judge-status').textContent =
+      'Applied ' + n + ' AI pick(s); low-confidence ones are left for you.';
+    rebuild(); refreshDraft();
+  }
+
   function bulkStatus(status) {
     shownRels.forEach(k => { if (relState[k]) relState[k].status = status; });
     rebuild(); refreshDraft();

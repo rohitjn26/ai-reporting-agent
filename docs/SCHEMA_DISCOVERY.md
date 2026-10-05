@@ -83,9 +83,17 @@ Name similarity is a **prior, not proof**: not sufficient (matching names can be
 
 **Acceptance** (`classify_joins`), per FK column, among targets with containment ≥ 0.98 and a unique key:
 
-- **High-entropy key** (string keys ≥ 16 chars — ObjectIds, UUIDs) with one such target → accepted on containment alone. Values that random can't be contained by chance, so `author → account.id` needs no name.
+- **Proven by the data** with one such target → accepted on containment alone, no name needed. Two ways to be proven:
+  - *High-entropy key* (string keys ≥ 16 chars — ObjectIds, UUIDs): values that random can't be contained by chance, so `author → account.id` needs no name.
+  - *Hole check* (integer keys): if the target's ids have holes (deleted rows, gaps), an unrelated number lands in them as often as holes occur; a real FK never does, because its values were copied from the target. The check compares the share of the FK's distinct values found with the share luck would give (how densely the target fills the FK's own value range), and counts it as proven when luck would produce it with probability below one in a million (Chernoff bound). If the target has **no** holes in that range, every value is found either way — the match proves nothing, and the other rules decide.
 - **Several targets** → the single best name signal wins (`suffix_id` `customer_id→customers` > `table` `c_task→c_task`, `c_account→account` > `exact`); a tie goes to review.
-- **Low-entropy key** (small ints, short codes) → needs a name signal. `shelf ⊆ store.id` over 1..20 is plausibly chance, so it goes to review.
+- **Nothing proven** (small ints in a gap-free id range, short codes) → needs a name signal. `shelf ⊆ store.id` over 1..20 is plausibly chance, so it goes to review.
+
+**One table vs many** (before classification): a column with no evidence at all — not proven, no name signal — that is contained in *several* tables is behaving like a number, not a reference (`products.stock_quantity` inside every gap-free `*_id` range). Those matches are dropped instead of being sent to review. If it fits only one table it stays for review, since the data can't rule it out.
+
+Each join carries its evidence (`evidence`: proven / name / none, plus `values_found`, `chance_rate`, `chance_log10`, `coverage`), shown on the review card.
+
+**AI judge for what's left** (`discovery/judge.py`, "🤖 Ask AI about uncertain" in the Schema tab). The data checks measure what can be measured; they can't tell *meaning* — that `shelf` is a shelf number, or that `assigned_to` is a user. For each uncertain column, one LLM call (`JOIN_JUDGE_MODEL`, default Haiku) sees the column's profile and samples, its table, each candidate target with the measured evidence, and the joins already accepted from that table, and returns `{target | none, confidence, reason}`. A target that isn't a candidate is rejected as an error. Verdicts are **suggestions**: they show on the review cards, and "Apply AI picks" accepts the chosen target and rejects the rest for medium/high-confidence verdicts only — low confidence stays with the user. Answers are cached per (model, prompt) for the process, so asking again gives the same result. As with descriptions, a few sample values leave the machine.
 
 Several FK columns into one table (`creator`/`owner`/`updater → account`) are all accepted. A Cube cube holds one join per target, so the draft keeps the best-named one and notes the rest.
 

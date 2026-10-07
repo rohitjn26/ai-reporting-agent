@@ -25,7 +25,7 @@ import uvicorn
 
 from graph.agent import (build_agent, maybe_summarise, close_checkpointer, MODEL_LABEL,
                          _fetch_cube_metadata, run_cube_query)
-from graph import feedback
+from graph import feedback, tracing
 from graph import query_builder as qb
 import chart.server as _chart_server
 
@@ -56,6 +56,7 @@ async def lifespan(app: FastAPI):
     print(f"\n  Chat UI  → http://localhost:{_ui_port}")
     print(f"  Charts   → http://localhost:{_chart_server._PORT}\n")
     yield
+    tracing.flush()
     await close_checkpointer()
 
 
@@ -256,7 +257,8 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
     """
     if agent is None:
         agent = _agent
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50,
+              "callbacks": tracing.callbacks(), "metadata": tracing.metadata(thread_id, tags=["ui"])}
     # Tell the UI which model is handling this turn (routed Haiku vs Sonnet).
     if model_name:
         yield f"data: {json.dumps({'type': 'model', 'model': model_name})}\n\n"

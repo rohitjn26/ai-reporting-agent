@@ -15,3 +15,5 @@ langgraph-checkpoint-postgres==2.0.19
 psycopg[binary,pool]==3.2.13
 # Schema-discovery module (discovery/): profiles CSVs and finds relationships.
 duckdb==1.5.5
+# Tracing (agent/graph/tracing.py) — only active when LANGFUSE_* keys are set.
+langfuse==4.17.0

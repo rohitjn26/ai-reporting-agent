@@ -42,7 +42,35 @@ def test_generates_expected_templates():
     cases = generate.generate_cases(FAKE_META)
     tmpl = _by_template(cases)
     assert {"single_measure", "measure_by_dimension", "top_n",
-            "measure_over_time", "pivot"} <= set(tmpl)
+            "measure_over_time", "pivot", "bottom_n", "sort_asc", "sort_by_dim",
+            "measure_threshold", "dim_equals", "date_range", "relative_date"} <= set(tmpl)
+
+
+def test_sort_cases_set_direction_and_key():
+    tmpl = _by_template(generate.generate_cases(FAKE_META))
+    assert tmpl["bottom_n"][0]["expected"]["order"] == {"orders.total_revenue": "asc"}
+    assert tmpl["bottom_n"][0]["expected"]["limit"] == 5
+    assert "limit" not in tmpl["sort_asc"][0]["expected"]
+    assert tmpl["sort_by_dim"][0]["expected"]["order"] == {"orders.country": "asc"}
+
+
+def test_filter_cases_carry_expected_filters():
+    tmpl = _by_template(generate.generate_cases(FAKE_META))
+    assert tmpl["measure_threshold"][0]["expected"]["filters"] == [
+        {"member": "orders.total_revenue", "operator": "gt", "values": ["1000"]}]
+    eq = tmpl["dim_equals"][0]
+    assert eq["expected"]["filters"][0]["member"] == "orders.country"
+    assert eq["expected"]["filters"][0]["values"][0] in eq["prompt"]   # value comes from the prompt
+    assert tmpl["date_range"][0]["expected"]["time_dimensions"][0]["dateRange"] == ["2024-01-01", "2024-12-31"]
+    assert tmpl["relative_date"][0]["expected"]["time_dimensions"][0]["dateRange"] == "last 12 months"
+
+
+def test_dim_equals_prefers_schema_sample_value():
+    meta = json.loads(json.dumps(FAKE_META))
+    meta[0]["dimensions"][1]["meta"] = {"sample_values": ["Germany", "France"]}
+    eq = _by_template(generate.generate_cases(meta))["dim_equals"][0]
+    assert eq["expected"]["filters"][0]["values"] == ["Germany"]
+    assert '"Germany"' in eq["prompt"]
 
 
 def test_measure_by_dimension_has_correct_expected_query():
@@ -111,6 +139,72 @@ def test_grade_query_checks_limit_and_order_when_specified():
     bad = {**good, "limit": 10}
     assert grading.grade_query(good, expected)["passed"]
     assert grading.grade_query(bad, expected)["passed"] is False
+
+
+def test_grade_query_fails_on_missing_or_extra_filter():
+    f = [{"member": "orders.total_revenue", "operator": "gt", "values": ["1000"]}]
+    expected = {"measures": ["orders.total_revenue"], "dimensions": ["orders.country"], "filters": f}
+    assert grading.grade_query({**expected}, expected)["passed"]
+    missing = {"measures": ["orders.total_revenue"], "dimensions": ["orders.country"]}
+    assert grading.grade_query(missing, expected)["passed"] is False
+    # a filter the prompt never asked for is wrong too
+    assert grading.grade_query(expected, missing)["passed"] is False
+
+
+def test_grade_query_filter_normalizes_values_and_rejects_wrong_operator():
+    expected = {"measures": ["m"], "filters": [{"member": "m", "operator": "gt", "values": ["1000"]}]}
+    numeric = {"measures": ["m"], "filters": [{"member": "m", "operator": "gt", "values": [1000]}]}
+    gte = {"measures": ["m"], "filters": [{"member": "m", "operator": "gte", "values": ["1000"]}]}
+    assert grading.grade_query(numeric, expected)["passed"]
+    assert grading.grade_query(gte, expected)["passed"] is False
+
+
+def test_grade_query_date_range_equivalent_spellings():
+    td = lambda dr: {"measures": ["m"], "time_dimensions": [
+        {"dimension": "t", "granularity": "month", "dateRange": dr}]}
+    expected = td(["2024-01-01", "2024-12-31"])
+    assert grading.grade_query(td(["2024-01-01T00:00:00.000", "2024-12-31T23:59:59.999"]), expected)["passed"]
+    assert grading.grade_query(td("2024"), expected)["passed"]
+    assert grading.grade_query(td(["2023-01-01", "2023-12-31"]), expected)["passed"] is False
+    assert grading.grade_query(td("Last 12 Months"), td("last 12 months"))["passed"]
+    # dropping the date range is a miss
+    no_range = {"measures": ["m"], "time_dimensions": [{"dimension": "t", "granularity": "month"}]}
+    assert grading.grade_query(no_range, expected)["passed"] is False
+
+
+def test_grade_query_primary_sort_key_must_match():
+    expected = {"measures": ["m"], "dimensions": ["d"], "order": {"d": "asc"}}
+    measure_first = {**expected, "order": {"m": "desc", "d": "asc"}}
+    assert grading.grade_query({**expected}, expected)["passed"]
+    assert grading.grade_query(measure_first, expected)["passed"] is False
+
+
+def test_pick_graded_query_defaults_to_last_call():
+    q1, q2 = {"measures": ["a"]}, {"measures": ["b"]}
+    assert grading.pick_graded_query([q1, q2], {}) is q2
+    assert grading.pick_graded_query([], {}) is None
+
+
+def test_pick_graded_query_first_filtered_survives_a_retry():
+    filtered = {"measures": ["m"], "filters": [{"member": "d", "operator": "equals", "values": ["X"]}]}
+    retry = {"measures": ["m"]}   # agent dropped the filter after an empty result
+    case = {"grade_call": "first_filtered"}
+    assert grading.pick_graded_query([filtered, retry], case) is filtered
+    assert grading.pick_graded_query([retry], case) is retry   # never filtered -> last call
+
+
+def test_dim_equals_cases_grade_first_filtered_call():
+    eq = _by_template(generate.generate_cases(FAKE_META))["dim_equals"][0]
+    assert eq["grade_call"] == "first_filtered"
+
+
+def test_members_exist_checks_filter_members():
+    ok = {"measures": ["orders.total_revenue"],
+          "filters": [{"member": "orders.country", "operator": "equals", "values": ["x"]}]}
+    bad = {"measures": ["orders.total_revenue"],
+           "filters": [{"member": "orders.region", "operator": "equals", "values": ["x"]}]}
+    assert grading.members_exist(ok, FAKE_META)["passed"]
+    assert grading.members_exist(bad, FAKE_META)["passed"] is False
 
 
 def test_members_exist_catches_hallucination():

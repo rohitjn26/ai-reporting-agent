@@ -47,6 +47,27 @@ It defaults to a different model from the paraphraser (`EVAL_VERIFIER_MODEL`) so
 the two don't share a blind spot, and it reuses the agent's `build_query` +
 `grade_query` for the re-derivation and comparison.
 
+### Filter and sort cases
+
+These grade the **shape** of the query, never its results, so no data values are
+needed — the expected filter is exactly what the prompt says:
+
+| Template | Prompt | Expected |
+|---|---|---|
+| `bottom_n` | "bottom 5 country by revenue" | `order {revenue: asc}, limit 5` |
+| `sort_asc` | "revenue by country, lowest first" | `order {revenue: asc}` |
+| `sort_by_dim` | "revenue by country, sorted alphabetically by country" | `order {country: asc}` |
+| `measure_threshold` | "country with revenue over 1000" | `filters [{revenue gt 1000}]` |
+| `dim_equals` | `revenue where country is "X"` | `filters [{country equals X}]` |
+| `date_range` | "monthly revenue in 2024" | `dateRange ["2024-01-01","2024-12-31"]` |
+| `relative_date` | "monthly revenue over the last 12 months" | `dateRange "last 12 months"` |
+
+`dim_equals` takes X from the dimension's `meta.sample_values` in the schema if
+present, else a placeholder ("Country A"). It never queries the data. A
+placeholder returns no rows, and the agent may retry without the filter, so these
+cases carry `grade_call: "first_filtered"`: the runner grades the first
+`query_cube` call that had filters, not the last call.
+
 Each case carries the expected **Cube query** and the expected **chart mapping**,
 so one file grades both query construction and `save_graph` mapping.
 
@@ -73,8 +94,10 @@ python evals/generate.py --paraphrase 3 --verify   # + drop drifted paraphrases
 
 ## Grading (portable by construction)
 
-- `grade_query(actual, expected)` — measures/dimensions/time-dimensions match as
-  sets; limit/order checked only when the case specifies them.
+- `grade_query(actual, expected)` — measures/dimensions/filters/time-dimensions
+  (incl. `dateRange`) match as sets, so a missing *or extra* filter fails;
+  limit/order checked only when the case specifies them, and then the primary
+  sort key must match too.
 - `members_exist(actual, metadata)` — the invariant: nothing hallucinated. Works
   on any schema.
 - `grade_chart_type` / `grade_mapping` — chart type is acceptable; save_graph

@@ -49,7 +49,7 @@ async def test_full_config_lifecycle(live_library_server):
     assert entry is not None
     assert entry["name"] == name
     assert set(entry["measures"]) == {"count"}
-    assert set(entry["dimensions"]) == {"status"}
+    assert entry["n_dimensions"] == 1
 
     # Detail returns the full stored definition.
     detail = json.loads(await lib.get_cube_config_detail(config_id))

@@ -6,7 +6,7 @@ from functools import lru_cache
 from typing import Annotated
 import httpx
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import InjectedState, create_react_agent
@@ -263,9 +263,10 @@ async def clear_thread(thread_id: str) -> None:
         for k in [k for k in cp.storage if k[0] == thread_id]:
             del cp.storage[k]
 
-# Summarise when message count exceeds this; keep the last KEEP_RECENT messages as-is.
+# Summarise when message count exceeds this; the latest turn (from the last user
+# message on) is always kept as-is.
 SUMMARISE_AFTER = 10
-KEEP_RECENT     = 4
+_SUMMARY_PREFIX = "[Conversation summary]"
 _SUMMARY_MODEL  = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
 
 
@@ -285,6 +286,18 @@ def _extract_text(content) -> str:
             b.get("text", "") for b in content if isinstance(b, dict)
         )[:400]
     return str(content)[:400]
+
+
+def _is_summary(m) -> bool:
+    return isinstance(m.content, str) and m.content.startswith(_SUMMARY_PREFIX)
+
+
+def _latest_turn_start(messages) -> int | None:
+    """Index of the last real user message (not a stored summary), or None."""
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage) and not _is_summary(messages[i]):
+            return i
+    return None
 
 
 async def maybe_summarise(agent, thread_id: str) -> bool:
@@ -309,19 +322,19 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
     if len(messages) <= SUMMARISE_AFTER:
         return False
 
-    to_summarise = list(messages[:-KEEP_RECENT])
-    keep         = list(messages[-KEEP_RECENT:])
-
-    # Ensure 'keep' starts at a clean HumanMessage boundary so we never
-    # leave an orphaned ToolMessage whose tool_use was summarised away.
-    while keep and not isinstance(keep[0], HumanMessage):
-        to_summarise.append(keep.pop(0))
-
-    if not keep or not to_summarise:
+    # Cut at the start of the latest turn (the last real user message), so we
+    # never orphan a ToolMessage from its tool_use. A turn with many tool steps
+    # is kept whole; everything before it is summarised.
+    cut = _latest_turn_start(messages)
+    if cut is None:
+        return False
+    to_summarise = list(messages[:cut])
+    if not to_summarise or (len(to_summarise) == 1 and _is_summary(to_summarise[0])):
         return False
 
     conversation = "\n".join(
-        f"{m.type.upper()}: {_extract_text(m.content)}"
+        # A previous summary is carried over whole so it isn't lost on re-summarising.
+        f"{m.type.upper()}: {m.content if _is_summary(m) else _extract_text(m.content)}"
         for m in to_summarise
     )
 
@@ -337,7 +350,7 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
     summary    = response.content if isinstance(response.content, str) else _extract_text(response.content)
 
     remove_ops   = [RemoveMessage(id=m.id) for m in to_summarise]
-    summary_msg  = HumanMessage(content=f"[Conversation summary]\n{summary}")
+    summary_msg  = HumanMessage(content=f"{_SUMMARY_PREFIX}\n{summary}")
     agent.update_state(config, {"messages": remove_ops + [summary_msg]})
     return True
 
@@ -580,16 +593,69 @@ def _build_state_modifier(state) -> list:
     block caches the tool definitions AND the system prompt together — measured
     at ~6.5K tokens, well over Haiku's 4096-token minimum — so that whole prefix
     is served from cache on every tool round-trip and every turn.
+
+    Two more things keep the history itself small and cheap:
+      - large tool results from EARLIER turns are trimmed (_trim_old_tool_results);
+        the stored state keeps them whole, only what's sent shrinks.
+      - a second breakpoint on the last message caches the whole history, so each
+        tool round-trip re-reads it from cache instead of paying full input price.
     """
     messages = state["messages"] if isinstance(state, dict) else state.messages
     history = [
         HumanMessage(content=m.content) if isinstance(m, SystemMessage) else m
         for m in messages
     ]
+    history = _with_cache_breakpoint(_trim_old_tool_results(history))
     system = SystemMessage(content=[
         {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
     ])
     return [system] + history
+
+
+# Tool results longer than this from a finished turn are cut to a head + note.
+# The current turn's results are never trimmed — the model is still using them.
+OLD_TOOL_RESULT_CHARS = 1500
+_TRIM_HEAD_CHARS      = 500
+
+
+def _trim_old_tool_results(history: list) -> list:
+    cut = _latest_turn_start(history)
+    if cut is None:
+        return history
+    out = []
+    for i, m in enumerate(history):
+        if i < cut and isinstance(m, ToolMessage) and isinstance(m.content, str) \
+                and len(m.content) > OLD_TOOL_RESULT_CHARS:
+            note = (f"\n… [trimmed {len(m.content) - _TRIM_HEAD_CHARS} chars from an earlier "
+                    f"turn — call {m.name or 'the tool'} again if you need the full result]")
+            m = m.model_copy(update={"content": m.content[:_TRIM_HEAD_CHARS] + note})
+        out.append(m)
+    return out
+
+
+def _with_cache_breakpoint(history: list) -> list:
+    """Copy of history with cache_control on the last message's last block."""
+    if not history:
+        return history
+    last = history[-1]
+    cc = {"type": "ephemeral"}
+    if isinstance(last, ToolMessage) and isinstance(last.content, str):
+        # A tool_result block carries the breakpoint; langchain-anthropic passes
+        # an all-tool_result ToolMessage through unchanged.
+        block = {"type": "tool_result", "content": last.content, "tool_use_id": last.tool_call_id,
+                 "is_error": last.status == "error", "cache_control": cc}
+        last = last.model_copy(update={"content": [block]})
+    elif isinstance(last, HumanMessage) and isinstance(last.content, str):
+        last = last.model_copy(update={"content": [{"type": "text", "text": last.content,
+                                                    "cache_control": cc}]})
+    elif isinstance(last, (HumanMessage, ToolMessage)) and isinstance(last.content, list) \
+            and last.content and isinstance(last.content[-1], dict):
+        blocks = list(last.content)
+        blocks[-1] = {**blocks[-1], "cache_control": cc}
+        last = last.model_copy(update={"content": blocks})
+    else:
+        return history
+    return history[:-1] + [last]
 
 
 async def build_agent():

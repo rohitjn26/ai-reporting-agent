@@ -74,7 +74,7 @@ async def run_case(case: dict) -> dict:
     agent = pick_agent(case["prompt"])   # same routing as production
     config = {"configurable": {"thread_id": uuid.uuid4().hex}, "recursion_limit": 30}
 
-    last_query = None      # last query_cube args (the one that feeds the answer)
+    queries = []           # every query_cube call's args, in order
     chart_type = None
     mapping = None
     error = None
@@ -87,7 +87,7 @@ async def run_case(case: dict) -> dict:
             name = ev.get("name", "")
             inp = ev["data"].get("input") or {}
             if name == "query_cube":
-                last_query = inp
+                queries.append(inp)
             elif name == "create_chart":
                 chart_type = inp.get("chart_type")
             elif name == "save_graph":
@@ -95,13 +95,13 @@ async def run_case(case: dict) -> dict:
     except Exception as e:
         error = str(e)
 
-    return {"query": last_query, "chart_type": chart_type, "mapping": mapping, "error": error}
+    return {"queries": queries, "chart_type": chart_type, "mapping": mapping, "error": error}
 
 
 def grade_case(case: dict, observed: dict, metadata: list[dict]) -> dict:
     """Score one case across the aspects we could observe."""
     aspects: dict[str, dict] = {}
-    actual_q = observed["query"]
+    actual_q = grading.pick_graded_query(observed["queries"], case)
 
     if actual_q is None:
         aspects["query"] = {"passed": False, "reason": observed["error"] or "agent never called query_cube"}

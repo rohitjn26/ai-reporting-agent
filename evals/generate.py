@@ -36,6 +36,12 @@ CUBE_API_SECRET = os.environ.get("CUBE_API_SECRET", "local-dev-secret")
 # Dimensions we never group by (identifiers / free-scale numerics make poor axes).
 _SKIP_DIM_TYPES = {"number"}
 
+# Filter cases grade the SHAPE of the query, never its results, so these literals
+# don't need to exist in the data — the expected filter is whatever the prompt says.
+_THRESHOLD     = 1000
+_YEAR          = 2024
+_RELATIVE      = "last 12 months"
+
 
 # ── metadata → normalized members ─────────────────────────────────────────────
 
@@ -69,6 +75,14 @@ def _synonyms(member: dict) -> list[str]:
 
 
 # ── case construction (pure — unit tested) ────────────────────────────────────
+
+def _filter_value(dim: dict) -> str:
+    """Value for a dim_equals case. Prefers a sample value written into the
+    schema (`meta.sample_values`), else a neutral placeholder named after the
+    dimension. Either way it comes from the schema, never from querying data."""
+    samples = (dim.get("meta") or {}).get("sample_values") or []
+    return str(samples[0]) if samples else f"{_title(dim)} A"
+
 
 def _case(cube, template, prompt, source, expected, chart_types, mapping):
     return {
@@ -126,6 +140,38 @@ def generate_cases(cubes: list[dict], *, max_synonyms: int = 2) -> list[dict]:
                     {**expected, "order": {m_name: "desc"}, "limit": 5}, ["bar", "table"], mapping,
                 ))
 
+                # sorting: bottom-N, ascending by the measure, alphabetical by the dimension
+                cases.append(_case(
+                    cube, "bottom_n", f"bottom 5 {d_title.lower()} by {m_title.lower()}", "title",
+                    {**expected, "order": {m_name: "asc"}, "limit": 5}, ["bar", "table"], mapping,
+                ))
+                cases.append(_case(
+                    cube, "sort_asc", f"{m_title.lower()} by {d_title.lower()}, lowest first",
+                    "title", {**expected, "order": {m_name: "asc"}}, ["bar", "table"], mapping,
+                ))
+                cases.append(_case(
+                    cube, "sort_by_dim",
+                    f"{m_title.lower()} by {d_title.lower()}, sorted alphabetically by {d_title.lower()}",
+                    "title", {**expected, "order": {d_name: "asc"}}, ["bar", "table"], mapping,
+                ))
+
+                # filters: a threshold on the measure (HAVING), equality on the dimension (WHERE)
+                cases.append(_case(
+                    cube, "measure_threshold",
+                    f"{d_title.lower()} with {m_title.lower()} over {_THRESHOLD}", "title",
+                    {**expected, "filters": [{"member": m_name, "operator": "gt",
+                                              "values": [str(_THRESHOLD)]}]},
+                    ["bar", "table"], mapping,
+                ))
+                value = _filter_value(d)
+                cases.append({**_case(
+                    cube, "dim_equals",
+                    f'{m_title.lower()} where {d_title.lower()} is "{value}"', "title",
+                    {"measures": [m_name],
+                     "filters": [{"member": d_name, "operator": "equals", "values": [value]}]},
+                    ["table"], None,
+                ), "grade_call": "first_filtered"})   # value may not exist -> empty result -> retries
+
             # 3) measure over time  (+ pivot: split by first categorical dim)
             for t in time_dims:
                 t_name, t_title = t["name"], _title(t)
@@ -136,6 +182,23 @@ def generate_cases(cubes: list[dict], *, max_synonyms: int = 2) -> list[dict]:
                 cases.append(_case(
                     cube, "measure_over_time", f"monthly {m_title.lower()}", "title",
                     expected_time, ["line", "bar"],
+                    {"label_dimension": t_name, "series_measures": [m_name], "series_dimension": None},
+                ))
+                # date filters: an absolute year and a relative window
+                cases.append(_case(
+                    cube, "date_range", f"monthly {m_title.lower()} in {_YEAR}", "title",
+                    {"measures": [m_name],
+                     "time_dimensions": [{"dimension": t_name, "granularity": "month",
+                                          "dateRange": [f"{_YEAR}-01-01", f"{_YEAR}-12-31"]}]},
+                    ["line", "bar"],
+                    {"label_dimension": t_name, "series_measures": [m_name], "series_dimension": None},
+                ))
+                cases.append(_case(
+                    cube, "relative_date", f"monthly {m_title.lower()} over the {_RELATIVE}", "title",
+                    {"measures": [m_name],
+                     "time_dimensions": [{"dimension": t_name, "granularity": "month",
+                                          "dateRange": _RELATIVE}]},
+                    ["line", "bar"],
                     {"label_dimension": t_name, "series_measures": [m_name], "series_dimension": None},
                 ))
                 if cat_dims:

@@ -19,24 +19,70 @@ def _as_set(x) -> set:
     return set(x or [])
 
 
+def _date_range_key(dr):
+    """Normalize a dateRange so equivalent spellings compare equal:
+    ["2024-01-01T00:00:00", "2024-12-31"] -> ("2024-01-01", "2024-12-31");
+    a bare year "2024" -> its full-year range; other strings ("last 90 days") lowercased."""
+    if dr is None or dr == [] or dr == "":
+        return None
+    if isinstance(dr, (list, tuple)):
+        return tuple(str(d)[:10] for d in dr)
+    s = str(dr).strip().lower()
+    if len(s) == 4 and s.isdigit():
+        return (f"{s}-01-01", f"{s}-12-31")
+    return s
+
+
 def _time_dims_key(tds) -> set:
-    """Normalize time_dimensions to a comparable set of (dimension, granularity)."""
+    """Normalize time_dimensions to a comparable set of (dimension, granularity, dateRange)."""
     out = set()
     for td in tds or []:
-        out.add((td.get("dimension"), td.get("granularity")))
+        dr = td.get("dateRange", td.get("date_range"))
+        out.add((td.get("dimension"), td.get("granularity"), _date_range_key(dr)))
     return out
+
+
+def _filters_key(filters) -> set:
+    """Normalize filters to a comparable set of (member, operator, values). Values
+    compare as strings so 1000 and "1000" match; their order doesn't matter."""
+    out = set()
+    for f in filters or []:
+        member = f.get("member") or f.get("dimension")
+        values = tuple(sorted(str(v) for v in f.get("values") or []))
+        out.add((member, f.get("operator"), values))
+    return out
+
+
+def pick_graded_query(queries: list[dict], case: dict) -> dict | None:
+    """Which of the agent's query_cube calls to grade.
+
+    Normally the last one — it's the query that feeds the answer. A case with
+    `grade_call: "first_filtered"` grades the first call that has filters
+    instead: its filter value may not exist in the data, and if the agent then
+    retries without the filter, the case should still score whether the filter
+    was built (falls back to the last call if none was filtered)."""
+    if not queries:
+        return None
+    if case.get("grade_call") == "first_filtered":
+        filtered = [q for q in queries if q.get("filters")]
+        if filtered:
+            return filtered[0]
+    return queries[-1]
 
 
 def grade_query(actual: dict, expected: dict) -> dict:
     """Compare a produced Cube query to the expected one.
 
-    Measures/dimensions/time_dimensions must match exactly (as sets). limit and
+    Measures/dimensions/filters/time_dimensions (incl. dateRange) must match
+    exactly (as sets) — an extra or missing filter is a wrong answer. limit and
     order are only checked when the expected case specifies them (so a case that
-    doesn't care about ordering isn't failed for an extra sort)."""
+    doesn't care about ordering isn't failed for an extra sort); when order is
+    checked, the primary (first) sort key must match too."""
     checks: dict[str, bool] = {}
 
     checks["measures"] = _as_set(actual.get("measures")) == _as_set(expected.get("measures"))
     checks["dimensions"] = _as_set(actual.get("dimensions")) == _as_set(expected.get("dimensions"))
+    checks["filters"] = _filters_key(actual.get("filters")) == _filters_key(expected.get("filters"))
     checks["time_dimensions"] = (
         _time_dims_key(actual.get("time_dimensions")) == _time_dims_key(expected.get("time_dimensions"))
     )
@@ -44,10 +90,14 @@ def grade_query(actual: dict, expected: dict) -> dict:
     if "limit" in expected:
         checks["limit"] = actual.get("limit") == expected["limit"]
     if "order" in expected:
-        # Direction per member must match; we don't require identical key ordering.
+        # Direction per member must match, and the primary sort key must be the
+        # expected one ("alphabetical" sorted by the measure first is wrong).
         exp_order = expected["order"]
         act_order = actual.get("order") or {}
-        checks["order"] = all(act_order.get(k) == v for k, v in exp_order.items())
+        checks["order"] = (
+            all(act_order.get(k) == v for k, v in exp_order.items())
+            and next(iter(act_order), None) == next(iter(exp_order), None)
+        )
 
     return {"passed": all(checks.values()), "checks": checks}
 
@@ -69,6 +119,11 @@ def members_exist(actual: dict, metadata: list[dict]) -> dict:
         td.get("dimension") for td in actual.get("time_dimensions", [])
         if td.get("dimension") not in dimensions
     ]
+    # A filter may be on a measure (HAVING) or a dimension (WHERE).
+    unknown_filters = [
+        f.get("member") or f.get("dimension") for f in actual.get("filters") or []
+        if (f.get("member") or f.get("dimension")) not in measures | dimensions
+    ]
 
     problems = []
     if unknown_measures:
@@ -77,6 +132,8 @@ def members_exist(actual: dict, metadata: list[dict]) -> dict:
         problems.append(f"unknown dimensions: {unknown_dims}")
     if unknown_time:
         problems.append(f"unknown time dimensions: {unknown_time}")
+    if unknown_filters:
+        problems.append(f"unknown filter members: {unknown_filters}")
 
     return {"passed": not problems, "problems": problems}
 

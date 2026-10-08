@@ -144,7 +144,8 @@ IMPORTANT query rules:
   wrong, call build_query again with the error in `context`.
   If it still fails, tell the user what went wrong instead of looping.
 - NEVER call reload_cube_schema when answering a data/chart question.
-  reload_cube_schema is only for after committing a config change.
+  commit_cube_config_update reloads Cube itself; reload_cube_schema is only for
+  after rollback_cube_config.
 
 When build_query reports "_validation_problems" (or the user asks for a measure or
 dimension that does NOT exist in the schema):
@@ -172,9 +173,16 @@ When the user asks to MODIFY an existing cube config, use this exact flow — ne
    remove_measures / remove_dimensions when the user explicitly asked to delete.
    This stages the change without saving.
 3. Summarise what changed and ask: "Should I commit this to the database?"
-4. Only after the user confirms, call commit_cube_config_update.
-5. Call reload_cube_schema so the change is live in Cube.js immediately.
-6. Call get_cube_config_detail to show the saved result for verification.
+4. Only after the user confirms, call commit_cube_config_update. It saves the change
+   as a new version and reloads Cube. If Cube can't compile it, the change is rolled
+   back automatically and the result has an "error" with a "compile_error" — tell the
+   user the change was NOT applied, explain the compile error in plain words, and
+   offer a corrected change. Do not call reload_cube_schema yourself.
+5. On success, call get_cube_config_detail to show the saved result for verification.
+
+To UNDO a committed change ("revert", "roll back", "undo that"), call
+rollback_cube_config (optionally with to_version from list_cube_config_versions),
+then reload_cube_schema.
 
 When the user asks to CREATE a new cube config, use create_cube_config directly.
 """
@@ -471,6 +479,64 @@ def guarded_query_cube(mcp_query_cube):
     return query_cube
 
 
+def _tool_output_text(out) -> str:
+    if isinstance(out, list):
+        return "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in out)
+    return out.content if hasattr(out, "content") else str(out)
+
+
+# reload_cube_schema results that mean the committed schema is not being served.
+_RELOAD_FAILED = ("CUBE_SCHEMA_ERROR", "Cube restarted but did not become healthy")
+
+
+def safe_commit(mcp_commit, reload_tool, rollback_tool):
+    """Wrap commit_cube_config_update so a change only stays if Cube compiles it:
+    commit (a new version) -> reload Cube -> on a compile failure, roll back to
+    the previous version and reload again. Cube is never left on a broken schema.
+    Same name and args as the MCP tool, so the UI and prompt keep working."""
+
+    @tool
+    async def commit_cube_config_update(config_id: str) -> str:
+        """Persist the staged cube config update as a new version, reload Cube, and
+        keep it only if Cube compiles it — otherwise it is rolled back automatically.
+        Must call preview_cube_config_update first, and only after the user confirmed."""
+        committed_text = _tool_output_text(await mcp_commit.ainvoke({"config_id": config_id}))
+        try:
+            committed = json.loads(committed_text)
+        except ValueError:
+            return committed_text
+        if not isinstance(committed, dict) or committed.get("error"):
+            return committed_text
+
+        reload_msg = _tool_output_text(await reload_tool.ainvoke({}))
+        if not reload_msg.startswith(_RELOAD_FAILED):
+            live = reload_msg.startswith("Cube restarted and ready")
+            return json.dumps({"status": "committed and live" if live else
+                               "committed, but Cube did not confirm the reload — check it",
+                               "id": committed.get("id"),
+                               "name": committed.get("name"), "version": committed.get("version"),
+                               "cube": reload_msg})
+
+        print(f"[commit] {committed.get('name')} v{committed.get('version')} broke the schema — rolling back")
+        rb_text = _tool_output_text(await rollback_tool.ainvoke({"config_id": config_id}))
+        try:
+            rb = json.loads(rb_text)
+        except ValueError:
+            rb = {"error": rb_text}
+        after = _tool_output_text(await reload_tool.ainvoke({})) if not rb.get("error") else ""
+        return json.dumps({
+            "error": "Change NOT applied: Cube could not compile it, so it was rolled back "
+                     "to the previous version. Tell the user why (compile_error) and offer a fix.",
+            "compile_error": reload_msg,
+            "rejected_version": committed.get("version"),
+            "restored_version": rb.get("version"),
+            "rollback_error": rb.get("error"),
+            "cube_after_rollback": after,
+        })
+
+    return commit_cube_config_update
+
+
 @tool
 def create_chart(
     chart_type: str,
@@ -611,6 +677,13 @@ async def build_agent():
     # query_cube is swapped for a guarded wrapper: it refuses fields that didn't
     # come from build_query (see graph/guard.py).
     mcp_tools = [guarded_query_cube(t) if t.name == "query_cube" else t for t in mcp_tools]
+    # commit_cube_config_update is swapped for one that reloads Cube and rolls the
+    # change back if it doesn't compile (needs both MCP servers' tools).
+    by_name = {t.name: t for t in mcp_tools}
+    if {"commit_cube_config_update", "reload_cube_schema", "rollback_cube_config"} <= by_name.keys():
+        commit = safe_commit(by_name["commit_cube_config_update"], by_name["reload_cube_schema"],
+                             by_name["rollback_cube_config"])
+        mcp_tools = [commit if t.name == "commit_cube_config_update" else t for t in mcp_tools]
     all_tools = mcp_tools + [build_query, create_chart, edit_cube_config]
 
     _agent = create_react_agent(

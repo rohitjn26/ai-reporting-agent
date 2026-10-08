@@ -275,6 +275,31 @@ async def commit_cube_config_update(config_id: str) -> str:
 
 
 @mcp.tool()
+async def rollback_cube_config(config_id: str, to_version: Optional[int] = None) -> str:
+    """
+    Make an earlier version of a cube config current again (default: the previous
+    good version). The version being left is marked REJECTED. Call
+    reload_cube_schema afterwards so Cube serves the restored version.
+    """
+    payload = {"to_version": to_version} if to_version is not None else {}
+    try:
+        result = await _post(f"/v1/CUBE_CONFIG/{config_id}/rollback", payload)
+    except httpx.HTTPStatusError as e:
+        return json.dumps({"error": f"Rollback failed: {e.response.text[:300]}"})
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+async def list_cube_config_versions(config_id: str) -> str:
+    """Version history of one cube config, newest first: version, status, is_current, updatedAt."""
+    result = await _get(f"/v1/CUBE_CONFIG/{config_id}/versions")
+    return json.dumps([
+        {k: v.get(k) for k in ("version", "status", "is_current", "createdAt")}
+        for v in result.get("data", [])
+    ])
+
+
+@mcp.tool()
 async def delete_cube_config(config_id: str) -> str:
     """Soft-delete a cube configuration from the library by its ID."""
     await _delete(f"/v1/CUBE_CONFIG/{config_id}")

@@ -117,8 +117,8 @@ async def health(request: Request) -> JSONResponse:
 async def list_cube_configs(status: str = "") -> str:
     """
     List all cube configurations in the library.
-    Returns a summary with id, name, description, available measures and dimensions.
-    Call this first to understand what data is available before building a query.
+    Returns a compact summary per config: id, name, description, measure names
+    and a dimension count. Use get_cube_config_detail for one config's dimensions and SQL.
     """
     params = {}
     if status:
@@ -128,15 +128,16 @@ async def list_cube_configs(status: str = "") -> str:
     summary = []
     for cfg in configs:
         d = cfg.get("data", {})
+        # Dimension names and SQL dominate the size (~50K chars across 40 configs)
+        # and this result stays in the agent's history, so only counts here.
         summary.append({
-            "id":          cfg["id"],
-            "name":        cfg["name"],
-            "description": d.get("description", ""),
-            "measures":    list(d.get("measures", {}).keys()),
-            "dimensions":  list(d.get("dimensions", {}).keys()),
-            "sql":         d.get("sql", ""),
+            "id":           cfg["id"],
+            "name":         cfg["name"],
+            "description":  d.get("description", ""),
+            "measures":     list(d.get("measures", {}).keys()),
+            "n_dimensions": len(d.get("dimensions", {})),
         })
-    return json.dumps(summary, indent=2)
+    return json.dumps(summary, separators=(",", ":"))
 
 
 @mcp.tool()

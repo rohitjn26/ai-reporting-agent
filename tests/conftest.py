@@ -92,6 +92,7 @@ def live_library_server(library_server_mod):
 
         # Point the MCP library tools at our live server.
         library_server_mod.LIBRARY_URL = base_url
+        library_server_mod.library_app = app_mod  # for tests that need the app/engine directly
 
         yield library_server_mod
     finally:

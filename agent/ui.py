@@ -273,6 +273,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
     if isinstance(input_, dict) and input_.get("messages"):
         user_message = getattr(input_["messages"][-1], "content", None)
     tool_inputs: dict = {}      # run_id -> tool input (captured at tool start)
+    commits_running: set = set()  # commit runs in flight — their inner reload reports via the commit
     trace_id = None
     pending_direct = None
 
@@ -318,6 +319,8 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 run_id = event.get("run_id", "")
                 tool_input = event["data"].get("input", {})
                 tool_inputs[run_id] = tool_input
+                if name == "commit_cube_config_update":
+                    commits_running.add(run_id)
                 shown = {k: v for k, v in tool_input.items() if k != "state"} \
                     if isinstance(tool_input, dict) else tool_input
                 yield f"data: {json.dumps({'type': 'tool_start', 'name': name, 'run_id': run_id, 'input': str(shown)[:120]})}\n\n"
@@ -327,6 +330,8 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 error  = event["data"].get("error")
                 output = event["data"].get("output", "")
                 output_text = output.content if hasattr(output, "content") else str(output)
+                if name == "commit_cube_config_update":
+                    commits_running.discard(run_id)
                 yield f"data: {json.dumps({'type': 'tool_end', 'name': name, 'run_id': run_id, 'error': str(error) if error else None, 'output': output_text[:2000]})}\n\n"
                 if name == "query_cube" and not error:
                     try:
@@ -373,7 +378,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                         yield f"data: {json.dumps({'type': 'config_preview', 'current': parsed.get('current'), 'proposed': parsed.get('proposed'), 'config_id': parsed.get('config_id')})}\n\n"
                     except Exception:
                         pass
-                if name == "reload_cube_schema" and not error:
+                if name == "reload_cube_schema" and not error and not commits_running:
                     try:
                         output = event["data"].get("output", "")
                         text = output.content if hasattr(output, "content") else str(output)
@@ -381,6 +386,19 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                             # Strip the sentinel prefix, send as a dedicated error event
                             msg = text.replace("CUBE_SCHEMA_ERROR: ", "")
                             yield f"data: {json.dumps({'type': 'cube_error', 'text': msg})}\n\n"
+                    except Exception:
+                        pass
+                if name == "commit_cube_config_update" and not error:
+                    # The commit wrapper reloads Cube itself; a compile failure
+                    # comes back here (already rolled back) instead of from reload.
+                    try:
+                        parsed = json.loads(output_text)
+                        if parsed.get("compile_error"):
+                            msg = parsed["compile_error"].replace("CUBE_SCHEMA_ERROR: ", "")
+                            restored = parsed.get("restored_version")
+                            note = (f"Change rolled back to version {restored}. " if restored
+                                    else "Rollback failed — Cube may still be broken. ")
+                            yield f"data: {json.dumps({'type': 'cube_error', 'text': note + msg})}\n\n"
                     except Exception:
                         pass
                 if name == "create_chart":

@@ -2,7 +2,7 @@
 Eval runner — drive the live agent over generated cases and score it.
 
 For each case it sends the prompt to the real agent (routed exactly like
-production via pick_agent), captures the actual tool calls from the
+production), captures the actual tool calls from the
 astream_events trajectory, and grades them with grading.py:
 
   - query    : the last query_cube args vs the case's expected query
@@ -69,9 +69,9 @@ def load_cases(path: str, limit: int, templates: list[str] | None, source: str |
 async def run_case(case: dict) -> dict:
     """Send one prompt to the agent, return the tool calls it actually made."""
     from langchain_core.messages import HumanMessage
-    from graph.agent import pick_agent
+    from graph import agent as agent_mod
 
-    agent = pick_agent(case["prompt"])   # same routing as production
+    agent = agent_mod._agent   # built once in run()
     config = {"configurable": {"thread_id": uuid.uuid4().hex}, "recursion_limit": 30}
 
     queries = []           # every query_cube call's args, in order
@@ -131,7 +131,7 @@ async def _bounded(sem, coro):
 
 async def run(cases: list[dict], metadata: list[dict], concurrency: int) -> list[dict]:
     from graph.agent import build_agent
-    await build_agent()   # populates the sonnet/haiku agents pick_agent chooses from
+    await build_agent()   # the single production agent; run_case reads it back
 
     sem = asyncio.Semaphore(concurrency)
     # gather preserves order, so results line up with cases.

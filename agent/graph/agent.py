@@ -139,6 +139,9 @@ DASHBOARDS (a grid of saved graphs, each re-queried live when viewed):
 - Use list_dashboards to find dashboards by name.
 
 IMPORTANT query rules:
+- If build_query returns "_cube_unavailable", Cube is down or its schema is broken.
+  Stop: do not call any other tool to work around it. Tell the user what's wrong
+  (from the message) and, for a compile error, offer to roll back the recent change.
 - If query_cube fails, read the error carefully. Do NOT retry the same query.
   If a filter value or option is wrong, fix it and try once more; if a member is
   wrong, call build_query again with the error in `context`.
@@ -373,6 +376,17 @@ async def _fetch_cube_metadata() -> tuple[list[dict], list[dict]]:
     return [c for c in entries if not hidden(c)], [c for c in entries if hidden(c)]
 
 
+def _cube_error_text(e: Exception) -> str:
+    """Short, readable reason Cube couldn't serve /meta (compile error text when there is one)."""
+    if isinstance(e, httpx.HTTPStatusError):
+        try:
+            msg = e.response.json().get("error") or e.response.text
+        except ValueError:
+            msg = e.response.text
+        return f"Cube returned HTTP {e.response.status_code}: {str(msg)[:600]}"
+    return f"Cube is unreachable ({type(e).__name__}: {str(e)[:200]})"
+
+
 async def run_cube_query(query: dict, limit: int = 50) -> dict:
     """Run a build_query-shaped query against Cube's REST API -> {rows, sql} or {error}.
 
@@ -424,9 +438,26 @@ async def build_query(request: str, context: str = "") -> str:
         existing fields — surface that to the user instead of guessing. If it
         contains "_view_error", the request spans two separate data areas (views)
         that cannot be combined in one query — do NOT call query_cube; relay the
-        boundary to the user.
+        boundary to the user. If it contains "_cube_unavailable", Cube itself is
+        down or its schema failed to compile — stop and tell the user.
     """
-    metadata, cubes = await _fetch_cube_metadata()
+    try:
+        metadata, cubes = await _fetch_cube_metadata()
+    except (httpx.HTTPStatusError, httpx.TransportError) as e:
+        # Cube is down or can't compile its schema: no data question can be answered
+        # until that's fixed, so stop here rather than let the agent go exploring
+        # (get_cube_metadata, list_cube_configs, ...) for a workaround.
+        return json.dumps({
+            "_cube_unavailable": _cube_error_text(e),
+            "instruction": (
+                "Cube (the data layer) is not serving queries right now, so this question "
+                "cannot be answered. Do NOT call any other tool to work around it — no "
+                "get_cube_metadata, list_cube_configs or query_cube. Tell the user Cube is "
+                "unavailable and why, in plain words. If it is a schema compile error, name "
+                "the view/cube involved and say a recent config change may have caused it; "
+                "offer to check list_cube_config_versions and roll it back."
+            ),
+        })
     # build_query is sync (structured LLM call) — run off the event loop.
     # examples_fn: past requests users confirmed/corrected on the chosen view,
     # shown to the model as few-shot examples (graph/feedback.py).

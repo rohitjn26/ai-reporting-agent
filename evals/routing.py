@@ -6,7 +6,7 @@ call per case) against the live view catalog, not the whole agent. Each case in
 routing_cases.jsonl lists the views that count as correct, best first; an empty
 list means the request spans views and the router should refuse (view=null).
 
-Reports, per case kind:
+Reports, per case kind (clear, member_only, overlap_word, span):
   - pass     : the chosen view is one of `accept` (or null for span cases)
   - preferred: the chosen view is `accept[0]`
 plus which views get confused with which, so a bad description shows up by name.

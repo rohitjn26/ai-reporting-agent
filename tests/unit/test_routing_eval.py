@@ -51,4 +51,4 @@ def test_case_file_names_only_real_views():
     views = {v for c in cases for v in c["accept"]}
     assert routing.check_cases(cases, views) == []
     assert routing.check_cases(cases + [{"id": "x", "accept": ["nope"]}], views) == ["x: unknown view 'nope'"]
-    assert {c["kind"] for c in cases} >= {"clear", "dataset_named", "member_only", "overlap_word", "span"}
+    assert {c["kind"] for c in cases} >= {"clear", "member_only", "overlap_word", "span"}

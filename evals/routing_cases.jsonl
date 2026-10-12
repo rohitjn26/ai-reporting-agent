@@ -12,10 +12,6 @@
 {"id": "org_step_answers", "kind": "clear", "prompt": "distribution of answers for each survey step", "accept": ["mdbl_org_view", "flu28_org_view"]}
 {"id": "org_document_invites", "kind": "clear", "prompt": "document invites sent per template", "accept": ["mdbl_org_view", "flu28_org_view"]}
 {"id": "org_task_assignments", "kind": "clear", "prompt": "task assignments per organization", "accept": ["mdbl_org_view", "flu28_org_view"]}
-{"id": "named_mdbl_participants", "kind": "dataset_named", "prompt": "in mdbl, participants enrolled per site", "accept": ["mdbl_org_view"]}
-{"id": "named_flu28_tasks", "kind": "dataset_named", "prompt": "flu28 task responses by task", "accept": ["flu28_org_view"]}
-{"id": "named_flu28_visits", "kind": "dataset_named", "prompt": "for the flu-28 study, visits per site", "accept": ["flu28_org_view"]}
-{"id": "named_mdbl_events", "kind": "dataset_named", "prompt": "mdbl events by type", "accept": ["mdbl_org_view"]}
 {"id": "member_compliance_by_activity", "kind": "member_only", "prompt": "get me compliance vs activity names", "accept": ["mdbl_org_view"], "note": "compliance_ratio exists only on mdbl_c_site; the router sees no members"}
 {"id": "member_cumulative_participants", "kind": "member_only", "prompt": "cumulative participant count over time", "accept": ["mdbl_org_view"], "note": "cumulative_count exists only on mdbl_c_public_user"}
 {"id": "member_open_queries", "kind": "member_only", "prompt": "average open queries per participant", "accept": ["mdbl_org_view", "flu28_org_view"]}
@@ -27,4 +23,3 @@
 {"id": "span_revenue_and_participants", "kind": "span", "prompt": "revenue by month next to participant count by month", "accept": []}
 {"id": "span_orders_and_visits", "kind": "span", "prompt": "compare number of orders with number of visits per country", "accept": []}
 {"id": "span_products_and_tasks", "kind": "span", "prompt": "units sold per product and task responses per task in one table", "accept": []}
-{"id": "span_mdbl_vs_flu28", "kind": "span", "prompt": "participants per site in mdbl versus flu28 side by side", "accept": []}

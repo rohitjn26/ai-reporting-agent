@@ -18,10 +18,11 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import dataclass
+from itertools import product
 
 import duckdb
 
-from .grain import GrainResult
+from .grain import GrainResult, single_keys
 from .profile import TableProfile
 
 # thresholds
@@ -59,6 +60,14 @@ class JoinCandidate:
     chance_rate: float | None = None    # share a random value in the FK's range would hit
     chance_log10: float | None = None   # log10 P(match this good by luck); very negative = proof
     coverage: float | None = None       # share of distinct PK values the FK references
+    # a composite key joins on several columns; fk_column/pk_column are then
+    # their names joined by "+" (a label and grouping key, not a real column)
+    fk_columns: tuple[str, ...] = ()
+    pk_columns: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        self.fk_columns = tuple(self.fk_columns) or (self.fk_column,)
+        self.pk_columns = tuple(self.pk_columns) or (self.pk_column,)
 
     @property
     def proven(self) -> bool:
@@ -78,15 +87,17 @@ class JoinCandidate:
         """The accepted join in Cube shape, keyed by the target cube."""
         return {
             self.pk_table: {
-                "sql": f"${{CUBE}}.{self.fk_column} = ${{{self.pk_table}.{self.pk_column}}}",
+                "sql": join_sql(self.fk_columns, self.pk_columns, self.pk_table),
                 "relationship": self.relationship,
             }
         }
 
     def to_dict(self) -> dict:
         return {
-            "fk": {"table": self.fk_table, "column": self.fk_column},
-            "pk": {"table": self.pk_table, "column": self.pk_column},
+            "fk": {"table": self.fk_table, "column": self.fk_column,
+                   "columns": list(self.fk_columns)},
+            "pk": {"table": self.pk_table, "column": self.pk_column,
+                   "columns": list(self.pk_columns)},
             "containment": round(self.containment, 4),
             "orphan_rows": self.orphan_rows,
             "name_signal": self.name_signal,
@@ -102,6 +113,15 @@ class JoinCandidate:
             "confidence": round(self.confidence, 3),
             "join": self.cube_join,
         }
+
+
+def join_sql(fk_cols, pk_cols, target: str) -> str:
+    """Cube join SQL from the FK cube to `target`, ANDed per column for a
+    composite key. A composite key's columns aren't the target's PK member, so
+    they're referenced as raw columns (`${target}.col`)."""
+    if len(fk_cols) == 1:
+        return f"${{CUBE}}.{fk_cols[0]} = ${{{target}.{pk_cols[0]}}}"
+    return " AND ".join(f"${{CUBE}}.{f} = ${{{target}}}.{p}" for f, p in zip(fk_cols, pk_cols))
 
 
 def _round(v: float | None) -> float | None:
@@ -220,10 +240,10 @@ def discover_joins(con: duckdb.DuckDBPyConnection,
     generic = {name for name, c in name_freq.items()
                if c >= max(GENERIC_MIN_TABLES, NAME_SIGNAL_TABLE_FRACTION * n_tables)}
 
-    # PK side = single-column grain keys (the unique "one" side).
+    # PK side = every column that alone identifies a row (the unique "one"
+    # side) — not only the grain key: a FK may reference `code` instead of `id`.
     pk_columns: list[tuple[str, str]] = [
-        (g.table, g.key[0]) for g in grains.values()
-        if g.kind == "single" and g.key
+        (t, c) for t, p in profiles.items() for c in single_keys(p)
     ]
     # a table's own single-column grain key is a PK, not a FK into another table
     own_key = {g.table: g.key[0] for g in grains.values() if g.kind == "single" and g.key}
@@ -293,9 +313,78 @@ def discover_joins(con: duckdb.DuckDBPyConnection,
                 cand.confidence = _score(signal, containment, pkp.unique_ratio, cand.proven)
                 candidates.append(cand)
 
+    candidates += _composite_joins(con, profiles, grains)
     candidates = _drop_unbacked_ambiguous(candidates)
     candidates.sort(key=lambda c: c.confidence, reverse=True)
     return candidates
+
+
+def _column_name_match(fk_col: str, pk_col: str) -> bool:
+    """Same name, or a prefixed one (ship_country -> country)."""
+    fk, pk = fk_col.lower(), pk_col.lower()
+    return fk == pk or fk.endswith("_" + pk)
+
+
+def _tuple_containment(con: duckdb.DuckDBPyConnection, fk_table: str, fk_cols, pk_table: str,
+                       pk_cols) -> tuple[float, int, int]:
+    """Composite version of _containment: share of FK rows (all columns filled
+    in) whose tuple exists in the PK -> (containment, orphan rows, distinct tuples)."""
+    on = " AND ".join(f"fk.{_quote(f)} = pk.k{i}" for i, f in enumerate(fk_cols))
+    keys = ", ".join(f"{_quote(p)} AS k{i}" for i, p in enumerate(pk_cols))
+    filled = " AND ".join(f"fk.{_quote(f)} IS NOT NULL" for f in fk_cols)
+    tup = ", ".join(f"fk.{_quote(f)}" for f in fk_cols)
+    non_null, orphans, ndv = con.execute(
+        f"SELECT COUNT(*), COUNT(*) FILTER (WHERE pk.hit IS NULL), COUNT(DISTINCT ({tup})) "
+        f"FROM {_quote(fk_table)} fk "
+        f"LEFT JOIN (SELECT DISTINCT {keys}, 1 AS hit FROM {_quote(pk_table)}) pk ON {on} "
+        f"WHERE {filled}"
+    ).fetchone()
+    if not non_null:
+        return 0.0, 0, 0
+    return (non_null - orphans) / non_null, orphans, ndv
+
+
+def _composite_joins(con: duckdb.DuckDBPyConnection,
+                     profiles: dict[str, TableProfile],
+                     grains: dict[str, GrainResult]) -> list[JoinCandidate]:
+    """FKs into tables keyed by several columns (sales.country+city -> cities).
+
+    Each key column needs a same-typed column in the FK table whose name
+    matches it (a shared value like order_item_id = 1 says nothing on its own)
+    and whose values are found in it; then the whole tuple must be found.
+    """
+    out: list[JoinCandidate] = []
+    for pk_table, g in grains.items():
+        if g.kind != "composite":
+            continue
+        key = g.key
+        for fk_table, fp in profiles.items():
+            if fk_table == pk_table:
+                continue
+            options = []
+            for k in key:
+                pkp = profiles[pk_table].columns[k]
+                options.append([
+                    c for c, fkp in fp.columns.items()
+                    if fkp.family == pkp.family and _column_name_match(c, k)
+                    and _containment(con, fk_table, c, pk_table, k)[0] >= MIN_CONTAINMENT])
+            own = set(grains[fk_table].key or [])
+            for combo in product(*options):
+                # a column used twice, or the FK table's own key (a 1:1 twin table)
+                if len(set(combo)) < len(combo) or set(combo) == own:
+                    continue
+                containment, orphans, ndv = _tuple_containment(con, fk_table, combo, pk_table, key)
+                if containment < MIN_CONTAINMENT:
+                    continue
+                cand = JoinCandidate(
+                    fk_table=fk_table, fk_column="+".join(combo),
+                    pk_table=pk_table, pk_column="+".join(key),
+                    fk_columns=combo, pk_columns=tuple(key),
+                    containment=containment, orphan_rows=orphans, pk_unique=True,
+                    name_signal="exact", confidence=0.0, fk_ndv=ndv)
+                cand.confidence = _score(cand.name_signal, containment, 1.0)
+                out.append(cand)
+    return out
 
 
 def _drop_unbacked_ambiguous(candidates: list[JoinCandidate]) -> list[JoinCandidate]:

@@ -52,16 +52,20 @@ def _is_unique(con: duckdb.DuckDBPyConnection, table: str, cols: list[str]) -> b
     return distinct == non_null_rows and (total - non_null_rows) <= 0.01 * total
 
 
+def single_keys(profile: TableProfile) -> list[str]:
+    """Every column that alone identifies a row: no nulls, all values distinct.
+    Continuous measures (a unique float) are excluded — they aren't identifiers."""
+    return [c for c, p in profile.columns.items()
+            if p.nulls == 0 and p.ndv == profile.rows and profile.rows > 0
+            and not p.is_continuous]
+
+
 def detect_grain(con: duckdb.DuckDBPyConnection, profile: TableProfile) -> GrainResult:
     rows = profile.rows
     cols = profile.columns
 
     # Level 1 — single-column keys, free from the profile (confirm exact).
-    # Continuous measures (a unique float) are excluded — they aren't identifiers.
-    singles = [
-        c for c, p in cols.items()
-        if p.nulls == 0 and p.ndv == rows and rows > 0 and not p.is_continuous
-    ]
+    singles = single_keys(profile)
     if singles:
         # prefer a column literally named "id", else the first.
         key = next((c for c in singles if c.lower() == "id"), singles[0])

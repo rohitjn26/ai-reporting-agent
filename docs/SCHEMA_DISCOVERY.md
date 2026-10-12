@@ -12,7 +12,7 @@ Let a user point at raw CSVs and have an agent propose the relationships needed 
 - Output is a **draft config** the user reviews — nothing is auto-committed to Cube, and the live Cube→Postgres runtime is untouched.
 - The chain runs: profile → grain → joins → additivity → view proposals → Cube `VIEW` json.
 
-**Non-goals (v1):** measures/dimensions authoring beyond what additivity implies, composite foreign keys, loading data into Postgres, wiring to the running agent.
+**Non-goals (v1):** measures/dimensions authoring beyond what additivity implies, loading data into Postgres, wiring to the running agent.
 
 ## Pipeline overview
 
@@ -78,6 +78,8 @@ A funnel: cheap pruning kills ~99% of column pairs before any data comparison; e
 2. **Metadata pruning** (arithmetic on stats, no scan): drop disjoint min/max ranges; drop where too many FK values are missing from the PK to reach the containment bar (`1 - (ndv(FK) − ndv(PK)) / FK rows < 0.90`); a PK candidate must be near-unique.
 3. **Exact containment** on survivors — fraction of the FK's non-null values present in the PK. ~1.0 = strong FK.
 4. **Direction** falls out of uniqueness: the unique side is the "one", giving `many_to_one` for free.
+
+**Targets** are every column that alone identifies a row (no nulls, all distinct, not a float) — not only the grain key, so a FK into `code` is found as well as one into `id`. **Composite targets** (`cities` keyed by `country + city`): each key column needs a same-typed FK column with a matching name (`country`, or a prefixed `ship_country`) whose values are found in it; then the whole tuple must be found (same 0.90 / 0.98 bars). Names are required here because a low-entropy part like `order_item_id = 1` matches by chance. The Cube join is the columns ANDed; the target cube keeps its key columns as dimensions next to the `CONCAT` pk. Composite joins are never sent to the AI judge.
 
 Name similarity is a **prior, not proof**: not sufficient (matching names can be coincidental — `quantity ⊆ id`) and not necessary (real FKs break naming, e.g. `custno → customers.id`). Containment is the verdict; names rank and disambiguate.
 
@@ -223,7 +225,7 @@ Key moves: cache the loaded data; build each PK column's distinct set once and r
 ## Open questions & next
 
 - **Measures/dimensions pass** — a rules-based draft now exists (above). The next pass is where the LLM is essential: classify columns into measure types, write descriptions + synonyms, and label the ambiguous paths.
-- **Composite foreign keys** — deferred for join *matching*, but composite grain is in scope (needed for the fan-out check and bridge detection). Watch for the case where a join genuinely needs a composite FK.
+- **Composite foreign keys** — matched when every column's name lines up with the target key (see Targets above); a composite FK with unrelated names is not found.
 - **Runtime wiring** — not yet connected to live Cube; output is a draft artifact. Loading CSVs into Postgres vs a second DuckDB Cube source is a later decision.
 - **Ambiguity review UX** — how competing paths are presented and picked, and how a chosen path emits into the view draft.
 - **Grain `undetermined`** — wide low-cardinality tables that hit the k=3 cap need a clean hand-off path in the review UI.

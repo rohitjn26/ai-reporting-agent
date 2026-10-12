@@ -166,6 +166,8 @@ def judge_joins(discovery: dict, columns: list[str] | None = None, dataset: str 
     llm = llm or _default_llm(model)
     groups: dict[str, list[dict]] = {}
     for j in discovery["joins"]["uncertain"]:
+        if len(j["fk"].get("columns") or [None]) > 1:
+            continue  # the judge reads one column's profile; composite joins stay manual
         groups.setdefault(f"{j['fk']['table']}.{j['fk']['column']}", []).append(j)
     if columns is not None:
         groups = {k: v for k, v in groups.items() if k in set(columns)}

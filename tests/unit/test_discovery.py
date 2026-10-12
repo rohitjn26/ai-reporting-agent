@@ -194,6 +194,56 @@ def test_name_shared_by_only_two_tables_is_a_signal(tmp_path):
     assert _pairs(r.accepted) == {("product", "category_name", "category")}
 
 
+def test_fk_into_a_non_grain_unique_column(tmp_path):
+    # products is keyed by id, but sales reference its sku — also unique
+    _csv(tmp_path / "products.csv", ["id", "sku", "name"],
+         [[i, f"SKU-{i:04d}", f"P{i}"] for i in range(1, 31)])
+    _csv(tmp_path / "sales.csv", ["id", "sku", "qty"],
+         [[i, f"SKU-{i % 30 + 1:04d}", i % 7] for i in range(1, 201)])
+    r = run_discovery(sorted(tmp_path.glob("*.csv")))
+    assert {(j.fk_table, j.fk_column, j.pk_table, j.pk_column) for j in r.accepted} == {
+        ("sales", "sku", "products", "sku")}
+
+
+@pytest.fixture
+def cities(tmp_path):
+    """cities is keyed by country + city (Paris is in FR and US); sales carry both.
+    payments has (order_no, seq) where seq = 1 mostly — a coincidental match on
+    sales' line number must not become a composite join."""
+    places = [("FR", "Paris"), ("US", "Paris"), ("FR", "Lyon"), ("US", "Austin"),
+              ("DE", "Berlin"), ("US", "Berlin"), ("GB", "London"), ("CA", "London")]
+    _csv(tmp_path / "cities.csv", ["country", "city", "population"],
+         [[c, n, 1000 * (i % 3 + 1)] for i, (c, n) in enumerate(places)])
+    _csv(tmp_path / "sales.csv", ["order_no", "line", "country", "city", "amount"],
+         [[i // 2, i % 2 + 1, *places[i % 8], 10 + i % 5] for i in range(200)])
+    _csv(tmp_path / "payments.csv", ["order_no", "seq", "paid"],
+         [[i, 1, 5.5 + i % 4] for i in range(100)])
+    return sorted(tmp_path.glob("*.csv"))
+
+
+def test_composite_key_target_is_joined_on_both_columns(cities):
+    r = run_discovery(cities)
+    assert r.grains["cities"].kind == "composite"
+    j = next(j for j in r.accepted if j.pk_table == "cities")
+    assert (j.fk_table, j.fk_columns, j.pk_columns) == ("sales", ("country", "city"),
+                                                        ("country", "city"))
+    assert j.cube_join["cities"]["sql"] == \
+        "${CUBE}.country = ${cities}.country AND ${CUBE}.city = ${cities}.city"
+    # no coincidental composite join on a low-entropy, differently named column
+    assert not any(j.fk_table == "payments" and len(j.fk_columns) > 1
+                   for j in r.accepted + r.uncertain)
+
+
+def test_semantic_composite_join_keeps_key_columns_groupable(cities):
+    from discovery.semantic import draft_semantic_layer
+    d = draft_semantic_layer(run_discovery(cities).to_dict())
+    cubes = {c["name"]: c["data"] for c in d["cubes"]}
+    assert cubes["sales"]["joins"]["cities"]["sql"] == \
+        "${CUBE}.country = ${cities}.country AND ${CUBE}.city = ${cities}.city"
+    assert {"country", "city"} <= set(cubes["cities"]["dimensions"])
+    assert cubes["cities"]["dimensions"]["pk"]["primary_key"]
+
+
 def test_table_named_column_is_a_name_signal():
     from discovery.joins import _name_signal
     assert _name_signal("x", "c_task", "c_task", "id") == "table"

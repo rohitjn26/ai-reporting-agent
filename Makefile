@@ -1,4 +1,4 @@
-.PHONY: up down seed agent logs ps install install-dev test test-unit test-e2e db eval
+.PHONY: up down seed agent logs ps install install-dev test test-unit test-e2e db eval eval-routing
 
 # Start the full stack (postgres, cube, library, MCP servers)
 up:
@@ -64,6 +64,12 @@ eval:
 	  .venv/bin/python evals/generate.py >/dev/null && \
 	ANTHROPIC_API_KEY=$$(grep ANTHROPIC_API_KEY agent/.env | cut -d= -f2) \
 	  .venv/bin/python evals/run.py $(ARGS)
+
+# View-routing eval — only the view-picking step, one small LLM call per case.
+#   make eval-routing ARGS=--dry-run     (checks cases vs live views, no LLM)
+eval-routing:
+	ANTHROPIC_API_KEY=$$(grep ANTHROPIC_API_KEY agent/.env | cut -d= -f2) \
+	  .venv/bin/python evals/routing.py $(ARGS)
 
 # Run the web UI (activates venv automatically)
 ui:

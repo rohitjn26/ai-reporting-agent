@@ -1,0 +1,15 @@
+{"id": "metric_profit_margin", "kind": "missing_metric", "prompt": "profit margin by country", "absent": ["profit", "margin", "cost"]}
+{"id": "metric_shipping_time", "kind": "missing_metric", "prompt": "average shipping time per order", "absent": ["shipping", "shipped"]}
+{"id": "metric_churn", "kind": "missing_metric", "prompt": "customer churn rate by month", "absent": ["churn"]}
+{"id": "metric_nps", "kind": "missing_metric", "prompt": "net promoter score by site", "absent": ["promoter", "nps"]}
+{"id": "metric_adverse_events", "kind": "missing_metric", "prompt": "number of adverse events per site", "absent": ["adverse"]}
+{"id": "dim_sales_rep", "kind": "missing_dimension", "prompt": "revenue by sales rep", "absent": ["sales_rep", "salesperson", "rep_"]}
+{"id": "dim_marketing_channel", "kind": "missing_dimension", "prompt": "orders by marketing channel", "absent": ["channel", "campaign", "utm"]}
+{"id": "dim_warehouse", "kind": "missing_dimension", "prompt": "units sold by warehouse", "absent": ["warehouse"]}
+{"id": "dim_income", "kind": "missing_dimension", "prompt": "participants by income bracket", "absent": ["income", "salary"], "absent_in": ["mdbl_org_view", "flu28_org_view"], "note": "income is a revenue synonym in sales; participants have none"}
+{"id": "dim_payment_method", "kind": "missing_dimension", "prompt": "orders by payment method", "absent": ["payment"]}
+{"id": "near_city", "kind": "near_miss", "prompt": "order count by city", "absent": ["city"], "absent_in": ["sales", "discovery_orders_view", "product_sales", "discovery_order_items_view"], "note": "only site addresses (clinical) mention a city"}
+{"id": "near_state", "kind": "near_miss", "prompt": "average order value by state", "absent": ["state"], "absent_in": ["sales", "discovery_orders_view", "product_sales", "discovery_order_items_view"], "note": "account.state exists in the clinical views, a different meaning"}
+{"id": "near_gross_margin", "kind": "near_miss", "prompt": "gross margin per product category", "absent": ["margin", "cost"]}
+{"id": "forecast_revenue", "kind": "forecast", "prompt": "forecast revenue for next quarter", "absent": ["forecast", "predict"]}
+{"id": "forecast_enrollment", "kind": "forecast", "prompt": "predict how many participants will enroll next month", "absent": ["forecast", "predict"]}

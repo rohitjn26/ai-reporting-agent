@@ -1,4 +1,4 @@
-.PHONY: up down seed agent logs ps install install-dev test test-unit test-e2e db eval eval-routing
+.PHONY: up down seed agent logs ps install install-dev test test-unit test-e2e db eval eval-routing eval-refusal
 
 # Start the full stack (postgres, cube, library, MCP servers)
 up:
@@ -70,6 +70,12 @@ eval:
 eval-routing:
 	ANTHROPIC_API_KEY=$$(grep ANTHROPIC_API_KEY agent/.env | cut -d= -f2) \
 	  .venv/bin/python evals/routing.py $(ARGS)
+
+# Refusal eval — does build_query say no when the data can't answer?
+#   make eval-refusal ARGS=--dry-run     (checks cases vs live schema, no LLM)
+eval-refusal:
+	ANTHROPIC_API_KEY=$$(grep ANTHROPIC_API_KEY agent/.env | cut -d= -f2) \
+	  .venv/bin/python evals/refusal.py $(ARGS)
 
 # Run the web UI (activates venv automatically)
 ui:

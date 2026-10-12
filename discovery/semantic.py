@@ -25,7 +25,7 @@ import copy
 import re
 from collections import defaultdict
 
-from .joins import _name_signal, primary_rank
+from .joins import _name_signal, join_sql, primary_rank
 
 # Numeric columns whose SUM is meaningless — averaged instead of summed.
 NON_ADDITIVE_HINTS = ("price", "rate", "ratio", "pct", "percent", "score", "grade",
@@ -73,6 +73,9 @@ def _approved_joins(discovery: dict, joins: list[dict] | None) -> list[dict]:
     return [{
         "fk_table": j["fk"]["table"], "fk_column": j["fk"]["column"],
         "pk_table": j["pk"]["table"], "pk_column": j["pk"]["column"],
+        # several for a composite key (fk/pk_column are then "a+b" labels)
+        "fk_columns": j["fk"].get("columns") or [j["fk"]["column"]],
+        "pk_columns": j["pk"].get("columns") or [j["pk"]["column"]],
         "relationship": j.get("relationship", "many_to_one"),
         "fk_ndv": j.get("fk_ndv", 0),
         "primary": bool(j.get("primary")),
@@ -121,7 +124,7 @@ def classify_tables(discovery: dict, joins: list[dict]) -> dict[str, str]:
     outgoing: dict[str, int] = {}
     incoming: dict[str, int] = {}
     for j in joins:
-        fk_cols.setdefault(j["fk_table"], set()).add(j["fk_column"])
+        fk_cols.setdefault(j["fk_table"], set()).update(j["fk_columns"])
         outgoing[j["fk_table"]] = outgoing.get(j["fk_table"], 0) + 1
         incoming[j["pk_table"]] = incoming.get(j["pk_table"], 0) + 1
 
@@ -168,7 +171,7 @@ def _cn(ds: str | None, table: str) -> str:
 def _build_cube(table: str, prof: dict, grain: dict, role: str,
                 joins: list[dict], notes: list[str], ds: str | None = None) -> dict:
     key = grain["key"] or []
-    fk_cols = {j["fk_column"] for j in joins if j["fk_table"] == table}
+    fk_cols = {c for j in joins if j["fk_table"] == table for c in j["fk_columns"]}
     dims: dict[str, dict] = {}
     measures: dict[str, dict] = {
         "count": {"type": "count", "title": f"{_title(table)} Count",
@@ -190,8 +193,9 @@ def _build_cube(table: str, prof: dict, grain: dict, role: str,
         notes.append(f"{table}: grain undetermined — no primary key; joins into it may fan out.")
 
     for name, c in prof["columns"].items():
-        if name in key or name in fk_cols:
-            continue  # PK handled above; FKs are join plumbing, not members
+        if (name in key and len(key) == 1) or name in fk_cols:
+            continue  # PK handled above; FKs are join plumbing, not members.
+            # A composite key's own columns (country, city) stay groupable.
         fam, t = c["family"], _title(name)
         if fam == "temporal":
             dims[name] = {"sql": name, "type": "time", "title": t,
@@ -228,7 +232,7 @@ def _build_cube(table: str, prof: dict, grain: dict, role: str,
     }
     cube_joins = {
         _cn(ds, j["pk_table"]): {
-            "sql": f"${{CUBE}}.{j['fk_column']} = ${{{_cn(ds, j['pk_table'])}.{j['pk_column']}}}",
+            "sql": join_sql(j["fk_columns"], j["pk_columns"], _cn(ds, j["pk_table"])),
             "relationship": j["relationship"],
         }
         for j in joins if j["fk_table"] == table
@@ -246,9 +250,11 @@ def _cube_description(table: str, key: list[str], role: str) -> str:
 
 
 def _coverage(discovery: dict, j: dict) -> float:
-    """Share of the FK table's rows where the FK column is filled in."""
-    col = discovery["tables"][j["fk_table"]]["columns"][j["fk_column"]]
-    return (col["rows"] - col["nulls"]) / col["rows"] if col["rows"] else 0.0
+    """Share of the FK table's rows where the FK column is filled in (for a
+    composite key, its emptiest column — a lower bound)."""
+    cols = discovery["tables"][j["fk_table"]]["columns"]
+    return min((cols[c]["rows"] - cols[c]["nulls"]) / cols[c]["rows"] if cols[c]["rows"] else 0.0
+               for c in j["fk_columns"])
 
 
 def _components(tables: list[str], joins: list[dict]) -> list[list[str]]:
@@ -533,7 +539,8 @@ def _add_role_entries(plan: dict, roles: list[dict], tables: dict) -> None:
             plan["entries"].append({
                 "table": j["pk_table"], "path": h["path"] + [key], "kind": "lookup",
                 "alias": key, "host": j["fk_table"], "copy_of": j["pk_table"],
-                "role_fk": j["fk_column"], "role_pk": j["pk_column"]})
+                "role_fk": j["fk_column"], "role_fk_columns": j["fk_columns"],
+                "role_pk_columns": j["pk_columns"]})
 
 
 def _add_copy_cubes(plan: dict, cubes: dict[str, dict], ds: str | None) -> None:
@@ -555,14 +562,15 @@ def _add_copy_cubes(plan: dict, cubes: dict[str, dict], ds: str | None) -> None:
             dup["data"]["title"] = f"{title} ({_title(e['role_fk'])})"
             dup["data"]["description"] = (f"{base.get('description', '')} Joined through "
                                           f"{e['host']}.{e['role_fk']}.").strip()
-            host[name] = {"sql": f"${{CUBE}}.{e['role_fk']} = ${{{name}.{e['role_pk']}}}",
+            host[name] = {"sql": join_sql(e["role_fk_columns"], e["role_pk_columns"], name),
                           "relationship": "many_to_one"}
         else:
             dup["data"]["title"] = f"{title} (via {cubes[e['host']]['data'].get('title') or e['host']})"
             dup["data"]["description"] = (f"{base.get('description', '')} Reached from {e['host']} — "
                                           f"a copy of {orig}, since a view reaches each cube one way.").strip()
             j = host.pop(orig)
-            j["sql"] = j["sql"].replace("${" + orig + ".", "${" + name + ".")
+            j["sql"] = (j["sql"].replace("${" + orig + ".", "${" + name + ".")
+                        .replace("${" + orig + "}.", "${" + name + "}."))
             host[name] = j
         cubes[e["alias"]] = dup
 
@@ -577,8 +585,9 @@ def _add_down_joins(plan: dict, cubes: dict[str, dict], notes: list[str], ds: st
         if name in joins and joins[name]["relationship"] != "one_to_many":
             notes.append(f"{j['pk_table']} -> {child}: replaced its own join with the "
                          f"view's downward join on {child}.{j['fk_column']}.")
-        joins[name] = {"sql": f"${{CUBE}}.{j['pk_column']} = ${{{name}}}.{j['fk_column']}",
-                       "relationship": "one_to_many"}
+        on = " AND ".join(f"${{CUBE}}.{p} = ${{{name}}}.{f}"
+                          for p, f in zip(j["pk_columns"], j["fk_columns"]))
+        joins[name] = {"sql": on, "relationship": "one_to_many"}
 
 
 def draft_semantic_layer(discovery: dict, joins: list[dict] | None = None,

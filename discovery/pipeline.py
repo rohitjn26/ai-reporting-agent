@@ -28,7 +28,7 @@ class DiscoveryResult:
         """Tables whose whole grain is made of foreign-key columns = junctions."""
         fk_cols_by_table: dict[str, set[str]] = {}
         for j in self.accepted + self.uncertain:
-            fk_cols_by_table.setdefault(j.fk_table, set()).add(j.fk_column)
+            fk_cols_by_table.setdefault(j.fk_table, set()).update(j.fk_columns)
         out = []
         for t, g in self.grains.items():
             if g.key and len(g.key) >= 2 and set(g.key) <= fk_cols_by_table.get(t, set()):

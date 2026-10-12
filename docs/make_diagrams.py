@@ -91,7 +91,10 @@ class SVG:
         )
         if label:
             mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
-            self.text(mx, my + label_dy, label, size=10.5, color="#64748b")
+            if p1[0] == p2[0]:  # vertical: label beside the line, not across it
+                self.text(mx + 6, my + 4, label, size=10.5, color="#64748b", anchor="start")
+            else:
+                self.text(mx, my + label_dy, label, size=10.5, color="#64748b")
 
     def polyline(self, pts, label=None, dashed=False, color="#334155"):
         dash = ' stroke-dasharray="6 4"' if dashed else ""
@@ -146,8 +149,8 @@ class SVG:
 
 # ── Diagram 1: agent system ──────────────────────────────────────────────────
 def agent_diagram():
-    s = SVG(1200, 830, "AI Reporting Agent — System Architecture")
-    s.legend(980, 150, [
+    s = SVG(1470, 880, "AI Reporting Agent — System Architecture")
+    s.legend(1230, 60, [
         ("llm", "LLM call (red badge)"),
         ("app", "entry / UI"),
         ("tool", "tool / code"),
@@ -155,94 +158,121 @@ def agent_diagram():
         ("data", "datastore"),
     ])
 
-    s.box("user", 400, 66, 200, 44, ["User (browser)"], "app")
-    s.box("ui", 120, 150, 760, 168, [""], "app")
-    s.text(500, 170, "Agent UI — ui.py  (host :8501, FastAPI + SSE)", size=13, weight="bold", color="#5b21b6")
-    s.box("router", 150, 200, 150, 96, ["pick_agent", "keyword routing", "Haiku ↔ Sonnet"], "app")
-    s.box("haiku", 330, 196, 175, 46, ["Haiku agent", "data / chart queries"], "llm", badge="LLM")
-    s.box("sonnet", 330, 250, 175, 46, ["Sonnet agent", "config edits"], "llm", badge="LLM")
-    s.box("summ", 545, 214, 165, 66, ["History summariser", "compress old turns"], "llm", badge="LLM")
+    s.box("user", 510, 56, 200, 44, ["User (browser)"], "app")
+    s.box("ui", 50, 130, 1120, 160, [""], "app")
+    s.text(610, 152, "Agent UI — ui.py  (host :8501, FastAPI + SSE)", size=13, weight="bold", color="#5b21b6")
+    s.box("schema", 70, 180, 230, 90, ["Schema tab", "/discovery/* endpoints", "browse · run · describe"], "app")
+    s.box("agent", 330, 180, 320, 90,
+          ["ReAct agent (LangGraph)", "one model: CLAUDE_MODEL (default Haiku)",
+           "/chat · /resume · /feedback"], "llm", badge="LLM")
+    s.box("summ", 680, 180, 200, 90, ["History summariser", "compress old turns"], "llm", badge="LLM")
+    s.box("ckpt", 910, 180, 240, 90,
+          ["Checkpointer", "Postgres (CHECKPOINT_DB_URL)", "or in-memory"], "data")
+    s.box("langfuse", 1230, 220, 210, 60, ["Langfuse (cloud)", "traces, optional"], "service")
 
-    s.box("local", 120, 372, 240, 96,
-          ["Local tools", "create_chart → Chart.js", "edit_cube_config (interrupt)"], "tool")
-    s.box("cubemcp", 400, 372, 240, 96,
-          ["cube-mcp (:5001, SSE)", "get_cube_metadata", "query_cube · reload_schema"], "tool")
-    s.box("libmcp", 680, 372, 240, 96,
-          ["library-mcp (:5002, SSE)", "cube-config CRUD", "save_graph · dashboards"], "tool")
+    s.box("local", 50, 400, 250, 100,
+          ["Local tools", "create_chart → Chart.js", "edit_cube_config (form interrupt)"], "tool")
+    s.box("bq", 340, 400, 250, 100,
+          ["build_query", "route to one view → structured query", "validate vs schema · repair once"],
+          "llm", badge="LLM")
+    s.box("cubemcp", 630, 400, 250, 100,
+          ["cube-mcp (:5001, SSE)", "get_cube_metadata · reload_schema",
+           "query_cube + guard", "(only fields from build_query)"], "tool")
+    s.box("libmcp", 920, 400, 250, 100,
+          ["library-mcp (:5002, SSE)", "config CRUD · versions · rollback",
+           "save_graph · dashboards", "commit → reload → auto-rollback"], "tool")
 
-    s.box("chart", 120, 540, 240, 88,
+    s.box("chart", 50, 570, 250, 88,
           ["Chart preview", "/chart · /graph · /dashboard", "replay.py (live re-query)"], "tool")
-    s.box("cube", 400, 540, 240, 88, ["Cube.js (:4000)", "semantic layer", "builds model from Library"], "service")
-    s.box("libapi", 680, 540, 240, 88, ["Library API (:3001)", "CUBE_CONFIG / GRAPH /", "DASHBOARD store"], "service")
+    s.box("fb", 340, 570, 250, 88,
+          ["Feedback store", "ratings + corrected queries", "Postgres or SQLite"], "data")
+    s.box("cube", 630, 570, 250, 88, ["Cube.js (:4000)", "semantic layer (views)", "builds model from Library"], "service")
+    s.box("libapi", 920, 570, 250, 88,
+          ["Library API (:3001)", "versioned cube configs", "graphs · dashboards"], "service")
+    s.box("disc", 1230, 570, 210, 88,
+          ["Schema discovery", "profile → grain → joins", "+ AI descriptions"], "tool", badge="LLM")
 
-    s.box("datadb", 400, 700, 240, 72, ["Postgres data-db (:5432)", "reporting — e-commerce data"], "data")
-    s.box("libdb", 680, 700, 240, 72, ["Postgres library-db (:5433)", "library — configs & graphs"], "data")
+    s.box("datadb", 630, 730, 250, 72, ["Postgres data-db (:5432)", "reporting data (per-dataset schemas)"], "data")
+    s.box("libdb", 920, 730, 250, 72, ["Postgres library-db (:5433)", "configs · graphs · dashboards"], "data")
 
     s.arrow(s.anchor("user", "bottom"), s.anchor("ui", "top"), "prompt (SSE)")
-    s.arrow((240, 318), s.anchor("local", "top"), "tool call")
-    s.arrow((520, 318), s.anchor("cubemcp", "top"), "tool call")
-    s.arrow((800, 318), s.anchor("libmcp", "top"), "tool call")
+    for i, name in enumerate(("local", "bq", "cubemcp", "libmcp")):
+        s.arrow((s.anchor(name, "top")[0], 290), s.anchor(name, "top"), "tool call" if i == 0 else None)
+    s.arrow((1170, 250), s.anchor("langfuse", "left"), "traces", dashed=True)
     s.arrow(s.anchor("local", "bottom"), s.anchor("chart", "top"))
+    s.arrow(s.anchor("fb", "top"), s.anchor("bq", "bottom"), "few-shot examples", dashed=True)
+    s.arrow((560, 500), (660, 570))
+    s.text(622, 528, "/meta", size=10.5, color="#64748b", anchor="start")
     s.arrow(s.anchor("cubemcp", "bottom"), s.anchor("cube", "top"))
     s.arrow(s.anchor("libmcp", "bottom"), s.anchor("libapi", "top"))
     s.arrow(s.anchor("cube", "bottom"), s.anchor("datadb", "top"), "SQL")
     s.arrow(s.anchor("libapi", "bottom"), s.anchor("libdb", "top"), "SQL")
-    s.arrow(s.anchor("chart", "right"), s.anchor("cube", "left"), "live re-query", dashed=True)
-    s.arrow(s.anchor("cube", "right"), s.anchor("libapi", "left"), "reads model", dashed=True)
+    s.arrow(s.anchor("cube", "right"), s.anchor("libapi", "left"), "reads", dashed=True)
+    s.polyline([(175, 658), (175, 700), (680, 700), (680, 658)], dashed=True)
+    s.text(185, 694, "live re-query", size=10.5, color="#64748b", anchor="start")
+    s.arrow(s.anchor("disc", "left"), s.anchor("libapi", "right"), "seed.py", dashed=True)
+    s.polyline([(1335, 658), (1335, 840), (690, 840), (690, 802)], dashed=True)
+    s.text(1325, 834, "tables (publish.py)", size=10.5, color="#64748b", anchor="end")
     return s.render()
 
 
 # ── Diagram 2: eval harness ──────────────────────────────────────────────────
 def eval_diagram():
-    s = SVG(1200, 780, "Evals — Architecture  (build once · run often)")
-    s.legend(980, 92, [
+    s = SVG(1300, 760, "Evals — Architecture  (build once · run often)")
+    s.legend(1080, 74, [
         ("llm", "LLM call (red badge)"),
         ("tool", "code (no LLM)"),
         ("service", "service"),
         ("data", "cache / datastore"),
     ])
 
-    s.lane(40, 74, 900, 210, "BUILD TIME — generate the dataset  (rare: schema change / more paraphrases)")
-    s.lane(40, 320, 1120, 420, "RUN TIME — score the agent  (frequent: every prompt tweak / model swap)")
+    s.lane(40, 74, 1010, 200, "BUILD TIME — generate the dataset  (rare: schema change / more paraphrases)")
+    s.lane(40, 310, 1220, 420, "RUN TIME — score the agent  (frequent: every prompt tweak / model swap)")
 
     # build lane
-    s.box("meta1", 70, 168, 150, 60, ["Cube /meta", "live schema"], "service")
-    s.box("gen", 262, 162, 175, 72, ["generate.py", "back-translate", "title + synonym"], "tool")
-    s.box("para", 480, 162, 170, 72, ["paraphrase.py", "reword prompt", "expected = COPIED"], "llm", badge="LLM")
-    s.box("verify", 675, 162, 170, 72, ["verify.py", "independent re-derive", "drop drift"], "llm", badge="LLM")
-    s.box("cache", 862, 158, 70, 92, ["cases", ".jsonl", "CACHE"], "data")
+    s.box("meta1", 70, 146, 150, 60, ["Cube /meta", "live schema"], "service")
+    s.box("gen", 260, 140, 180, 72, ["generate.py", "back-translate", "title · synonym · filter/sort"], "tool")
+    s.box("para", 480, 140, 180, 72, ["paraphrase.py", "reword prompt", "expected = COPIED"], "llm", badge="LLM")
+    s.box("verify", 700, 140, 180, 72, ["verify.py", "independent re-derive", "drop drift"], "llm", badge="LLM")
+    s.box("cache", 920, 130, 110, 92, ["cases", ".jsonl", "CACHE"], "data")
 
-    s.arrow(s.anchor("meta1", "right"), s.anchor("gen", "left"), "no LLM")
-    s.arrow(s.anchor("gen", "right"), s.anchor("para", "left"))
-    s.arrow(s.anchor("para", "right"), s.anchor("verify", "left"))
+    s.arrow(s.anchor("meta1", "right"), s.anchor("gen", "left"))
+    s.arrow(s.anchor("gen", "right"), s.anchor("para", "left"), "opt-in")
+    s.arrow(s.anchor("para", "right"), s.anchor("verify", "left"), "opt-in")
     s.arrow(s.anchor("verify", "right"), s.anchor("cache", "left"))
-    s.text(585, 250, "Bucket A: dataset-building LLM calls — paid ONCE, frozen in cache",
+    s.text(570, 252, "Bucket A: dataset-building LLM calls — paid ONCE, frozen in cache",
            size=11, color="#b91c1c")
 
-    # run lane
-    s.box("runpy", 70, 360, 165, 64, ["run.py", "load cases (no LLM)"], "tool")
-    s.box("agent", 300, 352, 220, 92,
-          ["Agent under test", "pick_agent → tool calls", "Bucket B — every run"], "llm", badge="LLM")
-    s.box("capture", 560, 360, 175, 66, ["capture tool calls", "query_cube / chart / save"], "tool")
-    s.box("grading", 560, 470, 220, 96,
+    # run lane — main suite
+    s.box("runpy", 70, 370, 160, 84, ["run.py", "load cases (no LLM)"], "tool")
+    s.box("agent", 280, 370, 220, 84,
+          ["Agent under test", "ReAct agent + real tools", "Bucket B — every run"], "llm", badge="LLM")
+    s.box("capture", 550, 370, 190, 84, ["capture tool calls", "query_cube · create_chart", "save_graph"], "tool")
+    s.box("grading", 790, 370, 210, 84,
           ["grading.py (no LLM)", "grade_query · members_exist", "chart_type · mapping"], "tool")
-    s.box("meta2", 820, 486, 150, 60, ["Cube /meta", "for members_exist"], "service")
-    s.box("report", 820, 360, 210, 96,
-          ["Report", "pass-rate per aspect", "× template / source"], "tool")
-    s.box("judge", 300, 486, 220, 60, ["LLM judge", "semantic cases (planned)"], "llm", dashed=True, badge="LLM")
+    s.box("report", 1050, 370, 180, 84, ["Report", "pass-rate per aspect", "× template / source"], "tool")
+    s.box("meta2", 820, 500, 150, 56, ["Cube /meta", "live schema"], "service")
 
-    # cache -> runpy (routed elbow into far-left of run lane)
-    s.polyline([(897, 250), (897, 306), (152, 306), (152, 360)],
-               label="read from cache (no LLM)", )
+    s.polyline([(975, 222), (975, 292), (54, 292), (54, 412), (70, 412)])
+    s.text(560, 287, "read from cache (no LLM)", size=10.5, color="#64748b")
     s.arrow(s.anchor("runpy", "right"), s.anchor("agent", "left"), "per case")
     s.arrow(s.anchor("agent", "right"), s.anchor("capture", "left"))
-    s.arrow(s.anchor("capture", "bottom"), s.anchor("grading", "top"))
-    s.arrow(s.anchor("meta2", "top"), s.anchor("grading", "bottom"))
-    s.polyline([(780, 500), (925, 500), (925, 456)], label="scores")
-    s.arrow(s.anchor("agent", "bottom"), s.anchor("judge", "top"), dashed=True)
-    s.arrow(s.anchor("judge", "right"), s.anchor("grading", "left"), dashed=True)
-    s.text(410, 470, "Bucket B: agent LLM calls — every run (this IS the eval)",
+    s.arrow(s.anchor("capture", "right"), s.anchor("grading", "left"))
+    s.arrow(s.anchor("grading", "right"), s.anchor("report", "left"))
+    s.arrow(s.anchor("meta2", "top"), s.anchor("grading", "bottom"), "members_exist")
+    s.text(390, 476, "Bucket B: agent LLM calls — every run (this IS the eval)",
            size=11, color="#b91c1c")
+
+    # run lane — targeted suites
+    s.text(70, 596, "Targeted suites — own case files, run deliberately (live LLM)",
+           size=13, weight="bold", anchor="start", color="#475569")
+    s.box("routing", 70, 615, 280, 84,
+          ["routing.py", "select_view step only", "right view? refuses spans?"], "llm", badge="LLM")
+    s.box("refusal", 390, 615, 280, 84,
+          ["refusal.py", "build_query on unanswerable asks", "says no vs force-fits"], "llm", badge="LLM")
+    s.box("adv", 710, 615, 320, 84,
+          ["adversarial.py", "prompt injection · few-shot poisoning",
+           "write tools stubbed (sandbox)"], "llm", badge="LLM")
     return s.render()
 
 

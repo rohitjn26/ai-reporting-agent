@@ -249,8 +249,12 @@ def discover_joins(con: duckdb.DuckDBPyConnection,
                 if fkp.family in ("number", "temporal") and fkp.min is not None:
                     if fkp.min > pkp.max or fkp.max < pkp.min:
                         continue
-                # containment impossible if FK has more distinct values than PK rows
-                if fkp.ndv > pkp.ndv:
+                # each FK value missing from the PK orphans at least one row, so
+                # containment <= 1 - (ndv(FK) - ndv(PK)) / FK rows. Skip only when
+                # that ceiling is below the bar: a few orphan values are normal.
+                missing = fkp.ndv - pkp.ndv
+                fk_rows = fkp.rows - fkp.nulls
+                if missing > 0 and 1 - missing / fk_rows < MIN_CONTAINMENT:
                     continue
 
                 signal = _name_signal(fk_table, fk_col, pk_table, pk_col)

@@ -157,3 +157,30 @@ def test_summarise_carries_previous_summary_over_whole(monkeypatch):
                      + [HumanMessage(content="latest")])
     did, _, prompts = _run_summarise(msgs, monkeypatch)
     assert did and old in prompts[0]
+
+
+# ── build_query when Cube is down ─────────────────────────────────────────────
+
+import httpx  # noqa: E402
+import json  # noqa: E402
+
+
+def _build_with_meta_error(monkeypatch, exc):
+    async def boom():
+        raise exc
+    monkeypatch.setattr(agent, "_fetch_cube_metadata", boom)
+    return json.loads(asyncio.run(agent.build_query.ainvoke({"request": "compliance by site"})))
+
+
+def test_build_query_stops_on_schema_compile_error(monkeypatch):
+    req = httpx.Request("GET", "http://cube/cubejs-api/v1/meta")
+    resp = httpx.Response(500, request=req, json={"error": "Error: Compile errors:\nmdbl_org_view cube: Member 'x' is included"})
+    out = _build_with_meta_error(monkeypatch, httpx.HTTPStatusError("500", request=req, response=resp))
+    assert "HTTP 500" in out["_cube_unavailable"] and "mdbl_org_view" in out["_cube_unavailable"]
+    assert "Do NOT call any other tool" in out["instruction"]
+    assert "measures" not in out  # nothing for query_cube to run
+
+
+def test_build_query_stops_when_cube_unreachable(monkeypatch):
+    out = _build_with_meta_error(monkeypatch, httpx.ConnectError("connection refused"))
+    assert out["_cube_unavailable"].startswith("Cube is unreachable (ConnectError")

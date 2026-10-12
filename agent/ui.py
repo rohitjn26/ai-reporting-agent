@@ -357,6 +357,8 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 if name == "build_query" and not error:
                     try:
                         parsed = json.loads(output_text)
+                        if parsed.get("_cube_unavailable"):
+                            yield f"data: {json.dumps({'type': 'cube_error', 'text': parsed['_cube_unavailable']})}\n\n"
                         if not parsed.get("_view_error") and (parsed.get("measures") or parsed.get("dimensions")):
                             tin = tool_inputs.get(run_id) or event["data"].get("input") or {}
                             try:

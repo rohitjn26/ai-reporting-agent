@@ -75,7 +75,7 @@ The blow-up is in column count and key size, not rows; 10 tables = 10 independen
 A funnel: cheap pruning kills ~99% of column pairs before any data comparison; exact checks run only on survivors.
 
 1. **Candidate generation** — keep pairs with compatible type + a name signal. The name signal is **specificity-weighted (IDF-style)**: `customer_id`↔`customers.id` is strong; a generic `status` shared across 8 tables carries almost no signal.
-2. **Metadata pruning** (arithmetic on stats, no scan): drop disjoint min/max ranges; drop where `ndv(FK) > ndv(PK)` (containment impossible); a PK candidate must be near-unique.
+2. **Metadata pruning** (arithmetic on stats, no scan): drop disjoint min/max ranges; drop where too many FK values are missing from the PK to reach the containment bar (`1 - (ndv(FK) − ndv(PK)) / FK rows < 0.90`); a PK candidate must be near-unique.
 3. **Exact containment** on survivors — fraction of the FK's non-null values present in the PK. ~1.0 = strong FK.
 4. **Direction** falls out of uniqueness: the unique side is the "one", giving `many_to_one` for free.
 

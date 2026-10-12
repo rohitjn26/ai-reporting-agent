@@ -29,6 +29,9 @@ MIN_CONTAINMENT = 0.90     # FK values that must exist in the PK to be a candida
 ACCEPT_CONTAINMENT = 0.98  # ...and to be accepted without review
 HIGH_ENTROPY_MIN_LEN = 16  # string keys this long (ObjectIds, UUIDs) can't match by chance
 NAME_SIGNAL_TABLE_FRACTION = 0.5  # a col name in >= this fraction of tables is generic
+# ...and in at least this many: an exact match always spans 2 tables, so a name
+# shared by just those 2 is the clearest pairing, never generic
+GENERIC_MIN_TABLES = 3
 MIN_FK_NDV_NO_SIGNAL = 10  # below this, a no-name-signal match is a coincidence (e.g. quantity)
 # Hole check: a match counts as proven when luck alone would produce it with
 # probability below 10^PROOF_LOG10 (one in a million). A significance level,
@@ -215,7 +218,7 @@ def discover_joins(con: duckdb.DuckDBPyConnection,
     name_freq = _column_name_frequency(profiles)
     n_tables = len(profiles)
     generic = {name for name, c in name_freq.items()
-               if c >= max(2, NAME_SIGNAL_TABLE_FRACTION * n_tables)}
+               if c >= max(GENERIC_MIN_TABLES, NAME_SIGNAL_TABLE_FRACTION * n_tables)}
 
     # PK side = single-column grain keys (the unique "one" side).
     pk_columns: list[tuple[str, str]] = [
@@ -249,8 +252,12 @@ def discover_joins(con: duckdb.DuckDBPyConnection,
                 if fkp.family in ("number", "temporal") and fkp.min is not None:
                     if fkp.min > pkp.max or fkp.max < pkp.min:
                         continue
-                # containment impossible if FK has more distinct values than PK rows
-                if fkp.ndv > pkp.ndv:
+                # each FK value missing from the PK orphans at least one row, so
+                # containment <= 1 - (ndv(FK) - ndv(PK)) / FK rows. Skip only when
+                # that ceiling is below the bar: a few orphan values are normal.
+                missing = fkp.ndv - pkp.ndv
+                fk_rows = fkp.rows - fkp.nulls
+                if missing > 0 and 1 - missing / fk_rows < MIN_CONTAINMENT:
                     continue
 
                 signal = _name_signal(fk_table, fk_col, pk_table, pk_col)

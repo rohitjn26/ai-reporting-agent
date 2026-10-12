@@ -169,6 +169,31 @@ def test_low_entropy_key_needs_a_name(tmp_path):
     assert _pairs(r.uncertain) == {("sale", "shelf", "store")}
 
 
+def test_fk_with_a_few_orphan_values_is_still_found(tmp_path):
+    # products reference 12 categories, the lookup has only 10: two orphan
+    # values on 2 of 300 rows. More FK distincts than PK rows must not rule it out.
+    cats = [f"cat_{i}" for i in range(12)]
+    _csv(tmp_path / "category.csv", ["category_name", "english"],
+         [[c, f"en_{c}"] for c in cats[:10]])
+    rows = [[f"p{i}", cats[i % 10]] for i in range(298)] + [["p298", cats[10]], ["p299", cats[11]]]
+    _csv(tmp_path / "product.csv", ["product_id", "category_name"], rows)
+    # unrelated tables, so a name shared by 2 tables isn't "generic" (>= half of them)
+    for t in ("seller", "review", "payment"):
+        _csv(tmp_path / f"{t}.csv", [f"{t}_id", "note"], [[f"{t}{i}", "x"] for i in range(5)])
+    r = run_discovery(sorted(tmp_path.glob("*.csv")))
+    assert _pairs(r.accepted) == {("product", "category_name", "category")}
+
+
+def test_name_shared_by_only_two_tables_is_a_signal(tmp_path):
+    # in a 2-table upload the shared name is the pairing itself, not a generic word
+    cats = [f"cat_{i}" for i in range(10)]
+    _csv(tmp_path / "category.csv", ["category_name", "english"], [[c, f"en_{c}"] for c in cats])
+    _csv(tmp_path / "product.csv", ["product_id", "category_name"],
+         [[f"p{i}", cats[i % 10]] for i in range(300)])
+    r = run_discovery(sorted(tmp_path.glob("*.csv")))
+    assert _pairs(r.accepted) == {("product", "category_name", "category")}
+
+
 def test_table_named_column_is_a_name_signal():
     from discovery.joins import _name_signal
     assert _name_signal("x", "c_task", "c_task", "id") == "table"

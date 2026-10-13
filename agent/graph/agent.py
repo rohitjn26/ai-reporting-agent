@@ -8,6 +8,7 @@ from typing import Annotated
 import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import InjectedState, create_react_agent
@@ -425,7 +426,7 @@ async def run_cube_query(query: dict, limit: int = 50) -> dict:
 
 
 @tool
-async def build_query(request: str, context: str = "") -> str:
+async def build_query(request: str, config: RunnableConfig, context: str = "") -> str:
     """
     Translate a natural-language data request into a validated Cube query.
 
@@ -471,7 +472,7 @@ async def build_query(request: str, context: str = "") -> str:
     # shown to the model as few-shot examples (graph/feedback.py).
     query = await asyncio.to_thread(qb.build_query, request, metadata,
                                     context=context or None, cubes=cubes,
-                                    examples_fn=feedback.examples_for)
+                                    examples_fn=feedback.examples_for, config=config)
     if isinstance(query, dict) and query.get("_view_error"):
         # A single query can't span two views. Stop the tool chain here and hand the
         # boundary back to the model to explain — don't let it fall through to query_cube.

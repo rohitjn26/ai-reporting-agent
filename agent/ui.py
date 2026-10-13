@@ -25,7 +25,7 @@ import uvicorn
 
 from graph.agent import (build_agent, maybe_summarise, close_checkpointer, MODEL_LABEL,
                          _fetch_cube_metadata, run_cube_query)
-from graph import feedback, tracing
+from graph import feedback, pricing, tracing
 from graph import query_builder as qb
 import chart.server as _chart_server
 
@@ -276,6 +276,14 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
     commits_running: set = set()  # commit runs in flight — their inner reload reports via the commit
     trace_id = None
     pending_direct = None
+    # Dollars for this request: every LLM call's usage (agent loop + build_query's
+    # inner calls), shown under the reply when it ends. `actions` labels what the
+    # request did (saved a graph, ...) so the cost line can say what it paid for.
+    cost = pricing.RequestCost()
+    actions: list[str] = []
+
+    def cost_event() -> str:
+        return f"data: {json.dumps(cost.as_event(actions))}\n\n"
 
     async def flush_query():
         """Emit the query card (direct queries only) and SQL for the last query run."""
@@ -314,6 +322,13 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                     )
                 if content:
                     yield f"data: {json.dumps({'type': 'token', 'text': content})}\n\n"
+
+            elif kind == "on_chat_model_end":
+                out = event["data"].get("output")
+                meta = getattr(out, "response_metadata", None) or {}
+                cost.add(meta.get("model") or meta.get("model_name")
+                         or (event.get("metadata") or {}).get("ls_model_name", ""),
+                         getattr(out, "usage_metadata", None))
 
             elif kind == "on_tool_start":
                 run_id = event.get("run_id", "")
@@ -403,6 +418,13 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                             yield f"data: {json.dumps({'type': 'cube_error', 'text': note + msg})}\n\n"
                     except Exception:
                         pass
+                if not error and name in _COSTED_ACTIONS:
+                    try:
+                        ok = not json.loads(output_text).get("error")
+                    except Exception:
+                        ok = "error" not in output_text[:200].lower()
+                    if ok:
+                        actions.append(_COSTED_ACTIONS[name])
                 if name == "create_chart":
                     # Show the query/SQL behind the final visualization (if any).
                     async for ev in flush_query():
@@ -444,6 +466,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 yield chunk
             return
         yield f"data: {json.dumps({'type': 'error', 'text': err_text})}\n\n"
+        yield cost_event()
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
         return
 
@@ -460,6 +483,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 # Pass all interrupt fields through to the frontend
                 payload = {"type": "interrupt", **iv}
                 yield f"data: {json.dumps(payload)}\n\n"
+                yield cost_event()
                 yield f"data: {json.dumps({'type': 'interrupted'})}\n\n"
                 return
     except Exception:
@@ -473,7 +497,17 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
     except Exception:
         pass
 
+    yield cost_event()
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
+# Tools whose success is worth naming on the cost line ("graph saved · $0.04").
+_COSTED_ACTIONS = {
+    "save_graph": "graph saved",
+    "create_dashboard": "dashboard saved",
+    "create_chart": "chart",
+    "commit_cube_config_update": "config committed",
+}
 
 
 @app.get("/chat")
@@ -684,6 +718,17 @@ _HTML = """<!DOCTYPE html>
       flex-shrink: 0;
     }
     header h1 { font-size: 1rem; font-weight: 600; color: #f1f5f9; }
+    .session-cost {
+      margin-left: auto; font-size: 0.75rem; color: #94a3b8; font-variant-numeric: tabular-nums;
+      background: #0f172a; border: 1px solid #334155; border-radius: 999px; padding: 3px 10px;
+    }
+    .session-cost + .stack-info { margin-left: 12px; }
+    .cost-line {
+      font-size: 0.72rem; color: #64748b; font-variant-numeric: tabular-nums;
+      display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center;
+    }
+    .cost-line .cost-usd { color: #fbbf24; font-weight: 600; }
+    .cost-line .cost-act { color: #4ade80; }
     header .dot {
       width: 8px; height: 8px; border-radius: 50%; background: #22c55e;
       animation: pulse 2s infinite;
@@ -1487,6 +1532,7 @@ _HTML = """<!DOCTYPE html>
     <button id="tab-schema" onclick="switchTab('schema')">Schema</button>
     <button id="tab-draft" onclick="switchTab('draft')">Semantic layer</button>
   </nav>
+  <span id="session-cost" class="session-cost" title="LLM spend in this browser session">$0.000 this session</span>
   <span class="stack-info">
     <a href="http://localhost:4000" target="_blank">Cube Playground</a> &nbsp;·&nbsp;
     <a href="http://localhost:3001/docs" target="_blank">Library API</a>
@@ -2536,6 +2582,38 @@ _HTML = """<!DOCTYPE html>
     return html;
   }
 
+  // ── what each request cost (from the LLM calls' token usage) ───────────────
+  let sessionDollars = 0, sessionRequests = 0;
+  const kTok = (n) => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
+
+  function showCost(d) {
+    if (!d.calls) return;
+    sessionDollars += d.dollars;
+    sessionRequests += 1;
+    const sc = document.getElementById('session-cost');
+    if (sc) sc.textContent = '$' + sessionDollars.toFixed(3) + ' this session · ' +
+                             sessionRequests + (sessionRequests === 1 ? ' request' : ' requests');
+    const cached = d.input_tokens ? Math.round(100 * d.cache_read / d.input_tokens) : 0;
+    const wrap = document.createElement('div');
+    wrap.className = 'msg agent';
+    const line = document.createElement('div');
+    line.className = 'cost-line';
+    line.title = d.calls + ' LLM calls · ' + d.input_tokens.toLocaleString() + ' input tokens (' +
+      d.cache_read.toLocaleString() + ' from cache) · ' + d.output_tokens.toLocaleString() +
+      ' output tokens · largest single call ' + d.max_context.toLocaleString() + ' tokens' +
+      (d.unpriced.length ? ' · no price for ' + d.unpriced.join(', ') : '');
+    line.innerHTML =
+      '<span class="cost-usd">$' + d.dollars.toFixed(d.dollars < 0.01 ? 4 : 3) +
+      (d.unpriced.length ? '+' : '') + '</span>' +
+      d.actions.map(a => '<span class="cost-act">' + escapeHtml(a) + '</span>').join('') +
+      '<span>' + d.calls + ' LLM ' + (d.calls === 1 ? 'call' : 'calls') + '</span>' +
+      '<span>' + kTok(d.input_tokens) + ' in (' + cached + '% cached) · ' + kTok(d.output_tokens) + ' out</span>' +
+      '<span>peak context ' + kTok(d.max_context) + '</span>';
+    wrap.appendChild(line);
+    messagesEl.appendChild(wrap);
+    scrollBottom();
+  }
+
   // ── core SSE handler — shared by /chat and /resume ─────────────────────────
   function handleStream(es, typingEl) {
     let agentBubble = null;
@@ -2668,6 +2746,10 @@ _HTML = """<!DOCTYPE html>
         } else {
           showInterruptCard(d.question || '', d.options || [], onAnswer);
         }
+
+      } else if (d.type === 'cost') {
+        finalizeAgentText();
+        showCost(d);
 
       } else if (d.type === 'interrupted') {
         // stream closed naturally at interrupt — nothing more to do here

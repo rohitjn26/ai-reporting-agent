@@ -706,6 +706,7 @@ _HTML = """<!DOCTYPE html>
     #chat-panel {
       width: 420px;
       flex-shrink: 0;
+      transition: width .15s ease;
       display: flex;
       flex-direction: column;
       border-right: 1px solid #334155;
@@ -902,40 +903,68 @@ _HTML = """<!DOCTYPE html>
     .fb-done { font-size: 0.72rem; color: #4ade80; }
     .fb-err { font-size: 0.72rem; color: #f59e0b; }
     .fb-err ul { margin: 4px 0 0 16px; }
+    .query-plan.fb-open { max-width: 100%; width: 100%; box-sizing: border-box; }
+    /* the fix editor needs room: widen the chat column while one is open */
+    #chat-panel.fb-wide { width: min(760px, 62vw); }
     .fb-panel {
-      display: flex; flex-direction: column; gap: 8px;
-      border-top: 1px solid #21262d; padding-top: 8px;
+      display: flex; flex-direction: column; gap: 14px;
+      border-top: 1px solid #21262d; padding-top: 12px;
     }
-    .fb-title { font-size: 0.72rem; color: #cbd5e1; font-weight: 600; }
-    .fb-tags { display: flex; flex-wrap: wrap; gap: 4px; }
+    .fb-section { display: flex; flex-direction: column; gap: 8px; }
+    .fb-panel .qp-row { align-items: flex-start; }
+    .fb-panel .qp-label { font-size: 0.76rem; min-width: 84px; padding-top: 5px; }
+    .fb-panel .qp-chips { gap: 6px; align-items: center; flex: 1; min-width: 0; }
+    .fb-panel .qp-chip { font-size: 0.76rem; padding: 4px 10px; display: inline-flex; align-items: center; gap: 4px; }
+    .fb-title { font-size: 0.8rem; color: #cbd5e1; font-weight: 600; }
+    .fb-panel .fb-hint { font-size: 0.74rem; font-weight: normal; }
+    .fb-tags { display: flex; flex-wrap: wrap; gap: 6px; }
     .fb-tag {
       background: #161b22; border: 1px solid #30363d; color: #94a3b8;
-      border-radius: 12px; padding: 2px 10px; font-size: 0.7rem; cursor: pointer;
+      border-radius: 12px; padding: 4px 12px; font-size: 0.74rem; cursor: pointer;
     }
     .fb-tag.on { background: #3b0764; border-color: #a855f7; color: #e9d5ff; }
     .fb-x {
       background: none; border: none; color: inherit; opacity: .6;
-      margin-left: 4px; cursor: pointer; font-size: 0.8rem; padding: 0;
+      margin-left: 2px; cursor: pointer; font-size: 0.9rem; padding: 0 2px; line-height: 1;
     }
     .fb-x:hover { opacity: 1; }
     .fb-add, .fb-mini {
       background: #0d1117; border: 1px dashed #30363d; color: #94a3b8;
-      border-radius: 6px; font-size: 0.7rem; padding: 2px 4px; max-width: 220px;
+      border-radius: 6px; font-size: 0.74rem; padding: 4px 8px; max-width: 260px; cursor: pointer;
     }
-    .fb-vals { width: 150px; border-style: solid; }
-    .fb-filter-add { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    .fb-add:hover { border-color: #6366f1; color: #cbd5e1; }
+    .fb-mini { border-style: solid; }
+    .fb-vals { flex: 1; min-width: 160px; max-width: none; cursor: text; }
+    .fb-filter-add { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; width: 100%; }
+    .fb-pop {
+      margin-left: 92px; background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+      padding: 8px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .fb-search {
+      background: #0d1117; border: 1px solid #6366f1; color: #e2e8f0; border-radius: 6px;
+      font: inherit; font-size: 0.78rem; padding: 6px 8px; outline: none;
+    }
+    .fb-list { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; }
+    .fb-opt {
+      background: none; border: none; text-align: left; cursor: pointer; color: #e2e8f0;
+      padding: 5px 8px; border-radius: 4px; font-size: 0.78rem;
+      display: flex; justify-content: space-between; gap: 12px;
+    }
+    .fb-opt:hover, .fb-opt.hi { background: #1e293b; }
+    .fb-opt small { color: #64748b; font-family: ui-monospace, monospace; font-size: 0.7rem; }
+    .fb-empty { font-size: 0.74rem; color: #64748b; padding: 4px 8px; }
     .fb-note {
       background: #0d1117; border: 1px solid #30363d; color: #e2e8f0; border-radius: 6px;
-      font: inherit; font-size: 0.75rem; padding: 6px 8px; min-height: 40px; resize: vertical;
+      font: inherit; font-size: 0.78rem; padding: 8px 10px; min-height: 56px; resize: vertical;
     }
-    .fb-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .fb-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
     .fb-mini-btn {
       background: #161b22; border: 1px solid #30363d; color: #cbd5e1;
-      border-radius: 6px; font-size: 0.7rem; padding: 3px 10px; cursor: pointer;
+      border-radius: 6px; font-size: 0.76rem; padding: 5px 12px; cursor: pointer;
     }
     .fb-primary {
       background: #4f46e5; border: 1px solid #6366f1; color: #fff;
-      border-radius: 6px; font-size: 0.7rem; padding: 3px 12px; cursor: pointer;
+      border-radius: 6px; font-size: 0.76rem; padding: 5px 14px; cursor: pointer;
     }
     .fb-primary:disabled { opacity: .5; cursor: default; }
     .fb-table-wrap { overflow-x: auto; max-height: 220px; overflow-y: auto; }
@@ -2142,12 +2171,20 @@ _HTML = """<!DOCTYPE html>
   const FB_GRANS = ['', 'day', 'week', 'month', 'quarter', 'year'];
   const FB_OPS = ['equals', 'notEquals', 'contains', 'notContains', 'gt', 'gte', 'lt', 'lte', 'set', 'notSet'];
 
+  function setFixOpen(card, open) {
+    card.classList.toggle('fb-open', open);
+    document.getElementById('chat-panel').classList.toggle('fb-wide', !!document.querySelector('.query-plan.fb-open'));
+  }
+
   async function openFixPanel(card, bar, traceId) {
     const panel = document.createElement('div');
     panel.className = 'fb-panel';
     panel.innerHTML = '<span class="fb-q">Loading…</span>';
     bar.replaceWith(panel);
-    scrollBottom();
+    setFixOpen(card, true);
+    // edits must never yank the chat to the latest message — only nudge the panel into view
+    const keepInView = (el) => el && el.scrollIntoView({ block: 'nearest' });
+    keepInView(panel);
 
     let info;
     try {
@@ -2180,29 +2217,72 @@ _HTML = """<!DOCTYPE html>
     }
     const isChanged = () => JSON.stringify(cleaned()) !== JSON.stringify(original);
 
-    const opts = (list, chosen) => list.filter(m => !chosen.includes(m.name))
-      .map(m => '<option value="' + escapeHtml(m.name) + '">' + escapeHtml(m.title) +
-                ' (' + escapeHtml(m.name) + ')</option>').join('');
+    const attr = (v) => escapeHtml(String(v)).replace(/"/g, '&quot;');
     const x = (attrs) => '<button class="fb-x" ' + attrs + ' title="Remove">&times;</button>';
+    const filterDraft = { member: '', op: 'equals', values: '' };
+    let openPick = null;   // key of the picker currently open, if any
 
-    function memberRow(label, key, list, cls) {
+    // members a picker offers: everything not already chosen for that slot
+    function pickList(key) {
+      if (key === 'measures') return M.measures.filter(m => !q.measures.includes(m.name));
+      if (key === 'dimensions') return M.dimensions.filter(m => !q.dimensions.includes(m.name));
+      if (key === 'time_dimensions') {
+        const used = q.time_dimensions.map(td => td.dimension);
+        return timeDims.filter(m => !used.includes(m.name));
+      }
+      return allMembers;   // filter member
+    }
+    const pickBtn = (key, label) =>
+      '<button class="fb-add" data-pick="' + key + '">' + escapeHtml(label) + '</button>';
+
+    function pickerHtml(key) {
+      return '<div class="fb-pop" data-pop="' + key + '">' +
+        '<input class="fb-search" type="search" placeholder="Search by name or title…" autocomplete="off"/>' +
+        '<div class="fb-list"></div></div>';
+    }
+
+    // fill the open picker's list, keeping only members that match every search word
+    function fillPicker(term) {
+      const pop = panel.querySelector('.fb-pop');
+      if (!pop) return;
+      const words = term.toLowerCase().split(' ').filter(Boolean);
+      const hits = pickList(pop.dataset.pop).filter(m => {
+        const hay = (m.title + ' ' + m.name).toLowerCase();
+        return words.every(w => hay.includes(w));
+      });
+      pop.querySelector('.fb-list').innerHTML = hits.length
+        ? hits.map((m, i) => '<button class="fb-opt' + (i ? '' : ' hi') + '" data-opt="' + attr(m.name) + '">' +
+            '<span>' + escapeHtml(m.title) + '</span><small>' + escapeHtml(m.name) + '</small></button>').join('')
+        : '<div class="fb-empty">No members match.</div>';
+    }
+
+    function choose(key, name) {
+      openPick = null;
+      if (key === 'filter') filterDraft.member = name;
+      else if (key === 'time_dimensions') q.time_dimensions.push({ dimension: name, granularity: 'month' });
+      else q[key].push(name);
+      render();
+    }
+
+    function row(label, inner, key) {
+      return '<div class="qp-row"><span class="qp-label">' + label + '</span><div class="qp-chips">' + inner +
+             '</div></div>' + (openPick === key ? pickerHtml(key) : '');
+    }
+
+    function memberRow(label, key, cls) {
       const chips = q[key].map((m, i) =>
         '<span class="qp-chip ' + cls + '">' + escapeHtml(m) + x('data-rm="' + key + '" data-i="' + i + '"') + '</span>').join('');
-      return '<div class="qp-row"><span class="qp-label">' + label + '</span><div class="qp-chips">' + chips +
-             '<select class="fb-add" data-add="' + key + '"><option value="">+ add</option>' +
-             opts(list, q[key]) + '</select></div></div>';
+      return row(label, chips + pickBtn(key, '+ add'), key);
     }
 
     function timeRow() {
-      const rows = q.time_dimensions.map((td, i) =>
+      const chips = q.time_dimensions.map((td, i) =>
         '<span class="qp-chip qp-dimension">' + escapeHtml(td.dimension) +
         ' <select class="fb-mini" data-gran="' + i + '">' +
         FB_GRANS.map(g => '<option value="' + g + '"' + ((td.granularity || '') === g ? ' selected' : '') + '>' +
                          (g || 'no grain') + '</option>').join('') + '</select>' +
         x('data-rm="time_dimensions" data-i="' + i + '"') + '</span>').join('');
-      const add = timeDims.length ? '<select class="fb-add" data-add="time_dimensions"><option value="">+ add</option>' +
-        opts(timeDims, q.time_dimensions.map(td => td.dimension)) + '</select>' : '';
-      return '<div class="qp-row"><span class="qp-label">Time</span><div class="qp-chips">' + rows + add + '</div></div>';
+      return row('Time', chips + (timeDims.length ? pickBtn('time_dimensions', '+ add') : ''), 'time_dimensions');
     }
 
     function filterRow() {
@@ -2210,25 +2290,28 @@ _HTML = """<!DOCTYPE html>
         '<span class="qp-chip qp-filter">' +
         escapeHtml([f.member, f.operator, (f.values || []).join(', ')].filter(Boolean).join(' ')) +
         x('data-rm="filters" data-i="' + i + '"') + '</span>').join('');
-      return '<div class="qp-row"><span class="qp-label">Filters</span><div class="qp-chips">' + chips +
-        '<span class="fb-filter-add">' +
-        '<select class="fb-mini" data-f="member"><option value="">member…</option>' + opts(allMembers, []) + '</select>' +
-        '<select class="fb-mini" data-f="op">' + FB_OPS.map(o => '<option>' + o + '</option>').join('') + '</select>' +
-        '<input class="fb-mini fb-vals" data-f="values" placeholder="values, comma-separated"/>' +
-        '<button class="fb-mini-btn" data-act="add-filter">add</button></span></div></div>';
+      const noVals = filterDraft.op === 'set' || filterDraft.op === 'notSet';
+      const draft = '<span class="fb-filter-add">' +
+        pickBtn('filter', filterDraft.member || 'member…') +
+        '<select class="fb-mini" data-f="op">' + FB_OPS.map(o =>
+          '<option' + (o === filterDraft.op ? ' selected' : '') + '>' + o + '</option>').join('') + '</select>' +
+        (noVals ? '' : '<input class="fb-mini fb-vals" data-f="values" placeholder="values, comma-separated" value="' +
+                       attr(filterDraft.values) + '"/>') +
+        '<button class="fb-mini-btn" data-act="add-filter"' + (filterDraft.member ? '' : ' disabled') + '>add filter</button></span>';
+      return row('Filters', chips + draft, 'filter');
     }
 
     function render() {
       panel.innerHTML =
-        '<div class="fb-title">What was wrong?</div>' +
+        '<div class="fb-section"><div class="fb-title">What was wrong?</div>' +
         '<div class="fb-tags">' + info.tags.map(tg =>
           '<button class="fb-tag' + (tags.has(tg) ? ' on' : '') + '" data-tag="' + tg + '">' +
-          tg.split('_').join(' ') + '</button>').join('') + '</div>' +
-        '<div class="fb-title">Fix the query <span class="fb-hint">— optional, but a correction teaches the agent the most' +
+          tg.split('_').join(' ') + '</button>').join('') + '</div></div>' +
+        '<div class="fb-section"><div class="fb-title">Fix the query <span class="fb-hint">— optional, but a correction teaches the agent the most' +
         (t.view ? ' · view <b>' + escapeHtml(t.view) + '</b>' : '') + '</span></div>' +
-        memberRow('Measures', 'measures', M.measures, 'qp-measure') +
-        memberRow('Dimensions', 'dimensions', M.dimensions, 'qp-dimension') +
-        timeRow() + filterRow() +
+        memberRow('Measures', 'measures', 'qp-measure') +
+        memberRow('Dimensions', 'dimensions', 'qp-dimension') +
+        timeRow() + filterRow() + '</div>' +
         '<textarea class="fb-note" placeholder="Note (optional)"></textarea>' +
         '<div class="fb-actions">' +
         '<button class="fb-mini-btn" data-act="run">&#9654; Run corrected query</button>' +
@@ -2237,6 +2320,8 @@ _HTML = """<!DOCTYPE html>
         (isChanged() ? '<span class="fb-hint">query edited</span>' : '') + '</div>' +
         '<div class="fb-result"></div>';
       panel.querySelector('.fb-note').value = note;
+      const search = panel.querySelector('.fb-search');
+      if (search) { fillPicker(''); search.focus({ preventScroll: true }); keepInView(panel.querySelector('.fb-pop')); }
     }
 
     const result = () => panel.querySelector('.fb-result');
@@ -2252,16 +2337,30 @@ _HTML = """<!DOCTYPE html>
         (rows.length > 10 ? '<div class="fb-hint">first 10 of ' + rows.length + ' rows</div>' : '');
     }
 
-    panel.addEventListener('input', (e) => { if (e.target.classList.contains('fb-note')) note = e.target.value; });
+    panel.addEventListener('input', (e) => {
+      const el = e.target;
+      if (el.classList.contains('fb-note')) note = el.value;
+      else if (el.classList.contains('fb-search')) fillPicker(el.value);
+      else if (el.dataset.f === 'values') filterDraft.values = el.value;
+    });
+
+    panel.addEventListener('keydown', (e) => {
+      if (!e.target.classList.contains('fb-search')) return;
+      if (e.key === 'Escape') { openPick = null; render(); }
+      else if (e.key === 'Enter') {
+        e.preventDefault();
+        const first = panel.querySelector('.fb-opt');
+        if (first) choose(openPick, first.dataset.opt);
+      }
+    });
 
     panel.addEventListener('change', (e) => {
       const el = e.target;
-      if (el.dataset.add && el.value) {
-        if (el.dataset.add === 'time_dimensions') q.time_dimensions.push({ dimension: el.value, granularity: 'month' });
-        else q[el.dataset.add].push(el.value);
-        render();
-      } else if (el.dataset.gran !== undefined) {
+      if (el.dataset.gran !== undefined) {
         q.time_dimensions[+el.dataset.gran].granularity = el.value || undefined;
+        render();
+      } else if (el.dataset.f === 'op') {
+        filterDraft.op = el.value;
         render();
       }
     });
@@ -2269,45 +2368,50 @@ _HTML = """<!DOCTYPE html>
     panel.addEventListener('click', async (e) => {
       const el = e.target.closest('button');
       if (!el) return;
-      if (el.dataset.tag) {
+      if (el.dataset.pick) {
+        openPick = openPick === el.dataset.pick ? null : el.dataset.pick;
+        render();
+      } else if (el.dataset.opt) {
+        choose(openPick, el.dataset.opt);
+      } else if (el.dataset.tag) {
         tags.has(el.dataset.tag) ? tags.delete(el.dataset.tag) : tags.add(el.dataset.tag);
         el.classList.toggle('on');
       } else if (el.dataset.rm) {
         q[el.dataset.rm].splice(+el.dataset.i, 1);
         render();
       } else if (el.dataset.act === 'add-filter') {
-        const get = (f) => panel.querySelector('[data-f=' + f + ']').value;
-        const member = get('member'), op = get('op');
-        if (!member) return;
-        const f = { member: member, operator: op };
-        if (op !== 'set' && op !== 'notSet')
-          f.values = get('values').split(',').map(s => s.trim()).filter(Boolean);
+        if (!filterDraft.member) return;
+        const f = { member: filterDraft.member, operator: filterDraft.op };
+        if (filterDraft.op !== 'set' && filterDraft.op !== 'notSet')
+          f.values = filterDraft.values.split(',').map(v => v.trim()).filter(Boolean);
         q.filters.push(f);
+        Object.assign(filterDraft, { member: '', op: 'equals', values: '' });
         render();
       } else if (el.dataset.act === 'run') {
         result().innerHTML = '<span class="fb-q">Running…</span>';
         const r = await postJson('/feedback/preview', { trace_id: traceId, query: cleaned() });
         if (r.problems || r.error) result().innerHTML = fbError(r); else showRows(r);
+        keepInView(result());
       } else if (el.dataset.act === 'save') {
         el.disabled = true;
         const body = { trace_id: traceId, verdict: 'down', tags: [...tags], note: note };
         if (isChanged()) body.corrected_query = cleaned();
         const r = await postJson('/feedback', body);
         if (r.ok) {
+          setFixOpen(card, false);
           panel.innerHTML = '<span class="fb-done">&#10003; Thanks — ' +
             (body.corrected_query ? 'correction saved; the agent will use it for similar requests'
                                   : 'feedback saved') +
             (r.status === 'pending' ? ' (after review)' : '') + '</span>';
-        } else { el.disabled = false; result().innerHTML = fbError(r); }
+        } else { el.disabled = false; result().innerHTML = fbError(r); keepInView(result()); }
       } else if (el.dataset.act === 'cancel') {
+        setFixOpen(card, false);
         panel.remove();
         attachFeedback(card, traceId);
       }
-      scrollBottom();
     });
 
     render();
-    scrollBottom();
   }
 
   function showConfigPreview(current, proposed) {

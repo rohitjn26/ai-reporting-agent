@@ -1,7 +1,8 @@
 """
 LangGraph ReAct agent wired to MCP tool servers + local chart/config tools.
 """
-import asyncio, json, os
+import asyncio, json, os, uuid
+from collections import OrderedDict
 from functools import lru_cache
 from typing import Annotated
 import httpx
@@ -24,6 +25,7 @@ except ImportError:  # postgres extras not installed — dev keeps using MemoryS
     dict_row = None
 
 from chart.renderer import render_chart
+from chart.replay import apply_mapping, build_table_grid
 from chart.server import serve_chart
 from graph.config_editor import edit_cube_config
 from graph import query_builder as qb
@@ -63,7 +65,8 @@ HARD RULE — every data question goes through build_query:
   the change or the error in `context`.
 - get_cube_metadata is only for questions ABOUT the schema ("what fields are there?",
   "what does the sales view cover?") or for the config-edit flows — never as a step
-  toward answering a data question.
+  toward answering a data question. Call it with no arguments to list the views, then
+  with view="<name>" for that view's fields.
 
 When the user asks for a chart or data insight:
 
@@ -83,13 +86,16 @@ When the user asks for a chart or data insight:
    fully qualified: "cube_name.member_name").
 3. If the user has NOT specified a chart type, ask: "What type of chart would you like? bar / line / pie / doughnut / table"
    Wait for their answer before calling create_chart.
-4. Call create_chart with the results to render the visualization.
+4. Call create_chart with the result_id query_cube returned plus a mapping
+   (label_dimension, series_measures, optional series_dimension — the same shape
+   save_graph uses). For chart_type="table" pass just result_id. Do NOT copy rows
+   into labels/datasets/columns/rows yourself — those are only for values you derived.
 
 Supported chart types: bar, line, pie, doughnut, table.
 Always call create_chart at the end — the user expects a visual result.
-For chart_type="table", call create_chart with `columns` (header names) and `rows`
-(a list of rows, each a flat list of cell values) — NOT labels/datasets. Each row is
-one record; never put a list inside a single cell.
+query_cube shows you every row only for small results; for big ones you see a preview
+and row_count. Never summarise, bucket or total rows you cannot see — if the user needs
+a rollup, call build_query again for an aggregated query.
 
 Sometimes the existing measures and dimensions alone cannot produce what the user
 asked for, so you derive the result yourself — by writing new SQL, bucketing values
@@ -131,8 +137,10 @@ mapping so it can be re-rendered live later and dropped into dashboards.
 
 DASHBOARDS (a grid of saved graphs, each re-queried live when viewed):
 - To build one: call create_dashboard(name, tiles) where tiles is an ordered list of
-  {"graph_id": "<id>", "w": <cols out of 12>, "h": <row units>}. Use list_graphs to find
-  the graph ids (its `cubes` field shows which cube each uses — good for grouping graphs
+  {"graph_id": "<id>", "w": <cols out of 12>, "h": <row units>}. ALWAYS call list_graphs
+  first to get the real graph ids — never invent or guess an id, and never use
+  get_cube_metadata to look for graphs (it lists schema fields, not graphs). list_graphs
+  gives the graph ids (its `cubes` field shows which cube each uses — good for grouping graphs
   that share a cube). Default sizing is w=6 (two per row), h=1; translate the user's
   layout words: "full width" -> w=12, "side by side" -> w=6 each, "make it tall" -> h=2.
 - To show an existing dashboard: call get_dashboard_detail(id) (the UI renders it live).
@@ -479,6 +487,54 @@ async def build_query(request: str, context: str = "") -> str:
     return json.dumps(query)
 
 
+# ── query results: full rows stay here, the model sees a compact view ──────────
+# A query_cube result used to go into the conversation whole — up to 1000 rows,
+# 100k+ tokens that were then re-sent on every later step of the turn. Now the
+# rows are kept server-side under a result_id; the model gets the columns, the row
+# count and (for big results) a preview, and create_chart builds the chart from
+# the stored rows via result_id + mapping, so nothing has to be transcribed.
+FULL_ROWS_MAX   = 100      # results up to this many rows are shown to the model whole
+FULL_CHARS_MAX  = 30_000   # ...as long as they also fit in this many characters
+PREVIEW_ROWS    = 20
+_RESULTS_KEPT   = 200      # oldest results are dropped past this (in-memory, per process)
+_results: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def _store_result(query: dict, rows: list, annotation: dict) -> str:
+    rid = "r_" + uuid.uuid4().hex[:8]
+    _results[rid] = {"query": query, "rows": rows, "annotation": annotation}
+    while len(_results) > _RESULTS_KEPT:
+        _results.popitem(last=False)
+    return rid
+
+
+def compact_result(query: dict, raw: str) -> str:
+    """Store a query_cube result and return what the model should see. Errors and
+    unparseable output pass through unchanged."""
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return raw
+    if not isinstance(parsed, dict) or parsed.get("error") or "data" not in parsed:
+        return raw
+    rows = parsed.get("data") or []
+    rid = _store_result(query, rows, parsed.get("annotation") or {})
+    out = {"result_id": rid, "row_count": len(rows),
+           "columns": list(rows[0].keys()) if rows else []}
+    whole = json.dumps(rows, default=str)
+    if len(rows) <= FULL_ROWS_MAX and len(whole) <= FULL_CHARS_MAX:
+        out["rows"] = rows
+    else:
+        out["rows"] = rows[:PREVIEW_ROWS]
+        out["note"] = (
+            f"Only the first {PREVIEW_ROWS} of {len(rows)} rows are shown. To chart this "
+            "result call create_chart with result_id and a mapping — it reads all rows. "
+            "Do not try to summarise or bucket rows you cannot see: if the user needs a "
+            "rollup, call build_query again for an aggregated query.")
+    out["sql"] = parsed.get("sql", "")
+    return json.dumps(out, default=str)
+
+
 def guarded_query_cube(mcp_query_cube):
     """Wrap the MCP query_cube tool with the build_query provenance guard
     (graph/guard.py). Same name, args and description, so the UI and prompt are
@@ -501,7 +557,7 @@ def guarded_query_cube(mcp_query_cube):
         if problem:
             print(f"[guard] query_cube rejected: {problem[:120]}")
             return json.dumps({"error": problem, "guard": "build_query_required"})
-        return await mcp_query_cube.ainvoke(args)
+        return compact_result(args, _tool_output_text(await mcp_query_cube.ainvoke(args)))
 
     query_cube.description = (
         (mcp_query_cube.description or query_cube.description)
@@ -571,6 +627,8 @@ def safe_commit(mcp_commit, reload_tool, rollback_tool):
 @tool
 def create_chart(
     chart_type: str,
+    result_id: str = "",
+    mapping: dict = {},
     labels: list[str] = [],
     datasets: list[dict] = [],
     title: str = "",
@@ -580,22 +638,37 @@ def create_chart(
     """
     Render a Chart.js chart (or an HTML table) in the UI's preview panel.
 
-    For bar / line / pie / doughnut charts use labels + datasets:
-        labels:   list of label strings (x-axis for bar/line, segments for pie)
-        datasets: list of dicts, each with "label" (str) and "data" (list of numbers)
+    PREFERRED — chart a query_cube result directly (all rows, nothing to copy):
+        result_id: the result_id query_cube returned
+        mapping:   for bar / line / pie / doughnut (omit for "table"):
+                   {"label_dimension": "<x-axis / segment dimension>",
+                    "series_measures": ["<measure>", ...],
+                    "series_dimension": null}   # or a dimension to split into one series per value
+        For chart_type="table" just pass result_id — every column is shown.
 
-    For chart_type="table" DO NOT use labels/datasets — provide a real grid:
-        columns: list of column header strings,
-                 e.g. ["Category", "Total Revenue", "Qty Sold", "Revenue per Item"]
-        rows:    list of rows, each a list of cell values aligned to columns,
-                 e.g. [["Electronics", "$10,120.93", 26, "$389.27"],
-                       ["Sports", "$1,967.69", 38, "$51.78"]]
-        Each row is one record; do not nest lists inside a cell.
+    ONLY when you derived the numbers yourself (a bucket, ratio or regrouping that
+    no query returns), pass the values directly instead of result_id:
+        bar / line / pie / doughnut: labels (list of strings) + datasets
+                   (list of {"label": str, "data": [numbers]})
+        table:     columns (header strings) + rows (list of flat lists, one per record)
 
     Args:
         chart_type: "bar" | "line" | "pie" | "doughnut" | "table"
         title:      optional chart title
     """
+    if result_id:
+        res = _results.get(result_id)
+        if res is None:
+            return json.dumps({"error": f"Unknown or expired result_id '{result_id}'. "
+                                        "Run query_cube again and use its new result_id."})
+        q, data, ann = res["query"], res["rows"], res["annotation"]
+        if chart_type == "table":
+            columns, rows = build_table_grid(data, ann, q)
+        else:
+            problems = graph_mapping_problems(q, mapping or {})
+            if problems:
+                return json.dumps({"error": "Bad mapping for this result:", "details": problems})
+            labels, datasets = apply_mapping(data, ann, mapping, q)
     html = render_chart(chart_type, labels, datasets, title, columns or None, rows or None)
     serve_chart(html, open_browser=True)
     # Don't return a URL — the UI renders the chart in its preview panel. Telling
@@ -604,6 +677,29 @@ def create_chart(
         "Chart rendered in the preview panel. Do NOT mention any URL or link — "
         "just briefly describe what the chart shows."
     )
+
+
+def graph_mapping_problems(query: dict, mapping: dict) -> list[str]:
+    """What's wrong with a chart mapping for this query (empty list = usable)."""
+    dims = list(query.get("dimensions") or []) + \
+        [td.get("dimension") for td in query.get("time_dimensions") or [] if td.get("dimension")]
+    measures = list(query.get("measures") or [])
+    problems = []
+    label = mapping.get("label_dimension")
+    if not label:
+        problems.append("mapping.label_dimension is required")
+    elif label not in dims:
+        problems.append(f"label_dimension '{label}' is not one of the query's dimensions {dims}")
+    series = mapping.get("series_measures") or []
+    if not series:
+        problems.append("mapping.series_measures needs at least one measure")
+    for m in series:
+        if m not in measures:
+            problems.append(f"series measure '{m}' is not one of the query's measures {measures}")
+    sd = mapping.get("series_dimension")
+    if sd and sd not in dims:
+        problems.append(f"series_dimension '{sd}' is not one of the query's dimensions {dims}")
+    return problems
 
 
 def _build_state_modifier(state) -> list:

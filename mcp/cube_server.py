@@ -51,18 +51,44 @@ async def health(request: Request) -> JSONResponse:
 
 
 @mcp.tool()
-async def get_cube_metadata() -> str:
+async def get_cube_metadata(view: str = "") -> str:
     """
-    Return all available cubes with their measures and dimensions.
-    Call this first to understand what data is queryable before building a query.
+    Describe the queryable schema.
+
+    With no arguments: a short catalog — each view's name, description and how many
+    measures/dimensions it has. With view="<name>": that view's measures and
+    dimensions with their types, titles and descriptions.
+
+    Not a step toward answering data questions (build_query does that), and it
+    does not list saved graphs (use list_graphs).
     """
     data = await _cube_get("/cubejs-api/v1/meta")
+    return format_metadata(data.get("cubes", []), view)
+
+
+def format_metadata(entries: list[dict], view: str = "") -> str:
+    """Render /meta for the agent: a catalog by default, one view's members on request.
+    The full dump of every view's members ran to ~160k tokens on real schemas."""
     # In dev mode /meta lists private cubes too (isVisible/public=false). Views are
     # the only surface the agent should query, so skip anything not visible — this
     # keeps raw cubes and their join keys out of the agent's schema regardless of mode.
-    cubes = [c for c in data.get("cubes", [])
-             if c.get("isVisible", c.get("public", True)) is not False]
-    lines = []
+    cubes = [c for c in entries if c.get("isVisible", c.get("public", True)) is not False]
+    if not cubes:
+        return "No cubes available."
+
+    if not view:
+        lines = ["Views (call get_cube_metadata(view=\"<name>\") for a view's fields):"]
+        for c in cubes:
+            line = (f"  {c['name']}  — {len(c.get('measures', []))} measures, "
+                    f"{len(c.get('dimensions', []))} dimensions")
+            if c.get("description"):
+                line += f"\n      {c['description']}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    picked = [c for c in cubes if c["name"] == view]
+    if not picked:
+        return f"No view named '{view}'. Available: " + ", ".join(c["name"] for c in cubes)
 
     def _fmt(member: dict) -> str:
         # Descriptions carry synonyms/meaning — critical for mapping NL to the
@@ -71,20 +97,15 @@ async def get_cube_metadata() -> str:
         desc = member.get("description")
         return f"{base}\n        desc: {desc}" if desc else base
 
-    for c in cubes:
-        header = f"\nCube: {c['name']}"
-        if c.get("description"):
-            header += f"  — {c['description']}"
-        lines.append(header)
-        if c.get("measures"):
-            lines.append("  Measures:")
-            for m in c["measures"]:
-                lines.append(_fmt(m))
-        if c.get("dimensions"):
-            lines.append("  Dimensions:")
-            for d in c["dimensions"]:
-                lines.append(_fmt(d))
-    return "\n".join(lines) if lines else "No cubes available."
+    c = picked[0]
+    lines = [f"Cube: {c['name']}" + (f"  — {c['description']}" if c.get("description") else "")]
+    if c.get("measures"):
+        lines.append("  Measures:")
+        lines += [_fmt(m) for m in c["measures"]]
+    if c.get("dimensions"):
+        lines.append("  Dimensions:")
+        lines += [_fmt(d) for d in c["dimensions"]]
+    return "\n".join(lines)
 
 
 def _inline_sql_params(sql: str, params: list) -> str:

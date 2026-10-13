@@ -216,6 +216,14 @@ def _default_view_llm(model: str):
     return ChatAnthropic(model=model, temperature=0).with_structured_output(ViewSelection)
 
 
+def _cached(text: str) -> list[dict]:
+    """A message body marked as a prompt-cache breakpoint. The schema / view catalog
+    is the big, stable part of every build_query call (often 50k+ tokens), so caching
+    it makes repeat calls on the same view ~10x cheaper. Everything after it (examples,
+    context, the request) varies per call and stays uncached."""
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+
+
 def select_view(
     request: str,
     metadata: list[dict],
@@ -228,7 +236,7 @@ def select_view(
     """Route a request to exactly one view. Returns ViewSelection(view=None) when
     the request would need to span views (Cube can't answer that in one query)."""
     llm = llm or _default_view_llm(model or os.environ.get("VIEW_SELECTOR_MODEL", "claude-haiku-4-5-20251001"))
-    msgs = [("system", _SELECT_SYSTEM), ("human", f"Views:\n{render_view_catalog(metadata, cubes)}")]
+    msgs = [("system", _SELECT_SYSTEM), ("human", _cached(f"Views:\n{render_view_catalog(metadata, cubes)}"))]
     if context:
         msgs.append(("human", f"Recent conversation (for follow-ups):\n{context}"))
     msgs.append(("human", f"Request: {request}"))
@@ -279,7 +287,7 @@ def _get_examples(examples_fn, request: str, view_meta: list[dict]) -> list[dict
 def _invoke(llm, request: str, schema_text: str, context: str | None,
             prior: dict | None, feedback: list[str] | None,
             examples: list[dict] | None = None) -> CubeQuery:
-    msgs = [("system", _SYSTEM), ("human", f"Schema:\n{schema_text}")]
+    msgs = [("system", _SYSTEM), ("human", _cached(f"Schema:\n{schema_text}"))]
     if examples:
         msgs.append(("human",
             "Verified examples — past requests on this data where a user confirmed or "

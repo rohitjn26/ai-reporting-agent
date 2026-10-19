@@ -29,6 +29,7 @@ from graph.config_editor import edit_cube_config
 from graph import query_builder as qb
 from graph import feedback
 from graph import guard
+from graph import drill
 
 CUBE_MCP_URL    = os.environ.get("CUBE_MCP_URL",    "http://localhost:5001/sse")
 LIBRARY_MCP_URL = os.environ.get("LIBRARY_MCP_URL", "http://localhost:5002/sse")
@@ -137,6 +138,17 @@ DASHBOARDS (a grid of saved graphs, each re-queried live when viewed):
   layout words: "full width" -> w=12, "side by side" -> w=6 each, "make it tall" -> h=2.
 - To show an existing dashboard: call get_dashboard_detail(id) (the UI renders it live).
 - Use list_dashboards to find dashboards by name.
+
+WHY A NUMBER CHANGED ("why is revenue down?", "what drove the jump in orders?"):
+1. Call build_query for the measure over the period the user means (e.g. "revenue
+   last month"), so the measure and time dimension are validated.
+2. Call explain_change with that measure, time dimension, filters and period. Leave
+   compare_period out unless the user named one (it defaults to the previous period).
+3. Answer in a few lines: the change (before → after), the dimension and values that
+   account for most of it with their share of the change, and what `inside_top`
+   adds. Say WHERE it happened, not why: the data can't show causes, so don't invent
+   them. If the result has "note", lead with it and keep the explanation short.
+4. To chart it, pass `chart_query` to query_cube unchanged, then create_chart.
 
 IMPORTANT query rules:
 - If build_query returns "_cube_unavailable", Cube is down or its schema is broken.
@@ -387,25 +399,46 @@ def _cube_error_text(e: Exception) -> str:
     return f"Cube is unreachable ({type(e).__name__}: {str(e)[:200]})"
 
 
+class CubeQueryError(RuntimeError):
+    """Cube rejected or failed a /load query; the message is Cube's own error."""
+
+
+def _to_cube(query: dict) -> dict:
+    """A build_query-shaped query (snake_case time_dimensions) in Cube's REST shape."""
+    q = {k: v for k, v in query.items() if not k.startswith("_") and k != "time_dimensions"}
+    if query.get("time_dimensions"):
+        q["timeDimensions"] = query["time_dimensions"]
+    return q
+
+
+async def _cube_load(client: httpx.AsyncClient, q: dict) -> dict:
+    """POST a Cube-shaped query to /load -> the response body (data, and the query
+    as Cube resolved it). Raises CubeQueryError when Cube reports an error."""
+    headers = {"Authorization": f"Bearer {CUBE_API_SECRET}"}
+    for _ in range(10):  # Cube answers "Continue wait" while a query is still running
+        resp = await client.post(f"{CUBE_URL}/cubejs-api/v1/load", json={"query": q}, headers=headers)
+        body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        if body.get("error") != "Continue wait":
+            break
+        await asyncio.sleep(0.5)
+    if resp.status_code >= 400 or body.get("error"):
+        raise CubeQueryError(body.get("error") or resp.text[:500])
+    return body
+
+
 async def run_cube_query(query: dict, limit: int = 50) -> dict:
     """Run a build_query-shaped query against Cube's REST API -> {rows, sql} or {error}.
 
     Used to preview a user's corrected query before it is saved as feedback.
     """
-    q = {k: v for k, v in query.items() if not k.startswith("_") and k != "time_dimensions"}
-    if query.get("time_dimensions"):
-        q["timeDimensions"] = query["time_dimensions"]
+    q = _to_cube(query)
     q["limit"] = min(int(q.get("limit") or limit), limit)
     headers = {"Authorization": f"Bearer {CUBE_API_SECRET}"}
     async with httpx.AsyncClient(timeout=30) as client:
-        for _ in range(10):  # Cube answers "Continue wait" while a query is still running
-            resp = await client.post(f"{CUBE_URL}/cubejs-api/v1/load", json={"query": q}, headers=headers)
-            body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-            if body.get("error") != "Continue wait":
-                break
-            await asyncio.sleep(0.5)
-        if resp.status_code >= 400 or body.get("error"):
-            return {"error": body.get("error") or resp.text[:500]}
+        try:
+            body = await _cube_load(client, q)
+        except CubeQueryError as e:
+            return {"error": str(e)}
         sql = ""
         try:
             sres = await client.get(f"{CUBE_URL}/cubejs-api/v1/sql",
@@ -477,6 +510,120 @@ async def build_query(request: str, context: str = "") -> str:
             ),
         })
     return json.dumps(query)
+
+
+def _round(x: float) -> float:
+    return round(x, 2) if isinstance(x, float) else x
+
+
+def _drivers(report: drill.ChangeReport, dims: int, members: int) -> list[dict]:
+    """The top of a ChangeReport, small enough to hand the model."""
+    out = []
+    for r in report.rankings[:dims]:
+        out.append({
+            "dimension": r.candidate.member,
+            "score": _round(r.score),
+            "members": [{"value": m.value, "before": _round(m.base), "after": _round(m.current),
+                         "change": _round(m.delta),
+                         "share_of_change": None if m.contribution is None else _round(m.contribution)}
+                        for m in r.members[:members]],
+        })
+    return out
+
+
+@tool
+async def explain_change(
+    measure: str,
+    time_dimension: str,
+    period: str | list[str],
+    state: Annotated[dict, InjectedState],
+    compare_period: str | list[str] | None = None,
+    filters: list[dict] = [],
+) -> str:
+    """
+    Explain where a measure went up or down between two periods: which dimension,
+    and which of its values, account for the change. Use it for "why did X drop",
+    "what drove the increase in Y", "where did we lose Z".
+
+    Call build_query first (e.g. "revenue last month") and pass its measure, time
+    dimension and filters here; only fields build_query returned are accepted.
+
+    Args:
+        measure: the one measure to explain, from build_query
+        time_dimension: the time dimension from build_query
+        period: the period the user asks about, as a Cube dateRange: "last month",
+                "this week", or ["2026-09-01", "2026-09-30"]
+        compare_period: what to compare against; omit it for the previous period
+                        of the same length (last month → the month before)
+        filters: build_query's filters, if any
+
+    Returns:
+        JSON with the totals, the dimensions that explain the change best (each with
+        its top values: before, after, change, share of the total change), the same
+        breakdown inside the top value (`inside_top`), and `chart_query`, which you
+        may pass to query_cube to chart the top dimension. If it has "note", the
+        change is small or within noise: say so and don't over-explain it. Describe
+        WHERE the change happened; the data can't say why.
+    """
+    scope = {"measures": [measure], "filters": filters,
+             "time_dimensions": [{"dimension": time_dimension}]}
+    problem = guard.check_provenance(scope, state.get("messages", []))
+    if problem:
+        return json.dumps({"error": problem, "guard": "build_query_required"})
+    try:
+        metadata, _ = await _fetch_cube_metadata()
+    except (httpx.HTTPStatusError, httpx.TransportError) as e:
+        return json.dumps({"_cube_unavailable": _cube_error_text(e)})
+    view_meta = [c for c in metadata if c["name"] == measure.split(".")[0]]
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        async def run(q: dict) -> list[dict]:
+            return (await _cube_load(client, _to_cube(q))).get("data", [])
+
+        async def resolve(date_range) -> list[str]:
+            # Cube resolves "last month" etc. and echoes the absolute range back
+            body = await _cube_load(client, _to_cube({**scope, "time_dimensions": [
+                {"dimension": time_dimension, "dateRange": date_range}]}))
+            return [v[:10] for v in body["query"]["timeDimensions"][0]["dateRange"]]
+
+        try:
+            current = await resolve(period)
+            previous = await resolve(compare_period) if compare_period else drill.previous_period(current)
+            report = await drill.rank_change(scope, view_meta, run, time_dimension=time_dimension,
+                                             period=current, compare_period=previous)
+            inside = None
+            top = report.rankings[0] if report.rankings else None
+            if top and top.members[0].value != drill.OTHER:
+                segment = {top.candidate.member: top.members[0].value}
+                sub = {**scope, "filters": filters + [drill.segment_filter(*next(iter(segment.items())))]}
+                inside = {"segment": segment,
+                          "drivers": _drivers(await drill.rank_change(
+                              sub, view_meta, run, time_dimension=time_dimension,
+                              period=current, compare_period=previous, max_candidates=6), 2, 3)}
+        except drill.NotAdditive as e:
+            return json.dumps({"error": str(e), "instruction": (
+                "Tell the user this measure is an average, ratio or distinct count, which "
+                "can't be split into per-segment contributions. Offer to explain the measures "
+                "it is built from (e.g. the numerator and denominator) instead.")})
+        except CubeQueryError as e:
+            return json.dumps({"error": f"Cube rejected the query: {e}"})
+
+    out = {
+        "measure": measure, "period": current, "compare_period": previous,
+        "before": _round(report.base), "after": _round(report.current),
+        "change": _round(report.delta),
+        "pct_change": _round(report.delta / report.base * 100) if report.base else None,
+        "drivers": _drivers(report, 3, 5),
+        "inside_top": inside,
+        "skipped": report.skipped or None,
+    }
+    if report.note:
+        out["note"] = report.note
+    if top:
+        out["chart_query"] = {"measures": [measure], "dimensions": [top.candidate.member],
+                              "filters": filters, "order": {measure: "desc"},
+                              "time_dimensions": [{"dimension": time_dimension, "dateRange": current}]}
+    return json.dumps({k: v for k, v in out.items() if v not in (None, [])}, default=str)
 
 
 def guarded_query_cube(mcp_query_cube):
@@ -715,7 +862,7 @@ async def build_agent():
         commit = safe_commit(by_name["commit_cube_config_update"], by_name["reload_cube_schema"],
                              by_name["rollback_cube_config"])
         mcp_tools = [commit if t.name == "commit_cube_config_update" else t for t in mcp_tools]
-    all_tools = mcp_tools + [build_query, create_chart, edit_cube_config]
+    all_tools = mcp_tools + [build_query, explain_change, create_chart, edit_cube_config]
 
     _agent = create_react_agent(
         ChatAnthropic(model=MODEL),

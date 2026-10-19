@@ -373,6 +373,11 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                             yield _plan_event(trace_id, parsed, source="build_query")
                     except Exception:
                         pass
+                # explain_change's chart_query isn't what build_query planned ("revenue
+                # last month" → revenue by region), so don't record it against that
+                # trace; it becomes its own trace for the user's question instead.
+                if name == "explain_change" and not error:
+                    trace_id = None
                 if name == "preview_cube_config_update" and not error:
                     try:
                         output = event["data"].get("output", "")

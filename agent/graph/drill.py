@@ -84,6 +84,7 @@ class ChangeReport:
     delta: float
     rankings: list[ChangeRanking]
     skipped: dict[str, str] = field(default_factory=dict)      # member → why it wasn't ranked
+    note: Optional[str] = None          # set when the change is too small to read much into
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -123,11 +124,15 @@ def _view_members(view_meta: list[dict], view: str, kind: str) -> list[dict]:
     return [m for c in view_meta if c["name"] == view for m in c.get(kind, [])]
 
 
-def is_additive(measure: str, view_meta: list[dict]) -> bool:
+def _agg_type(measure: str, view_meta: list[dict]) -> Optional[str]:
     for m in _view_members(view_meta, measure.split(".")[0], "measures"):
         if m["name"] == measure:
-            return m.get("aggType") in ADDITIVE_AGG
-    return False
+            return m.get("aggType")
+    return None
+
+
+def is_additive(measure: str, view_meta: list[dict]) -> bool:
+    return _agg_type(measure, view_meta) in ADDITIVE_AGG
 
 
 def _looks_like_id(member: dict) -> bool:
@@ -199,6 +204,13 @@ def _time_key(key: str, query: dict) -> Optional[tuple[int, str]]:
     return None
 
 
+def segment_filter(member: str, value: Any) -> dict:
+    """The Cube filter that keeps one member value (notSet for a null bucket)."""
+    if value is None:
+        return {"member": member, "operator": "notSet"}
+    return {"member": member, "operator": "equals", "values": [str(value)]}
+
+
 def drill(query: dict, segment: dict[str, Any], candidate: Candidate) -> dict:
     """Narrow `query` to `segment` (a clicked row's dimension values) and break the
     result down by `candidate`. Measures, other filters and the date range carry
@@ -217,8 +229,7 @@ def drill(query: dict, segment: dict[str, Any], candidate: Candidate) -> dict:
             continue
         if key in dims:
             dims.remove(key)
-        q["filters"].append({"member": key, "operator": "notSet"} if value is None
-                            else {"member": key, "operator": "equals", "values": [str(value)]})
+        q["filters"].append(segment_filter(key, value))
 
     if candidate.is_time:
         for td in q["time_dimensions"]:
@@ -236,7 +247,49 @@ def drill(query: dict, segment: dict[str, Any], candidate: Candidate) -> dict:
     return {k: v for k, v in q.items() if v not in ([], {})}
 
 
+def previous_period(date_range: list) -> list[str]:
+    """The period just before `date_range` ([from, to], as Cube resolves it), of the
+    same length: whole calendar months step back by months (September → August,
+    not "the 30 days before"), anything else by its length in days."""
+    start, end = (_parse_time(v).date() for v in date_range[:2])
+    if start.day == 1 and (end + timedelta(days=1)).day == 1:
+        months = (end.year - start.year) * 12 + end.month - start.month + 1
+        y, m = divmod(start.month - 1 - months, 12)
+        prev_start = date(start.year + y, m + 1, 1)
+        return [prev_start.isoformat(), (start - timedelta(days=1)).isoformat()]
+    days = (end - start).days + 1
+    return [(start - timedelta(days=days)).isoformat(), (start - timedelta(days=1)).isoformat()]
+
+
+def change_note(base: float, current: float, agg_type: Optional[str]) -> Optional[str]:
+    """Why a change shouldn't be over-read, or None. Counts get a Poisson check
+    (a move under ~2 standard deviations is ordinary noise); anything under 2% of
+    the baseline is called small whatever the measure."""
+    delta = current - base
+    if agg_type == "count" and base + current > 0 and abs(delta) < 2 * math.sqrt(base + current):
+        return (f"a move of {delta:+g} on counts of {base:g} → {current:g} is within normal "
+                "noise; any breakdown below may be chance")
+    if base and abs(delta) / abs(base) < 0.02:
+        return f"the change is under 2% of the baseline ({delta:+g} on {base:g})"
+    return None
+
+
 # ── ranking ───────────────────────────────────────────────────────────────────
+
+def _drop_duplicates(rankings: list, signature, skipped: dict[str, str]) -> list:
+    """Keep one of several dimensions that split the data identically (the same
+    column reached through two joins, e.g. country and customer_country)."""
+    seen: dict = {}
+    out = []
+    for r in rankings:
+        sig = frozenset(signature(m) for m in r.members)
+        if sig in seen:
+            skipped[r.candidate.member] = f"same values as {seen[sig]}"
+            continue
+        seen[sig] = r.candidate.member
+        out.append(r)
+    return out
+
 
 def _num(v: Any) -> float:
     try:
@@ -338,7 +391,8 @@ async def rank_change(
     base = sum(_num(r.get(measure)) for r in results[1])
     delta = current - base
     denom = abs(delta) or abs(base) or 1.0
-    report = ChangeReport(measure, base, current, delta, [])
+    report = ChangeReport(measure, base, current, delta, [],
+                          note=change_note(base, current, _agg_type(measure, view_meta)))
 
     for i, c in enumerate(cands):
         cur_rows, base_rows = results[2 + 2 * i], results[3 + 2 * i]
@@ -369,6 +423,8 @@ async def rank_change(
         score = sum(surprises[:top_k]) / denom
         report.rankings.append(ChangeRanking(c, score, members))
 
+    report.rankings = _drop_duplicates(
+        report.rankings, lambda m: (str(m.value), m.base, m.current), report.skipped)
     report.rankings.sort(key=_sort_key)
     return report
 
@@ -417,6 +473,8 @@ async def rank_breakdown(
                      else (lambda m: (-abs(m.amount), str(m.value))))
         report.rankings.append(BreakdownRanking(c, score, members))
 
+    report.rankings = _drop_duplicates(
+        report.rankings, lambda m: (str(m.value), m.amount), report.skipped)
     if additive:
         report.rankings.sort(key=_sort_key)
     return report

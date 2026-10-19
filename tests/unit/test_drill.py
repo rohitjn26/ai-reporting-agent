@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from graph.drill import (OTHER, Candidate, NotAdditive, bucket_range, candidates,
+from graph.drill import (OTHER, Candidate, NotAdditive, bucket_range, candidates, change_note, previous_period,
                          drill, rank_breakdown, rank_change)
 
 META = [{
@@ -261,3 +261,33 @@ async def test_breakdown_time_candidate_keeps_buckets_in_order():
     assert week.candidate == Candidate("sales.created_at", "week")
     values = [m.value for m in week.members]
     assert values == sorted(values)
+
+
+# ── periods, noise, duplicates ────────────────────────────────────────────────
+
+@pytest.mark.parametrize("period,expected", [
+    (["2026-09-01T00:00:00.000", "2026-09-30T23:59:59.999"], ["2026-08-01", "2026-08-31"]),
+    (["2026-01-01", "2026-03-31"], ["2025-10-01", "2025-12-31"]),          # a quarter
+    (["2026-03-01", "2026-03-31"], ["2026-02-01", "2026-02-28"]),
+    (["2026-10-12", "2026-10-18"], ["2026-10-05", "2026-10-11"]),          # a week
+    (["2026-09-10", "2026-10-09"], ["2026-08-11", "2026-09-09"]),          # last 30 days
+])
+def test_previous_period(period, expected):
+    assert previous_period(period) == expected
+
+
+def test_change_note():
+    assert "noise" in change_note(8, 6, "count")              # 2 < 2·√14
+    assert change_note(800, 600, "count") is None
+    assert "under 2%" in change_note(1000, 990, "sum")
+    assert change_note(1000, 900, "sum") is None
+
+
+async def test_identical_dimensions_are_reported_once():
+    meta = [{**META[0], "dimensions": META[0]["dimensions"] + [
+        {"name": "sales.customer_region", "type": "string"}]}]
+    facts = [{**f, "customer_region": f["region"]} for f in FACTS]
+    report = await rank_change(SCOPE, meta, fake_cube(facts),
+                               time_dimension="sales.created_at", period=MAR, compare_period=FEB)
+    assert [r.candidate.member for r in report.rankings] == ["sales.region", "sales.channel"]
+    assert report.skipped["sales.customer_region"] == "same values as sales.region"

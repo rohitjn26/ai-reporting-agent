@@ -6,6 +6,7 @@ Run:  python ui.py
 Open: http://localhost:8501
 """
 import asyncio, json, os, sys
+import httpx
 from pathlib import Path
 import asyncpg
 
@@ -24,10 +25,13 @@ from langgraph.types import Command
 import uvicorn
 
 from graph.agent import (build_agent, maybe_summarise, close_checkpointer, MODEL_LABEL,
+                         CubeQueryError, _cube_load, _to_cube,
                          _fetch_cube_metadata, run_cube_query)
 from graph import feedback, tracing
 from graph import query_builder as qb
 import chart.server as _chart_server
+from chart.explore import explore_page, view_model
+from graph import drill
 
 os.environ.setdefault("CHART_OPEN_BROWSER", "false")
 
@@ -103,6 +107,108 @@ async def dashboard(dashboard_id: str):
         return await render_dashboard_by_id(dashboard_id)
     except Exception as e:
         return _replay_error_page("dashboard", str(e))
+
+
+# ── drill-down explorer (no LLM: graph/drill.py ranks, chart/explore.py draws) ──
+
+# Queries behind charts the agent drew, by id, so /explore/{id} can start from
+# one. In memory and capped: a chart's explorer only needs to outlive its session.
+_explore_queries: dict[str, dict] = {}
+_EXPLORE_KEEP = 200
+_DRILL_LIMIT = 100          # rows per drilled chart; ranking already skips wide splits
+
+
+def _remember_explore(query: dict) -> str:
+    import uuid
+    eid = uuid.uuid4().hex[:12]
+    _explore_queries[eid] = query
+    while len(_explore_queries) > _EXPLORE_KEEP:
+        _explore_queries.pop(next(iter(_explore_queries)))
+    return eid
+
+
+@app.get("/explore/{eid}", response_class=HTMLResponse)
+def explore(eid: str):
+    query = _explore_queries.get(eid)
+    if not query:
+        return _replay_error_page("drill-down", "This chart's query is no longer in memory "
+                                  "(the UI restarted). Ask for the chart again.")
+    return explore_page(query)
+
+
+async def _drill_view_meta(query: dict) -> list[dict]:
+    view = (query.get("measures") or query.get("dimensions") or [""])[0].split(".")[0]
+    metadata, _ = await _fetch_cube_metadata()
+    return [c for c in metadata if c["name"] == view]
+
+
+def _drill_candidate(raw) -> "drill.Candidate | None":
+    return drill.Candidate(raw["member"], raw.get("granularity")) if raw else None
+
+
+@app.post("/drill/run")
+async def drill_run(request: Request):
+    """Run a drill step -> what the explore page draws. With no candidate and no
+    records flag, runs `query` as it is (the explorer's starting chart)."""
+    body = await request.json()
+    query, segment = body.get("query") or {}, body.get("segment") or {}
+    if not query.get("measures"):
+        return JSONResponse({"error": "Only charts with a measure can be drilled into."}, 400)
+    meta = await _drill_view_meta(query)
+    candidate = _drill_candidate(body.get("candidate"))
+    if body.get("records"):
+        nxt = drill.records_query(query, segment, meta)
+    elif candidate:
+        nxt = {**drill.drill(query, segment, candidate), "limit": _DRILL_LIMIT}
+    else:
+        nxt = {k: v for k, v in query.items() if v not in ([], {}, None)}
+    # same check build_query applies: every member exists, and stays in one view
+    problems = [p for p in qb.validate_query(nxt, meta) if "no measures" not in p]
+    if problems:
+        return JSONResponse({"error": "; ".join(problems)}, 400)
+    note = None
+    async with httpx.AsyncClient(timeout=30) as client:
+        try:
+            res = await _cube_load(client, _to_cube(nxt))
+        except CubeQueryError as e:
+            if not body.get("records"):
+                return JSONResponse({"error": f"Cube rejected the query: {e}"}, 400)
+            # one bad column (or a join Cube can't build) shouldn't hide the records:
+            # retry with just the columns the chart already showed
+            nxt = drill.records_query(query, segment, meta, minimal=True)
+            note = f"Showing fewer columns: Cube rejected the full set ({e})."
+            try:
+                res = await _cube_load(client, _to_cube(nxt))
+            except CubeQueryError as e2:
+                return JSONResponse({"error": f"Cube rejected the query: {e2}"}, 400)
+    view = view_model(nxt, res.get("data", []), res.get("annotation", {}))
+    if note:
+        view["note"] = note
+    return view
+
+
+@app.post("/drill/options")
+async def drill_options(request: Request):
+    """Ranked 'break down by' choices for one clicked row."""
+    body = await request.json()
+    query, segment = body.get("query") or {}, body.get("segment") or {}
+    meta = await _drill_view_meta(query)
+    scope = drill.narrow(query, segment)
+    scope["dimensions"] = []
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        async def run(q):
+            return (await _cube_load(client, _to_cube(q))).get("data", [])
+        report = await drill.rank_breakdown(scope, meta, run)
+
+    titles = {m["name"]: m.get("shortTitle") or m.get("title") or m["name"]
+              for c in meta for m in c.get("dimensions", [])}
+    return {"options": [{
+        "member": r.candidate.member, "granularity": r.candidate.granularity,
+        "title": (f"{titles.get(r.candidate.member, r.candidate.member)} by {r.candidate.granularity}"
+                  if r.candidate.is_time else titles.get(r.candidate.member, r.candidate.member)),
+        "score": r.score, "members": len(r.members),
+    } for r in report.rankings], "skipped": report.skipped}
 
 
 def _load_run_discovery():
@@ -276,6 +382,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
     commits_running: set = set()  # commit runs in flight — their inner reload reports via the commit
     trace_id = None
     pending_direct = None
+    last_query = None           # the latest query_cube that ran, for the chart's drill-down link
 
     async def flush_query():
         """Emit the query card (direct queries only) and SQL for the last query run."""
@@ -343,6 +450,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                             executed = tool_inputs.get(run_id) or event["data"].get("input") or {}
                             if isinstance(executed, dict):   # drop LangGraph-injected state
                                 executed = {k: v for k, v in executed.items() if k in _QUERY_KEYS}
+                                last_query = executed
                             if trace_id and isinstance(executed, dict):
                                 await asyncio.to_thread(feedback.get_store().attach_execution,
                                                         trace_id, executed, sql)
@@ -412,7 +520,10 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                     # Show the query/SQL behind the final visualization (if any).
                     async for ev in flush_query():
                         yield ev
-                    yield f"data: {json.dumps({'type': 'chart', 'url': '/chart'})}\n\n"
+                    ev = {'type': 'chart', 'url': '/chart'}
+                    if last_query and last_query.get("measures"):
+                        ev['explore'] = f"/explore/{_remember_explore(last_query)}"
+                    yield f"data: {json.dumps(ev)}\n\n"
                 # Render a saved graph or dashboard live in the preview panel.
                 # The tool output is the created/fetched resource JSON (has "id").
                 if name in ("create_dashboard", "get_dashboard_detail") and not error:
@@ -2616,6 +2727,14 @@ _HTML = """<!DOCTYPE html>
         link.innerHTML = '📊 View chart →';
         const lw = document.createElement('div');
         lw.className = 'msg agent'; lw.appendChild(link);
+        if (d.explore) {
+          const ex = document.createElement('a');
+          ex.href = d.explore; ex.className = 'chart-link';
+          ex.style.marginLeft = '12px';
+          ex.innerHTML = '🔍 Drill down';
+          ex.onclick = e => { e.preventDefault(); showChart(d.explore); };
+          lw.appendChild(ex);
+        }
         messagesEl.appendChild(lw); scrollBottom();
 
       } else if (d.type === 'dashboard') {

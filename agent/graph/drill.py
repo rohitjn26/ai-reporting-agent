@@ -153,17 +153,35 @@ def finer(granularity: Optional[str]) -> Optional[str]:
     return GRANULARITIES[i + 1] if i + 1 < len(GRANULARITIES) else None
 
 
+def drill_members(query: dict, view_meta: list[dict]) -> list[str]:
+    """The view dimensions the query's first measure lists as `drill_members` in the
+    data model, in their listed order. Cube may name them by the view member
+    ("sales.status") or by the cube member a view dimension aliases ("orders.status")."""
+    dims = _view_members(view_meta, _view_of(query), "dimensions")
+    by_name = {d["name"]: d["name"] for d in dims}
+    by_name.update({d["aliasMember"]: d["name"] for d in dims if d.get("aliasMember")})
+    listed = next((m.get("drillMembers") or [] for m in _view_members(view_meta, _view_of(query), "measures")
+                   if m["name"] == query["measures"][0]), [])
+    out: list[str] = []
+    for name in listed:
+        if by_name.get(name) and by_name[name] not in out:
+            out.append(by_name[name])
+    return out
+
+
 def candidates(query: dict, view_meta: list[dict]) -> list[Candidate]:
     """What the query can be drilled into next: one finer step on each of its time
     dimensions, then every groupable dimension of its view that isn't already in
-    the query, pinned by a filter, or an identifier."""
+    the query, pinned by a filter, or an identifier. Dimensions the measure lists
+    as drill_members in the data model, when it has any, come first."""
     out = [Candidate(td["dimension"], finer(td.get("granularity")))
            for td in query.get("time_dimensions", []) if finer(td.get("granularity"))]
     taken = set(query.get("dimensions", [])) | _pinned(query)
-    for d in _view_members(view_meta, _view_of(query), "dimensions"):
-        if d.get("type") in SPLIT_TYPES and d["name"] not in taken and not _looks_like_id(d):
-            out.append(Candidate(d["name"]))
-    return out
+    dims = [d for d in _view_members(view_meta, _view_of(query), "dimensions")
+            if d.get("type") in SPLIT_TYPES and d["name"] not in taken and not _looks_like_id(d)]
+    preferred = drill_members(query, view_meta)
+    dims.sort(key=lambda d: preferred.index(d["name"]) if d["name"] in preferred else len(preferred))
+    return out + [Candidate(d["name"]) for d in dims]
 
 
 # ── the drill itself ──────────────────────────────────────────────────────────
@@ -211,16 +229,18 @@ def segment_filter(member: str, value: Any) -> dict:
     return {"member": member, "operator": "equals", "values": [str(value)]}
 
 
-def drill(query: dict, segment: dict[str, Any], candidate: Candidate) -> dict:
-    """Narrow `query` to `segment` (a clicked row's dimension values) and break the
-    result down by `candidate`. Measures, other filters and the date range carry
-    over; order keys for members that are gone are dropped, and so is the limit,
-    since a parent's top-N says nothing about the child."""
+def _clean(q: dict) -> dict:
+    return {k: v for k, v in q.items() if v not in ([], {})}
+
+
+def narrow(query: dict, segment: dict[str, Any]) -> dict:
+    """`query` cut down to `segment` (a clicked row's dimension values): each value
+    becomes a filter and leaves the dimensions, a clicked time bucket becomes the
+    date range. The limit goes, since a parent's top-N says nothing about the child."""
     q = {k: v for k, v in query.items() if k != "limit"}
     q["filters"] = list(query.get("filters", []))
     q["time_dimensions"] = [dict(td) for td in query.get("time_dimensions", [])]
     dims = list(query.get("dimensions", []))
-
     for key, value in segment.items():
         tk = _time_key(key, query)
         if tk:
@@ -230,21 +250,57 @@ def drill(query: dict, segment: dict[str, Any], candidate: Candidate) -> dict:
         if key in dims:
             dims.remove(key)
         q["filters"].append(segment_filter(key, value))
+    q["dimensions"] = dims
+    return q
 
+
+def drill(query: dict, segment: dict[str, Any], candidate: Candidate) -> dict:
+    """Narrow `query` to `segment` and break the result down by `candidate`.
+    Measures, other filters and the date range carry over; order keys for
+    members that are gone are dropped."""
+    q = narrow(query, segment)
     if candidate.is_time:
         for td in q["time_dimensions"]:
             if td["dimension"] == candidate.member:
                 td["granularity"] = candidate.granularity
     else:
-        dims.append(candidate.member)
-        for td in q["time_dimensions"]:
-            if any(_time_key(k, query) for k in segment):
+        q["dimensions"].append(candidate.member)
+        if any(_time_key(k, query) for k in segment):
+            for td in q["time_dimensions"]:
                 td.pop("granularity", None)     # a clicked bucket is now a range, not an axis
-
-    q["dimensions"] = dims
-    kept = set(q["measures"]) | set(dims) | {td["dimension"] for td in q["time_dimensions"]}
+    kept = set(q["measures"]) | set(q["dimensions"]) | {td["dimension"] for td in q["time_dimensions"]}
     q["order"] = {k: v for k, v in (query.get("order") or {}).items() if k in kept}
-    return {k: v for k, v in q.items() if v not in ([], {})}
+    return _clean(q)
+
+
+def records_query(query: dict, segment: dict[str, Any], view_meta: list[dict],
+                  *, limit: int = 100, max_columns: int = 8, minimal: bool = False) -> dict:
+    """The rows behind `segment`, like Cube's own drillDown: ungrouped records,
+    with the measure's drill_members as columns when the data model lists them,
+    else the query's time dimension plus the view's groupable, non-ID dimensions,
+    those from the measure's own cube first (joined ones are likelier to fail).
+    `minimal` keeps only the columns the chart already had, which ran fine: the
+    fallback when Cube rejects the full set. Sum measures come along as each
+    record's own value (a count would just be 1)."""
+    q = narrow(query, segment)
+    view = _view_of(query)
+    times = [td["dimension"] for td in q["time_dimensions"]]
+    columns = [] if minimal else drill_members(query, view_meta)
+    if minimal:
+        columns = times + [d for d in query.get("dimensions", []) if d not in times]
+    elif not columns:
+        home = next((m.get("aliasMember", "").split(".")[0]
+                     for m in _view_members(view_meta, view, "measures")
+                     if m["name"] == query["measures"][0]), "")
+        dims = [d for d in _view_members(view_meta, view, "dimensions")
+                if d.get("type") in SPLIT_TYPES and not _looks_like_id(d) and d["name"] not in times]
+        dims.sort(key=lambda d: not (home and (d.get("aliasMember") or "").startswith(home + ".")))
+        columns = (times + [d["name"] for d in dims])[:max_columns]
+    sums = [m for m in query["measures"] if _agg_type(m, view_meta) == "sum"]
+    tds = [{k: v for k, v in td.items() if k != "granularity"}
+           for td in q["time_dimensions"] if td.get("dateRange")]
+    return _clean({"measures": sums, "dimensions": columns, "filters": q["filters"],
+                   "time_dimensions": tds, "ungrouped": True, "limit": limit})
 
 
 def previous_period(date_range: list) -> list[str]:

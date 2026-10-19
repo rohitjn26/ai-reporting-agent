@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from graph.drill import (OTHER, Candidate, NotAdditive, bucket_range, candidates, change_note, previous_period,
+from graph.drill import (OTHER, Candidate, NotAdditive, bucket_range, candidates, change_note, previous_period, records_query,
                          drill, rank_breakdown, rank_change)
 
 META = [{
@@ -291,3 +291,38 @@ async def test_identical_dimensions_are_reported_once():
                                time_dimension="sales.created_at", period=MAR, compare_period=FEB)
     assert [r.candidate.member for r in report.rankings] == ["sales.region", "sales.channel"]
     assert report.skipped["sales.customer_region"] == "same values as sales.region"
+
+
+# ── drill_members and records ─────────────────────────────────────────────────
+
+def _with_drill_members(*names):
+    m = META[0]
+    measures = [{**x, "drillMembers": list(names)} if x["name"] == "sales.revenue" else x
+                for x in m["measures"]]
+    dims = [{**d, "aliasMember": "orders." + d["name"].split(".")[1]} for d in m["dimensions"]]
+    return [{**m, "measures": measures, "dimensions": dims}]
+
+
+def test_drill_members_come_first_by_view_or_cube_name():
+    meta = _with_drill_members("orders.channel", "sales.is_gift", "orders.nope")
+    cands = candidates({"measures": ["sales.revenue"]}, meta)
+    assert [c.member for c in cands] == ["sales.channel", "sales.is_gift", "sales.region"]
+
+
+def test_records_use_generic_columns_without_drill_members():
+    q = {"measures": ["sales.revenue", "sales.count"], "dimensions": ["sales.region"],
+         "time_dimensions": [{"dimension": "sales.created_at", "granularity": "month",
+                              "dateRange": "this year"}]}
+    out = records_query(q, {"sales.region": "West", "sales.created_at.month": "2026-03-01T00:00:00.000"}, META)
+    assert out == {
+        "measures": ["sales.revenue"],                       # a count per record is just 1
+        "dimensions": ["sales.created_at", "sales.region", "sales.channel", "sales.is_gift"],
+        "filters": [{"member": "sales.region", "operator": "equals", "values": ["West"]}],
+        "time_dimensions": [{"dimension": "sales.created_at", "dateRange": ["2026-03-01", "2026-03-31"]}],
+        "ungrouped": True, "limit": 100}
+
+
+def test_records_use_drill_members_when_listed():
+    out = records_query({"measures": ["sales.revenue"], "dimensions": ["sales.region"]},
+                        {"sales.region": "West"}, _with_drill_members("orders.customer_id", "sales.channel"))
+    assert out["dimensions"] == ["sales.customer_id", "sales.channel"]

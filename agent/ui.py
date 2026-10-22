@@ -1353,6 +1353,16 @@ _HTML = """<!DOCTYPE html>
     @keyframes bounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
 
     /* ── Input area ── */
+    #chat-toolbar {
+      display: flex; justify-content: flex-end; padding: 8px 16px 0; flex-shrink: 0;
+    }
+    #new-chat-btn {
+      background: #161b22; border: 1px solid #30363d; color: #cbd5e1; border-radius: 6px;
+      font-size: 0.75rem; padding: 4px 12px; cursor: pointer;
+    }
+    #new-chat-btn:hover { border-color: #6366f1; color: #fff; }
+    #new-chat-btn:disabled { opacity: .4; cursor: default; }
+    .chat-note { font-size: 0.72rem; color: #64748b; text-align: center; }
     #input-area {
       padding: 14px 16px;
       border-top: 1px solid #334155;
@@ -1650,7 +1660,7 @@ _HTML = """<!DOCTYPE html>
     <button id="tab-schema" onclick="switchTab('schema')">Schema</button>
     <button id="tab-draft" onclick="switchTab('draft')">Semantic layer</button>
   </nav>
-  <span id="session-cost" class="session-cost" title="LLM spend in this browser session">$0.000 this session</span>
+  <span id="session-cost" class="session-cost" title="LLM spend in this conversation">$0.000 this chat</span>
   <span class="stack-info">
     <a href="http://localhost:4000" target="_blank">Cube Playground</a> &nbsp;·&nbsp;
     <a href="http://localhost:3001/docs" target="_blank">Library API</a>
@@ -1660,6 +1670,9 @@ _HTML = """<!DOCTYPE html>
 <main id="view-chat">
   <!-- Chat -->
   <div id="chat-panel">
+    <div id="chat-toolbar">
+      <button id="new-chat-btn" title="Start a fresh conversation — the agent forgets this one">&#xFF0B; New chat</button>
+    </div>
     <div id="messages">
       <div class="msg agent">
         <div class="bubble">Hey! I can turn your data into charts. Try asking:<br><br>
@@ -1817,12 +1830,36 @@ _HTML = """<!DOCTYPE html>
     });
   }
 
-  // Stable session ID — one per browser tab, survives page refreshes within the tab.
-  const threadId = sessionStorage.getItem('threadId') || (() => {
+  // Conversation ID — one per browser tab, survives page refreshes within the tab
+  // (and, with the Postgres checkpointer, UI restarts). "New chat" swaps it.
+  const resumedThread = !!sessionStorage.getItem('threadId');
+  let threadId = sessionStorage.getItem('threadId') || (() => {
     const id = makeUUID();
     sessionStorage.setItem('threadId', id);
     return id;
   })();
+  const WELCOME_HTML = messagesEl.innerHTML;
+
+  function chatNote(text) {
+    const n = document.createElement('div');
+    n.className = 'chat-note';
+    n.textContent = text;
+    messagesEl.appendChild(n);
+  }
+
+  // Start a fresh conversation: new thread id, clean transcript, cost total back to 0.
+  // The old conversation stays in the checkpoint store; the agent just stops seeing it.
+  function newChat() {
+    if (sendBtn.disabled) return;          // a reply is still streaming
+    threadId = makeUUID();
+    sessionStorage.setItem('threadId', threadId);
+    messagesEl.innerHTML = WELCOME_HTML;
+    document.getElementById('chat-panel').classList.remove('fb-wide');
+    resetChatCost();
+    input.focus();
+  }
+  document.getElementById('new-chat-btn').addEventListener('click', newChat);
+  if (resumedThread) chatNote('Continuing your previous conversation — the agent remembers it. Use "New chat" to start fresh.');
 
   function scrollBottom() { messagesEl.scrollTop = messagesEl.scrollHeight; }
 
@@ -2702,6 +2739,12 @@ _HTML = """<!DOCTYPE html>
 
   // ── what each request cost (from the LLM calls' token usage) ───────────────
   let sessionDollars = 0, sessionRequests = 0;
+
+  function resetChatCost() {
+    sessionDollars = 0; sessionRequests = 0;
+    const sc = document.getElementById('session-cost');
+    if (sc) sc.textContent = '$0.000 this chat';
+  }
   const kTok = (n) => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n);
 
   function showCost(d) {
@@ -2709,7 +2752,7 @@ _HTML = """<!DOCTYPE html>
     sessionDollars += d.dollars;
     sessionRequests += 1;
     const sc = document.getElementById('session-cost');
-    if (sc) sc.textContent = '$' + sessionDollars.toFixed(3) + ' this session · ' +
+    if (sc) sc.textContent = '$' + sessionDollars.toFixed(3) + ' this chat · ' +
                              sessionRequests + (sessionRequests === 1 ? ' request' : ' requests');
     const cached = d.input_tokens ? Math.round(100 * d.cache_read / d.input_tokens) : 0;
     const wrap = document.createElement('div');

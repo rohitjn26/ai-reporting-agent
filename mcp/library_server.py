@@ -524,7 +524,8 @@ async def create_dashboard(
     _found, missing = await _load_graphs(graph_ids)
     if missing:
         return json.dumps(
-            {"error": "These graph_ids do not exist — save the graphs first:", "details": missing},
+            {"error": "These graph_ids do not exist. Call list_graphs for the real ids "
+                      "(never guess one), or save the graphs first:", "details": missing},
             indent=2,
         )
 

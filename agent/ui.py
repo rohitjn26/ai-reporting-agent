@@ -25,7 +25,7 @@ from langgraph.types import Command
 import uvicorn
 
 from graph.agent import (build_agent, maybe_summarise, close_checkpointer, MODEL_LABEL,
-                         CubeQueryError, _cube_load, _to_cube,
+                         CubeQueryError, _cube_load, _to_cube, drill_distances,
                          _fetch_cube_metadata, run_cube_query)
 from graph import feedback, pricing, tracing
 from graph import query_builder as qb
@@ -199,7 +199,8 @@ async def drill_options(request: Request):
     async with httpx.AsyncClient(timeout=30) as client:
         async def run(q):
             return (await _cube_load(client, _to_cube(q))).get("data", [])
-        report = await drill.rank_breakdown(scope, meta, run)
+        distances = await drill_distances(client, scope["measures"][0], meta) if scope.get("measures") else None
+        report = await drill.rank_breakdown(scope, meta, run, distances=distances)
 
     titles = {m["name"]: m.get("shortTitle") or m.get("title") or m["name"]
               for c in meta for m in c.get("dimensions", [])}

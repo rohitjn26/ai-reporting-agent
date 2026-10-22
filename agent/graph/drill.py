@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
@@ -169,19 +171,125 @@ def drill_members(query: dict, view_meta: list[dict]) -> list[str]:
     return out
 
 
-def candidates(query: dict, view_meta: list[dict]) -> list[Candidate]:
+# Words in a dimension name that usually mark a category worth splitting by.
+_CATEGORY_WORDS = ("name", "type", "status", "group", "category", "kind", "role", "state",
+                   "stage", "phase", "arm", "cohort", "country", "region", "gender", "label",
+                   "title", "level", "segment", "channel", "source")
+PER_CUBE = 3   # with a join tree, each nearby cube's best few dimensions go first
+
+
+def join_edges(sql: str) -> list[tuple[str, str]]:
+    """(parent, child) cube pairs from the JOIN clauses of Cube-generated SQL: the
+    joined alias is the child, the other alias in its ON condition the parent."""
+    edges = []
+    for m in re.finditer(r'JOIN\s+\S+\s+AS\s+"(\w+)"\s+ON\s+(.*?)(?=\b(?:LEFT|INNER|RIGHT|FULL)?\s*JOIN\b|\bWHERE\b|\bGROUP BY\b|\bORDER BY\b|\bLIMIT\b|$)',
+                         sql, flags=re.S | re.I):
+        child = m.group(1)
+        parent = next((a for a in re.findall(r'"(\w+)"\.', m.group(2)) if a != child), None)
+        if parent:
+            edges.append((parent, child))
+    return edges
+
+
+def cube_distances(edges: list[tuple[str, str]], start: str) -> dict[str, tuple[int, int]]:
+    """For every cube in the join tree: (joins away from `start`, 0 if it is `start`
+    or on start's path up to the root, else 1). Cubes on that path hold what each
+    row belongs to (a response's participant, site, ...), so they rank first."""
+    parent = {c: p for p, c in edges}
+    on_path, c = {start}, start
+    while c in parent and parent[c] not in on_path:
+        c = parent[c]
+        on_path.add(c)
+    adj = defaultdict(set)
+    for p, c in edges:
+        adj[p].add(c)
+        adj[c].add(p)
+    dist, todo = {start: 0}, deque([start])
+    while todo:
+        c = todo.popleft()
+        for n in adj[c]:
+            if n not in dist:
+                dist[n] = dist[c] + 1
+                todo.append(n)
+    return {c: (d, 0 if c in on_path else 1) for c, d in dist.items()}
+
+
+def _source_cube(member: dict) -> str:
+    return (member.get("aliasMember") or member["name"]).split(".")[0]
+
+
+def _column(member: dict) -> str:
+    """The underlying column name: the cube member a view dimension aliases."""
+    return (member.get("aliasMember") or member["name"]).split(".")[-1].lower()
+
+
+_LABEL_WORDS = ("name", "title", "label")
+
+
+def _category_rank(member: dict) -> int:
+    """0 for a label column (site name, task title), 1 for other category-like
+    columns (status, type, group, ...), 2 for the rest."""
+    words = _column(member).split("_")
+    if any(w in words for w in _LABEL_WORDS):
+        return 0
+    return 1 if any(w in words for w in _CATEGORY_WORDS) else 2
+
+
+def _boilerplate(dims: list[dict]) -> set[str]:
+    """Columns nearly every cube in the view has (platform fields like type,
+    data_source, locales). They rarely split the data in a way that explains
+    anything, so they go after each cube's own columns."""
+    cubes_by_col: dict[str, set[str]] = defaultdict(set)
+    for d in dims:
+        cubes_by_col[_column(d)].add(_source_cube(d))
+    n = len({_source_cube(d) for d in dims})
+    return {c for c, cubes in cubes_by_col.items() if n >= 4 and len(cubes) >= 0.75 * n}
+
+
+def _by_join_distance(dims: list[dict], distances: dict[str, tuple[int, int]]) -> list[dict]:
+    """Nearest cubes first; within a cube, label columns (name, title) first, then
+    other category-like ones, view-wide boilerplate last within each of those. The first PER_CUBE of every cube come before the
+    rest, so a wide view's nearest cube can't fill the whole probe budget."""
+    far = (len(distances) + 1, 1)
+    common = _boilerplate(dims)
+    by_cube: dict[str, list[dict]] = defaultdict(list)
+    for d in dims:
+        by_cube[_source_cube(d)].append(d)
+    order = sorted(by_cube, key=lambda c: (distances.get(c, far), c))
+    for c in order:   # stable sort: model order within a rank
+        by_cube[c].sort(key=lambda d: (_category_rank(d), _column(d) in common))
+    head = [d for c in order for d in by_cube[c][:PER_CUBE]]
+    tail = [d for c in order for d in by_cube[c][PER_CUBE:]]
+    return head + tail
+
+
+def candidates(query: dict, view_meta: list[dict],
+               distances: Optional[dict[str, tuple[int, int]]] = None) -> list[Candidate]:
     """What the query can be drilled into next: one finer step on each of its time
     dimensions, then every groupable dimension of its view that isn't already in
     the query, pinned by a filter, or an identifier. Dimensions the measure lists
-    as drill_members in the data model, when it has any, come first."""
+    as drill_members in the data model, when it has any, come first. With
+    `distances` (cube_distances from the measure's cube), the rest are ordered by
+    how close their cube is to the measure — otherwise model order, which for a
+    wide view means the root cube's columns (often one value) fill the budget."""
     out = [Candidate(td["dimension"], finer(td.get("granularity")))
            for td in query.get("time_dimensions", []) if finer(td.get("granularity"))]
     taken = set(query.get("dimensions", [])) | _pinned(query)
     dims = [d for d in _view_members(view_meta, _view_of(query), "dimensions")
             if d.get("type") in SPLIT_TYPES and d["name"] not in taken and not _looks_like_id(d)]
+    if distances:
+        dims = _by_join_distance(dims, distances)
     preferred = drill_members(query, view_meta)
     dims.sort(key=lambda d: preferred.index(d["name"]) if d["name"] in preferred else len(preferred))
     return out + [Candidate(d["name"]) for d in dims]
+
+
+def measure_cube(query: dict, view_meta: list[dict]) -> Optional[str]:
+    """The cube a view measure comes from (its aliasMember's cube)."""
+    for m in _view_members(view_meta, _view_of(query), "measures"):
+        if m["name"] == query["measures"][0]:
+            return _source_cube(m)
+    return None
 
 
 # ── the drill itself ──────────────────────────────────────────────────────────
@@ -405,6 +513,33 @@ def _with_range(scope: dict, time_dimension: str, date_range) -> dict:
     return q
 
 
+_ID_LIKE = re.compile(r"^(?:[0-9a-f]{24}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", re.I)
+
+
+def _unreadable(values: dict) -> bool:
+    """Most values are object ids or JSON blobs: ranking them would name a driver
+    nobody can read ("69e6a5ed..." or '{"additional":[]}'), so skip the dimension."""
+    shown = [str(k).strip() for k in values if k is not None and k != OTHER]
+    if not shown:
+        return False
+    odd = sum(1 for v in shown if _ID_LIKE.match(v) or v[:1] in "{[")
+    return odd / len(shown) >= 0.5
+
+
+_UNREADABLE_NOTE = "its values are ids or JSON, not readable labels"
+
+
+def _fans_out(values: dict, total: float) -> bool:
+    """A split whose parts add up to more (or less) than the whole counts some rows
+    more than once — the dimension reaches the measure through a one-to-many join."""
+    return abs(sum(values.values()) - total) > max(1.0, 0.005 * abs(total))
+
+
+def _fan_out_note(values: dict, total: float) -> str:
+    return (f"its values add up to {sum(values.values()):,.0f}, not the total {total:,.0f} "
+            "(it reaches this measure through a join that repeats rows)")
+
+
 def _sort_key(r) -> tuple:
     return (-(r.score if r.score is not None else -1), len(r.members), r.candidate.member)
 
@@ -417,10 +552,11 @@ async def rank_change(
     time_dimension: str,
     period,
     compare_period,
-    max_candidates: int = 8,
+    max_candidates: int = 24,
     max_members: int = 50,
     min_share: float = 0.01,
     top_k: int = 3,
+    distances: Optional[dict[str, tuple[int, int]]] = None,
 ) -> ChangeReport:
     """Rank the dimensions that explain how scope's first measure moved from
     `compare_period` to `period` (Cube dateRanges), and each one's members.
@@ -431,7 +567,7 @@ async def rank_change(
                           "per-segment contributions")
     cur_scope = _with_range(scope, time_dimension, period)
     base_scope = _with_range(scope, time_dimension, compare_period)
-    cands = [c for c in candidates(scope, view_meta) if not c.is_time][:max_candidates]
+    cands = [c for c in candidates(scope, view_meta, distances) if not c.is_time][:max_candidates]
 
     totals = [{"measures": [measure], "filters": q.get("filters", []),
                "time_dimensions": [{k: v for k, v in td.items() if k != "granularity"}
@@ -460,6 +596,13 @@ async def rank_change(
             report.skipped[c.member] = f"more than {max_members} members"
             continue
         cur_v, base_v = _values(cur_rows, c, measure), _values(base_rows, c, measure)
+        if _fans_out(cur_v, current) or _fans_out(base_v, base):
+            bad, total = (cur_v, current) if _fans_out(cur_v, current) else (base_v, base)
+            report.skipped[c.member] = _fan_out_note(bad, total)
+            continue
+        if _unreadable({**base_v, **cur_v}):
+            report.skipped[c.member] = _UNREADABLE_NOTE
+            continue
         keys = set(cur_v) | set(base_v)
         sizes = {k: max(abs(base_v.get(k, 0.0)), abs(cur_v.get(k, 0.0))) for k in keys}
         cur_v, base_v = _fold_small(sizes, min_share, cur_v, base_v)
@@ -490,20 +633,25 @@ async def rank_breakdown(
     view_meta: list[dict],
     run: Run,
     *,
-    max_candidates: int = 8,
+    max_candidates: int = 24,
     max_members: int = 50,
     min_share: float = 0.01,
+    distances: Optional[dict[str, tuple[int, int]]] = None,
 ) -> BreakdownReport:
     """Rank what `query` could be drilled into when there's nothing to compare
     against: the dimension where a few members dominate comes first."""
     measure = query["measures"][0]
     additive = is_additive(measure, view_meta)
-    cands = candidates(query, view_meta)[:max_candidates]
+    cands = candidates(query, view_meta, distances)[:max_candidates]
+    total_q = {k: v for k, v in _probe(query, Candidate(measure), max_members).items() if k != "dimensions"}
     results = await asyncio.gather(*(run(_probe(query, c, max_members)) for c in cands),
-                                   return_exceptions=True)
+                                   *([run(total_q)] if additive else []), return_exceptions=True)
+    whole = None
+    if additive and not isinstance(results[-1], BaseException):
+        whole = sum(_num(r.get(measure)) for r in results[-1])
     report = BreakdownReport(measure, [])
 
-    for c, rows in zip(cands, results):
+    for c, rows in zip(cands, results[:len(cands)]):
         if isinstance(rows, BaseException):
             report.skipped[c.member] = f"query failed: {rows}"
             continue
@@ -511,6 +659,12 @@ async def rank_breakdown(
             report.skipped[c.member] = f"more than {max_members} members"
             continue
         values = _values(rows, c, measure)
+        if whole is not None and not c.is_time and _fans_out(values, whole):
+            report.skipped[c.member] = _fan_out_note(values, whole)
+            continue
+        if not c.is_time and _unreadable(values):
+            report.skipped[c.member] = _UNREADABLE_NOTE
+            continue
         if additive:
             (values,) = _fold_small(values, min_share, values)
         if len(values) < 2:

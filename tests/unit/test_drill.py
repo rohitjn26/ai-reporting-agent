@@ -326,3 +326,77 @@ def test_records_use_drill_members_when_listed():
     out = records_query({"measures": ["sales.revenue"], "dimensions": ["sales.region"]},
                         {"sales.region": "West"}, _with_drill_members("orders.customer_id", "sales.channel"))
     assert out["dimensions"] == ["sales.customer_id", "sales.channel"]
+
+
+# ── ordering by join distance; refusing splits that double-count or can't be read ──
+
+from graph.drill import cube_distances, join_edges  # noqa: E402
+
+CUBE_SQL = '''SELECT count("resp".id) FROM app.org AS "org"
+LEFT JOIN app.site AS "site" ON "org".id = "site".org
+LEFT JOIN app.participant AS "part" ON "part".site = "site".id
+LEFT JOIN app.response AS "resp" ON "part".id = "resp".participant
+LEFT JOIN app.event AS "event" ON "part".id = "event".participant  GROUP BY 1 LIMIT 1'''
+
+
+def test_join_edges_read_parent_and_child_whichever_side_of_on_they_are():
+    assert join_edges(CUBE_SQL) == [("org", "site"), ("site", "part"), ("part", "resp"), ("part", "event")]
+
+
+def test_cube_distances_put_the_path_to_the_root_before_side_branches():
+    d = cube_distances(join_edges(CUBE_SQL), "resp")
+    assert d["resp"] == (0, 0) and d["part"] == (1, 0) and d["site"] == (2, 0) and d["org"] == (3, 0)
+    assert d["event"] == (2, 1)          # as far as site, but a side branch
+
+
+WIDE = [{"name": "v", "measures": [{"name": "v.count", "aggType": "count", "aliasMember": "resp.count"}],
+         "dimensions": [
+             {"name": f"v.{cube}_{col}", "type": "string", "aliasMember": f"{cube}.{col}"}
+             for cube, cols in {
+                 "org":   ["type", "data_source", "plan", "name"],
+                 "site":  ["type", "data_source", "address", "country", "name"],
+                 "part":  ["type", "data_source", "status", "email"],
+                 "resp":  ["type", "data_source", "answer"],
+                 "event": ["type", "data_source", "title"],
+             }.items() for col in cols]}]
+
+
+def test_with_distances_near_cubes_and_label_columns_come_first():
+    order = [c.member for c in candidates({"measures": ["v.count"]}, WIDE,
+                                          cube_distances(join_edges(CUBE_SQL), "resp"))]
+    # nearest cube first, then up the path; the side branch after site (same distance), root last
+    cubes = list(dict.fromkeys(m.split(".")[1].split("_")[0] for m in order[:15]))
+    assert cubes == ["resp", "part", "site", "event", "org"]
+    site = [m for m in order if m.startswith("v.site_")]
+    assert site[:2] == ["v.site_name", "v.site_country"]      # label, then category
+    assert site.index("v.site_type") > site.index("v.site_country")   # boilerplate after own columns
+
+
+def test_without_distances_model_order_is_kept():
+    order = [c.member for c in candidates({"measures": ["v.count"]}, WIDE)]
+    assert order[0] == "v.org_type"
+
+
+async def test_a_split_that_double_counts_is_refused():
+    cube = fake_cube(FACTS)
+
+    async def run(q):
+        rows = await cube(q)
+        if "sales.channel" in q.get("dimensions", []):   # channel reached through a fan-out join
+            rows = [{**r, "sales.revenue": str(float(r["sales.revenue"]) * 2)} for r in rows]
+        return rows
+
+    report = await rank_change(SCOPE, META, run, time_dimension="sales.created_at",
+                               period=MAR, compare_period=FEB)
+    assert "add up to" in report.skipped["sales.channel"]
+    assert "sales.channel" not in [r.candidate.member for r in report.rankings]
+    breakdown = await rank_breakdown({"measures": ["sales.revenue"]}, META, run)
+    assert "add up to" in breakdown.skipped["sales.channel"]
+
+
+async def test_ids_and_json_values_are_skipped_as_unreadable():
+    facts = [{**f, "region": {"West": "69e6a5eda8281e62845ad69d", "East": "69e6a5eea8281e62845ad6d1"}[f["region"]]}
+             for f in FACTS]
+    report = await rank_change(SCOPE, META, fake_cube(facts), time_dimension="sales.created_at",
+                               period=MAR, compare_period=FEB)
+    assert report.skipped["sales.region"] == "its values are ids or JSON, not readable labels"

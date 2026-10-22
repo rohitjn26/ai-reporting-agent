@@ -420,6 +420,34 @@ def _to_cube(query: dict) -> dict:
     return q
 
 
+async def drill_distances(client: httpx.AsyncClient, measure: str,
+                          view_meta: list[dict]) -> dict | None:
+    """How far each cube of the measure's view is from the measure's own cube, from
+    the JOINs Cube generates for one query touching every cube (Cube's /sql only
+    compiles it; nothing runs). Lets the drill engine try a response's participant
+    and site before the organization's settings. None if it can't be worked out —
+    the engine then falls back to model order."""
+    start = drill.measure_cube({"measures": [measure]}, view_meta)
+    reps: dict[str, str] = {}
+    for c in view_meta:
+        for d in c.get("dimensions", []):
+            cube = (d.get("aliasMember") or "").split(".")[0]
+            if cube and cube not in reps and d.get("type") in drill.SPLIT_TYPES:
+                reps[cube] = d["name"]
+    if not start or not reps:
+        return None
+    q = {"measures": [measure], "dimensions": list(reps.values()), "limit": 1}
+    try:
+        resp = await client.get(f"{CUBE_URL}/cubejs-api/v1/sql", params={"query": json.dumps(q)},
+                                headers={"Authorization": f"Bearer {CUBE_API_SECRET}"})
+        resp.raise_for_status()
+        sql = resp.json()["sql"]["sql"][0]
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+        return None
+    edges = drill.join_edges(sql)
+    return drill.cube_distances(edges, start) if edges else None
+
+
 async def _cube_load(client: httpx.AsyncClient, q: dict) -> dict:
     """POST a Cube-shaped query to /load -> the response body (data, and the query
     as Cube resolved it). Raises CubeQueryError when Cube reports an error."""
@@ -643,11 +671,13 @@ async def explain_change(
                 {"dimension": time_dimension, "dateRange": date_range}]}))
             return [v[:10] for v in body["query"]["timeDimensions"][0]["dateRange"]]
 
+        distances = await drill_distances(client, measure, view_meta)
         try:
             current = await resolve(period)
             previous = await resolve(compare_period) if compare_period else drill.previous_period(current)
             report = await drill.rank_change(scope, view_meta, run, time_dimension=time_dimension,
-                                             period=current, compare_period=previous)
+                                             period=current, compare_period=previous,
+                                             distances=distances)
             inside = None
             top = report.rankings[0] if report.rankings else None
             if top and top.members[0].value != drill.OTHER:
@@ -656,7 +686,8 @@ async def explain_change(
                 inside = {"segment": segment,
                           "drivers": _drivers(await drill.rank_change(
                               sub, view_meta, run, time_dimension=time_dimension,
-                              period=current, compare_period=previous, max_candidates=6), 2, 3)}
+                              period=current, compare_period=previous, max_candidates=12,
+                              distances=distances), 2, 3)}
         except drill.NotAdditive as e:
             return json.dumps({"error": str(e), "instruction": (
                 "Tell the user this measure is an average, ratio or distinct count, which "

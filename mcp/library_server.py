@@ -415,7 +415,17 @@ async def save_graph(
     Returns:
         The created GRAPH resource as JSON (includes assigned id), or validation errors.
     """
-    errors = _validate_graph(chart_type, cube_query, mapping or {})
+    # Same leniency as create_chart: a time dimension may be named as its result
+    # column ("x.created_at.week"); store it as the queried member ("x.created_at").
+    mapping = dict(mapping or {})
+    suffixed = {f"{td['dimension']}.{td['granularity']}": td["dimension"]
+                for td in cube_query.get("time_dimensions", [])
+                if td.get("dimension") and td.get("granularity")}
+    for k in ("label_dimension", "series_dimension"):
+        if mapping.get(k) in suffixed:
+            mapping[k] = suffixed[mapping[k]]
+
+    errors = _validate_graph(chart_type, cube_query, mapping)
     if errors:
         return json.dumps({"error": "Graph is not replayable — fix these:", "details": errors}, indent=2)
 

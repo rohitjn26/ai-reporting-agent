@@ -4,7 +4,7 @@ LangGraph ReAct agent wired to MCP tool servers + local chart/config tools.
 import asyncio, json, os, uuid
 from collections import OrderedDict
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Literal
 import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, ToolMessage
@@ -26,7 +26,7 @@ except ImportError:  # postgres extras not installed — dev keeps using MemoryS
     dict_row = None
 
 from chart.renderer import render_chart
-from chart.replay import apply_mapping, build_table_grid
+from chart.replay import apply_mapping, build_table_grid, normalize_mapping
 from chart.server import serve_chart
 from graph.config_editor import edit_cube_config
 from graph import query_builder as qb
@@ -714,6 +714,38 @@ def guarded_query_cube(mcp_query_cube):
     return query_cube
 
 
+def gated_cube_metadata(mcp_get_metadata):
+    """Wrap get_cube_metadata so the model must say why it wants the schema. The prompt
+    already says data questions go to build_query, yet Haiku still opened with
+    get_cube_metadata (catalog, then a whole view) "to explore" — two wasted calls that
+    left ~100k tokens of schema in the history for every later call of the turn. With a
+    required purpose whose only values are schema questions and config edits, a data
+    question has no honest value to pass. build_query fetches the schema itself."""
+
+    @tool
+    async def get_cube_metadata(
+        purpose: Literal["schema_question", "config_edit"],
+        view: str = "",
+    ) -> str:
+        """Describe the queryable schema — ONLY when the user asks ABOUT the schema
+        ("what fields are there?", "what does the sales view cover?") or during a config
+        edit. Never for a data question (a chart, table, number, "per week", "by country"):
+        there is no purpose for that — call build_query, which reads the schema itself.
+
+        With no view: a short catalog of views. With view="<name>": that view's
+        measures and dimensions with descriptions. Does not list saved graphs (use
+        list_graphs).
+
+        Args:
+            purpose: "schema_question" (the user asked what data/fields exist) or
+                     "config_edit" (you are adding or changing a cube field)
+            view:    optional view name for its fields
+        """
+        return _tool_output_text(await mcp_get_metadata.ainvoke({"view": view}))
+
+    return get_cube_metadata
+
+
 def _tool_output_text(out) -> str:
     if isinstance(out, list):
         return "".join(b.get("text", "") if isinstance(b, dict) else str(b) for b in out)
@@ -813,7 +845,8 @@ def create_chart(
         if chart_type == "table":
             columns, rows = build_table_grid(data, ann, q)
         else:
-            problems = graph_mapping_problems(q, mapping or {})
+            mapping = normalize_mapping(mapping or {}, q)
+            problems = graph_mapping_problems(q, mapping)
             if problems:
                 return json.dumps({"error": "Bad mapping for this result:", "details": problems})
             labels, datasets = apply_mapping(data, ann, mapping, q)
@@ -952,6 +985,8 @@ async def build_agent():
     # query_cube is swapped for a guarded wrapper: it refuses fields that didn't
     # come from build_query (see graph/guard.py).
     mcp_tools = [guarded_query_cube(t) if t.name == "query_cube" else t for t in mcp_tools]
+    # get_cube_metadata needs a stated purpose, none of which is a data question.
+    mcp_tools = [gated_cube_metadata(t) if t.name == "get_cube_metadata" else t for t in mcp_tools]
     # commit_cube_config_update is swapped for one that reloads Cube and rolls the
     # change back if it doesn't compile (needs both MCP servers' tools).
     by_name = {t.name: t for t in mcp_tools}

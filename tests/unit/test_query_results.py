@@ -93,6 +93,30 @@ def test_bad_mapping_is_reported_not_rendered(rendered):
     assert "s.city" in out["details"][0] and not rendered
 
 
+def test_time_dimension_accepted_under_its_row_name(rendered):
+    # The model read "s.created.week" off the rows and passed that; it used to be
+    # rejected as "not one of the query's dimensions ['s.created']".
+    q = {"measures": ["s.revenue"], "dimensions": [], "filters": [], "limit": 1000, "order": {},
+         "time_dimensions": [{"dimension": "s.created", "granularity": "week"}]}
+    rows = [{"s.created.week": "2026-05-04T00:00:00.000", "s.revenue": "166"}]
+    rid = json.loads(agent.compact_result(q, _raw(rows)))["result_id"]
+    msg = agent.create_chart.invoke({"chart_type": "bar", "result_id": rid,
+                                     "mapping": {"label_dimension": "s.created.week",
+                                                 "series_measures": ["s.revenue"]}})
+    assert "Chart rendered" in msg
+    assert rendered[0][2][0]["data"] == [166]
+
+
+def test_wrong_granularity_suffix_is_still_rejected(rendered):
+    q = {"measures": ["s.revenue"], "dimensions": [], "filters": [], "limit": 1000, "order": {},
+         "time_dimensions": [{"dimension": "s.created", "granularity": "week"}]}
+    rid = json.loads(agent.compact_result(q, _raw([])))["result_id"]
+    out = json.loads(agent.create_chart.invoke({"chart_type": "bar", "result_id": rid,
+                                                "mapping": {"label_dimension": "s.created.month",
+                                                            "series_measures": ["s.revenue"]}}))
+    assert "s.created.month" in out["details"][0] and not rendered
+
+
 def test_unknown_result_id_asks_for_a_rerun(rendered):
     out = json.loads(agent.create_chart.invoke({"chart_type": "bar", "result_id": "r_gone"}))
     assert "query_cube again" in out["error"] and not rendered
@@ -126,6 +150,31 @@ def test_metadata_for_one_view_lists_members(cube_server_mod):
 
 def test_metadata_unknown_view_names_the_real_ones(cube_server_mod):
     assert "Available: sales" in cube_server_mod.format_metadata(META, "nope")
+
+
+class _FakeMetaTool:
+    def __init__(self):
+        self.calls = []
+
+    async def ainvoke(self, args):
+        self.calls.append(args)
+        return f"schema for {args.get('view') or 'all'}"
+
+
+def test_agent_metadata_tool_requires_a_non_data_purpose():
+    gated = agent.gated_cube_metadata(_FakeMetaTool())
+    props = gated.tool_call_schema.model_json_schema()
+    assert "purpose" in props["required"]
+    assert set(props["properties"]["purpose"]["enum"]) == {"schema_question", "config_edit"}
+    with pytest.raises(Exception):          # no purpose -> the call never reaches Cube
+        gated.invoke({"view": "sales"})
+
+
+async def test_agent_metadata_tool_passes_the_view_through():
+    fake = _FakeMetaTool()
+    gated = agent.gated_cube_metadata(fake)
+    out = await gated.ainvoke({"purpose": "schema_question", "view": "sales"})
+    assert out == "schema for sales" and fake.calls == [{"view": "sales"}]
 
 
 # ── build_query caches the schema ─────────────────────────────────────────────

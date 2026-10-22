@@ -50,6 +50,21 @@ def row_key(member: str, cube_query: dict) -> str:
     return member
 
 
+def normalize_mapping(mapping: dict, cube_query: dict) -> dict:
+    """Accept a time dimension under its result-row name too. The model reads
+    "orders.created_at.month" off the rows and passes that, but a mapping names the
+    queried member ("orders.created_at"); strip the suffix when it is the granularity
+    that member was queried at."""
+    suffixed = {f"{td['dimension']}.{td['granularity']}": td["dimension"]
+                for td in cube_query.get("time_dimensions", [])
+                if td.get("dimension") and td.get("granularity")}
+    out = dict(mapping)
+    for k in ("label_dimension", "series_dimension"):
+        if out.get(k) in suffixed:
+            out[k] = suffixed[out[k]]
+    return out
+
+
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 

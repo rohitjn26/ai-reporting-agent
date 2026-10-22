@@ -119,3 +119,14 @@ async def test_wrapper_blocks_then_allows_via_toolnode():
                     {"measures": ["sales.count"], "dimensions": ["sales.status"]})
     assert ok["sql"] == "SELECT 1"
     assert calls == [{"measures": ["sales.count"], "dimensions": ["sales.status"]}]
+
+
+def test_explain_change_chart_query_counts_as_a_build():
+    chart = {"measures": ["sales.count"], "dimensions": ["sales.country"],
+             "time_dimensions": [{"dimension": "sales.created_at", "dateRange": ["2026-09-01", "2026-09-30"]}]}
+    explained = ToolMessage(content=json.dumps({"change": -2, "chart_query": chart}),
+                            name="explain_change", tool_call_id="e1")
+    h = _history(_built(BUILT), explained)
+    assert guard.check_provenance(chart, h) is None
+    no_chart = ToolMessage(content=json.dumps({"error": "x"}), name="explain_change", tool_call_id="e2")
+    assert "sales.country" in guard.check_provenance(chart, _history(_built(BUILT), no_chart))

@@ -11,6 +11,9 @@ Provenance is read from the conversation itself (the build_query ToolMessages in
 graph state), not process memory, so it survives restarts and works on any
 replica that resumes the thread.
 
+explain_change's `chart_query` counts as a build too: the engine picks its
+dimension from the live schema, so charting it needs no second build_query.
+
 What the agent MAY still change without re-running build_query: filter values,
 limit, order direction, time granularity / date range, and dropping members —
 anything that doesn't introduce a member build_query didn't choose.
@@ -64,11 +67,14 @@ def recent_builds(messages: list) -> list[dict]:
         if isinstance(m, HumanMessage) and not str(m.content).startswith("[Conversation summary]"):
             in_turn = False
             continue
-        if isinstance(m, ToolMessage) and m.name == "build_query":
+        if isinstance(m, ToolMessage) and m.name in ("build_query", "explain_change"):
             try:
                 parsed = json.loads(_tool_text(m))
             except (ValueError, TypeError):
                 continue
+            if m.name == "explain_change":
+                # its chart_query is built from schema members, like build_query's output
+                parsed = parsed.get("chart_query") if isinstance(parsed, dict) else None
             if isinstance(parsed, dict):
                 (turn if in_turn else earlier).append(parsed)
                 if not in_turn:

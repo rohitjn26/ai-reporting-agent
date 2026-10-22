@@ -160,7 +160,7 @@ def test_build_query_puts_examples_in_prompt():
     q = qb.build_query("net sales", VIEW, llm=llm, examples_fn=examples_fn)
     assert q == {"measures": ["sales.net_revenue"]}
     assert seen["args"] == ("net sales", ["sales"])
-    text = "\n".join(m[1] for m in llm.msgs[0])
+    text = "\n".join(m[1] if isinstance(m[1], str) else m[1][0]["text"] for m in llm.msgs[0])
     assert "Verified examples" in text and "net sales by country" in text
     # examples sit before the request
     assert llm.msgs[0][-1][1] == "Request: net sales"

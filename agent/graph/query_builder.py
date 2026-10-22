@@ -216,6 +216,21 @@ def _default_view_llm(model: str):
     return ChatAnthropic(model=model, temperature=0).with_structured_output(ViewSelection)
 
 
+def _call(llm, msgs, config):
+    """llm.invoke, passing the caller's RunnableConfig when there is one. The agent
+    runs build_query in a worker thread, so without an explicit config these calls
+    would not report to the agent run's callbacks (the UI's cost meter, tracing)."""
+    return llm.invoke(msgs, config=config) if config else llm.invoke(msgs)
+
+
+def _cached(text: str) -> list[dict]:
+    """A message body marked as a prompt-cache breakpoint. The schema / view catalog
+    is the big, stable part of every build_query call (often 50k+ tokens), so caching
+    it makes repeat calls on the same view ~10x cheaper. Everything after it (examples,
+    context, the request) varies per call and stays uncached."""
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+
+
 def select_view(
     request: str,
     metadata: list[dict],
@@ -224,15 +239,16 @@ def select_view(
     model: str | None = None,
     llm=None,
     cubes: list[dict] | None = None,
+    config=None,
 ) -> ViewSelection:
     """Route a request to exactly one view. Returns ViewSelection(view=None) when
     the request would need to span views (Cube can't answer that in one query)."""
     llm = llm or _default_view_llm(model or os.environ.get("VIEW_SELECTOR_MODEL", "claude-haiku-4-5-20251001"))
-    msgs = [("system", _SELECT_SYSTEM), ("human", f"Views:\n{render_view_catalog(metadata, cubes)}")]
+    msgs = [("system", _SELECT_SYSTEM), ("human", _cached(f"Views:\n{render_view_catalog(metadata, cubes)}"))]
     if context:
         msgs.append(("human", f"Recent conversation (for follow-ups):\n{context}"))
     msgs.append(("human", f"Request: {request}"))
-    return llm.invoke(msgs)
+    return _call(llm, msgs, config)
 
 
 def _resolve_view(
@@ -243,13 +259,15 @@ def _resolve_view(
     model: str | None,
     view_llm,
     cubes: list[dict] | None = None,
+    config=None,
 ) -> tuple[list[dict] | None, str | None]:
     """Pick the single view this request lives in and return (view_metadata, error).
     With 0–1 views there's nothing to route. `error` is set (and metadata None)
     when no single view fits, so callers can surface the boundary honestly."""
     if len(metadata) <= 1:
         return metadata, None
-    sel = select_view(request, metadata, context=context, model=model, llm=view_llm, cubes=cubes)
+    sel = select_view(request, metadata, context=context, model=model, llm=view_llm, cubes=cubes,
+                      config=config)
     if not sel.view:
         return None, sel.reason or "request spans multiple views and can't be answered in one query"
     view_meta = [c for c in metadata if c.get("name") == sel.view]
@@ -278,8 +296,8 @@ def _get_examples(examples_fn, request: str, view_meta: list[dict]) -> list[dict
 
 def _invoke(llm, request: str, schema_text: str, context: str | None,
             prior: dict | None, feedback: list[str] | None,
-            examples: list[dict] | None = None) -> CubeQuery:
-    msgs = [("system", _SYSTEM), ("human", f"Schema:\n{schema_text}")]
+            examples: list[dict] | None = None, config=None) -> CubeQuery:
+    msgs = [("system", _SYSTEM), ("human", _cached(f"Schema:\n{schema_text}"))]
     if examples:
         msgs.append(("human",
             "Verified examples — past requests on this data where a user confirmed or "
@@ -296,7 +314,7 @@ def _invoke(llm, request: str, schema_text: str, context: str | None,
             f"Your previous query was invalid:\n{prior}\nProblems:\n- " + "\n- ".join(feedback) +
             "\nReturn a corrected query using only valid members."))
     msgs.append(("human", f"Request: {request}"))
-    return llm.invoke(msgs)
+    return _call(llm, msgs, config)
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -312,6 +330,7 @@ def build_query(
     max_repairs: int = 1,
     cubes: list[dict] | None = None,
     examples_fn: Callable[[str, list[dict]], list[dict]] | None = None,
+    config=None,
 ) -> dict:
     """NL → validated Cube query dict. Routes to a single view first (a query can
     never span views), builds against only that view's slice, then repairs static
@@ -320,9 +339,10 @@ def build_query(
 
     `examples_fn(request, view_meta)` (optional) returns past verified
     {request, query} pairs for the chosen view — human feedback reused as
-    few-shot examples (see graph/feedback.py)."""
+    few-shot examples (see graph/feedback.py). `config` is the caller's RunnableConfig,
+    forwarded to every LLM call."""
     view_meta, view_error = _resolve_view(request, metadata, context=context, model=model,
-                                          view_llm=view_llm, cubes=cubes)
+                                          view_llm=view_llm, cubes=cubes, config=config)
     if view_error:
         return {"_view_error": view_error}
 
@@ -330,13 +350,13 @@ def build_query(
     schema_text = render_schema(view_meta)
     examples = _get_examples(examples_fn, request, view_meta)
 
-    result = _invoke(llm, request, schema_text, context, None, None, examples)
+    result = _invoke(llm, request, schema_text, context, None, None, examples, config)
     query = result.to_query()
     problems = validate_query(query, view_meta)
 
     repairs = 0
     while problems and repairs < max_repairs:
-        result = _invoke(llm, request, schema_text, context, query, problems, examples)
+        result = _invoke(llm, request, schema_text, context, query, problems, examples, config)
         query = result.to_query()
         problems = validate_query(query, view_meta)
         repairs += 1

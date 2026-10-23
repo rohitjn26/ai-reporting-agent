@@ -423,6 +423,14 @@ def _from_draft(base: str, path: str, force: bool, skip_data: bool, pg_url: str 
         for table, rows in load_data(draft, pg_url or DEFAULT_PG_URL).items():
             print(f"  {table}: {rows} rows")
         print()
+        # New data, so new column stats (what drill-down uses to pick dimensions).
+        try:
+            from discovery.stats import refresh_stats
+            st = refresh_stats(draft["dataset"], source_url=pg_url or DEFAULT_PG_URL)
+            print(f"Column stats: {st['columns']} columns in {st['tables']} tables"
+                  + (f" (failed: {st['failed']})" if st["failed"] else "") + "\n")
+        except Exception as e:  # stats are an optimisation; never fail a seed over them
+            print(f"  note: column stats not refreshed ({e}); run `make stats`\n")
 
     _seed(base, "CUBE_CONFIG", draft.get("cubes", []), update=True)
     _seed(base, "VIEW", draft.get("views", []), update=True)

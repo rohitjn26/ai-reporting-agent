@@ -25,7 +25,7 @@ from langgraph.types import Command
 import uvicorn
 
 from graph.agent import (build_agent, maybe_summarise, close_checkpointer, MODEL_LABEL,
-                         CubeQueryError, _cube_load, _to_cube, drill_distances,
+                         CubeQueryError, _cube_load, _to_cube, drill_context,
                          _fetch_cube_metadata, run_cube_query)
 from graph import feedback, pricing, tracing
 from graph import query_builder as qb
@@ -199,8 +199,9 @@ async def drill_options(request: Request):
     async with httpx.AsyncClient(timeout=30) as client:
         async def run(q):
             return (await _cube_load(client, _to_cube(q))).get("data", [])
-        distances = await drill_distances(client, scope["measures"][0], meta) if scope.get("measures") else None
-        report = await drill.rank_breakdown(scope, meta, run, distances=distances)
+        distances, col_stats = (await drill_context(client, scope["measures"][0], meta)
+                                if scope.get("measures") else (None, None))
+        report = await drill.rank_breakdown(scope, meta, run, distances=distances, stats=col_stats)
 
     titles = {m["name"]: m.get("shortTitle") or m.get("title") or m["name"]
               for c in meta for m in c.get("dimensions", [])}
@@ -261,6 +262,37 @@ def discovery_browse(path: str | None = None):
         return {"path": str(base), "parent": parent, "dirs": dirs, "csv_count": csv_count}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ── column stats for drill-down (discovery/stats.py) ─────────────────────────
+
+def _stats():
+    _load_run_discovery()  # puts the repo root on sys.path
+    from discovery import stats
+    return stats
+
+
+@app.get("/stats")
+async def stats_status():
+    """Per data schema: when its column stats were computed, and whether a refresh runs."""
+    st = _stats()
+    try:
+        schemas = await asyncio.to_thread(st.data_schemas)
+        saved = await asyncio.to_thread(st.status)
+    except Exception as e:
+        return JSONResponse({"error": f"could not read stats: {e}"}, status_code=502)
+    busy = st.running()
+    return {"schemas": [{"schema": s, **saved.get(s, {}), "running": s in busy} for s in schemas]}
+
+
+@app.post("/stats/refresh")
+async def stats_refresh(request: Request):
+    """Recompute one schema's column stats in the background."""
+    schema = (await request.json()).get("schema", "")
+    if not schema:
+        return JSONResponse({"error": "schema is required"}, status_code=400)
+    started = _stats().refresh_in_background(schema)
+    return {"schema": schema, "started": started}
 
 
 @app.post("/discovery/run")
@@ -1468,6 +1500,14 @@ _HTML = """<!DOCTYPE html>
     }
     #schema-side button.primary:disabled { background: #334155; color: #64748b; cursor: default; }
     #scan-status { font-size: 0.75rem; color: #64748b; margin-top: 6px; min-height: 14px; }
+    #stats-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+    .stats-row {
+      display: flex; align-items: center; gap: 8px; font-size: 0.8rem; color: #cbd5e1;
+      background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 6px 10px;
+    }
+    .stats-row b { color: #f1f5f9; }
+    .stats-row .stats-meta { color: #64748b; flex: 1; }
+    .stats-row button { font-size: 0.72rem; padding: 3px 10px; }
     #file-list label {
       display: flex; align-items: center; gap: 8px; padding: 4px 2px; font-size: 0.85rem;
       color: #cbd5e1; cursor: pointer;
@@ -1718,6 +1758,9 @@ _HTML = """<!DOCTYPE html>
     <h2>Tables</h2>
     <div id="file-list"><span style="color:#475569;font-size:0.82rem">Scan a folder to list CSVs.</span></div>
     <button class="primary" id="run-btn" onclick="runDiscovery()" disabled>Run discovery</button>
+
+    <h2>Column stats <span style="color:#475569;font-weight:normal">— what drill-down splits by</span></h2>
+    <div id="stats-list"><span style="color:#475569;font-size:0.82rem">Loading…</span></div>
 
     <h2>Relationships <span id="rel-count" style="color:#475569"></span></h2>
     <div class="search-row">
@@ -2978,7 +3021,44 @@ _HTML = """<!DOCTYPE html>
     ['chat', 'schema', 'draft'].forEach(t =>
       document.getElementById('tab-' + t).classList.toggle('active', t === name));
     if (name === 'schema' && cy) cy.resize();  // canvas was hidden when laid out
+    if (name === 'schema') loadStats();
   }
+
+  // ── column stats (what drill-down splits by) ──────────────────────────────
+  let statsPoll = null;
+
+  function ago(iso) {
+    const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return mins + ' min ago';
+    const h = Math.round(mins / 60);
+    return h < 48 ? h + ' h ago' : Math.round(h / 24) + ' days ago';
+  }
+
+  async function loadStats() {
+    const el = document.getElementById('stats-list');
+    let d;
+    try { d = await (await fetch('/stats')).json(); }
+    catch (e) { el.innerHTML = '<span class="fb-err">Could not load stats</span>'; return; }
+    if (d.error) { el.innerHTML = '<span class="fb-err">' + escapeHtml(d.error) + '</span>'; return; }
+    el.innerHTML = (d.schemas || []).map(x =>
+      '<div class="stats-row"><b>' + escapeHtml(x.schema) + '</b><span class="stats-meta">' +
+      (x.running ? 'refreshing…'
+                 : x.computed_at ? x.columns + ' columns · ' + ago(x.computed_at) : 'no stats yet') +
+      '</span><button data-schema="' + escapeHtml(x.schema) + '"' + (x.running ? ' disabled' : '') + '>' +
+      (x.computed_at ? 'Refresh' : 'Compute') + '</button></div>').join('') ||
+      '<span style="color:#475569;font-size:0.82rem">No data schemas found.</span>';
+    clearTimeout(statsPoll);
+    if ((d.schemas || []).some(x => x.running)) statsPoll = setTimeout(loadStats, 2000);
+  }
+
+  document.getElementById('stats-list').addEventListener('click', async (e) => {
+    const b = e.target.closest('button[data-schema]');
+    if (!b) return;
+    b.disabled = true;
+    await postJson('/stats/refresh', { schema: b.dataset.schema });
+    loadStats();
+  });
 
   // graph: pan/zoom can lose the whole thing off-screen — fit brings it back,
   // re-layout also re-spreads nodes that were dragged into a heap

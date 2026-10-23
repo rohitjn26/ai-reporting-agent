@@ -1,9 +1,10 @@
 """
 LangGraph ReAct agent wired to MCP tool servers + local chart/config tools.
 """
-import asyncio, json, os, uuid
+import asyncio, json, os, re, sys, uuid
 from collections import OrderedDict
 from functools import lru_cache
+from pathlib import Path
 from typing import Annotated, Literal
 import httpx
 from langchain_anthropic import ChatAnthropic
@@ -420,13 +421,56 @@ def _to_cube(query: dict) -> dict:
     return q
 
 
-async def drill_distances(client: httpx.AsyncClient, measure: str,
-                          view_meta: list[dict]) -> dict | None:
-    """How far each cube of the measure's view is from the measure's own cube, from
-    the JOINs Cube generates for one query touching every cube (Cube's /sql only
-    compiles it; nothing runs). Lets the drill engine try a response's participant
-    and site before the organization's settings. None if it can't be worked out —
-    the engine then falls back to model order."""
+def _stats_module():
+    """discovery.stats (repo root package). Appended to sys.path, as ui.py does for
+    discovery, so the repo's local mcp/ directory can't shadow the installed SDK."""
+    root = str(Path(__file__).resolve().parent.parent.parent)
+    if root not in sys.path:
+        sys.path.append(root)
+    from discovery import stats
+    return stats
+
+
+def _member_stats(view_meta: list[dict], aliases: dict[str, tuple[str, str]]) -> dict | None:
+    """{view dimension: ColumnStat} for dimensions that are a plain column of a table
+    with saved stats. A schema with tables still missing gets a background refresh,
+    so this drill uses what's there and the next one gets the rest."""
+    try:
+        st = _stats_module()
+    except Exception as e:
+        print(f"[stats] unavailable: {e}")
+        return None
+    tables_by_schema: dict[str, set[str]] = {}
+    for schema, table in aliases.values():
+        tables_by_schema.setdefault(schema, set()).add(table)
+    loaded: dict[tuple[str, str, str], object] = {}
+    for schema, tables in tables_by_schema.items():
+        try:
+            got = st.load_stats(schema, sorted(tables))
+        except Exception as e:
+            print(f"[stats] could not read stats for {schema}: {e}")
+            continue
+        if tables - {t for t, _ in got}:
+            st.refresh_in_background(schema)
+        loaded.update({(schema, t, c): v for (t, c), v in got.items()})
+    out = {}
+    for c in view_meta:
+        for d in c.get("dimensions", []):
+            alias, _, column = (d.get("aliasMember") or "").partition(".")
+            if alias in aliases and (*aliases[alias], column) in loaded:
+                out[d["name"]] = loaded[(*aliases[alias], column)]
+    return out or None
+
+
+async def drill_context(client: httpx.AsyncClient, measure: str,
+                        view_meta: list[dict]) -> tuple[dict | None, dict | None]:
+    """What the drill engine needs to pick dimensions well, from one compile-only
+    /sql request for a query touching every cube of the measure's view:
+    - distances: how far each cube is from the measure's cube (the JOIN tree), so a
+      response's participant and site are tried before the organization's settings;
+    - stats: fill rate and distinct count per dimension (discovery.stats, read from
+      the library DB via the table each cube alias names in that SQL).
+    Either is None when it can't be worked out; the engine then falls back."""
     start = drill.measure_cube({"measures": [measure]}, view_meta)
     reps: dict[str, str] = {}
     for c in view_meta:
@@ -435,7 +479,7 @@ async def drill_distances(client: httpx.AsyncClient, measure: str,
             if cube and cube not in reps and d.get("type") in drill.SPLIT_TYPES:
                 reps[cube] = d["name"]
     if not start or not reps:
-        return None
+        return None, None
     q = {"measures": [measure], "dimensions": list(reps.values()), "limit": 1}
     try:
         resp = await client.get(f"{CUBE_URL}/cubejs-api/v1/sql", params={"query": json.dumps(q)},
@@ -443,9 +487,12 @@ async def drill_distances(client: httpx.AsyncClient, measure: str,
         resp.raise_for_status()
         sql = resp.json()["sql"]["sql"][0]
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
-        return None
+        return None, None
     edges = drill.join_edges(sql)
-    return drill.cube_distances(edges, start) if edges else None
+    distances = drill.cube_distances(edges, start) if edges else None
+    aliases = drill.alias_tables(sql)
+    stats = await asyncio.to_thread(_member_stats, view_meta, aliases) if aliases else None
+    return distances, stats
 
 
 async def _cube_load(client: httpx.AsyncClient, q: dict) -> dict:
@@ -671,13 +718,13 @@ async def explain_change(
                 {"dimension": time_dimension, "dateRange": date_range}]}))
             return [v[:10] for v in body["query"]["timeDimensions"][0]["dateRange"]]
 
-        distances = await drill_distances(client, measure, view_meta)
+        distances, col_stats = await drill_context(client, measure, view_meta)
         try:
             current = await resolve(period)
             previous = await resolve(compare_period) if compare_period else drill.previous_period(current)
             report = await drill.rank_change(scope, view_meta, run, time_dimension=time_dimension,
                                              period=current, compare_period=previous,
-                                             distances=distances)
+                                             distances=distances, stats=col_stats)
             inside = None
             top = report.rankings[0] if report.rankings else None
             if top and top.members[0].value != drill.OTHER:
@@ -687,7 +734,7 @@ async def explain_change(
                           "drivers": _drivers(await drill.rank_change(
                               sub, view_meta, run, time_dimension=time_dimension,
                               period=current, compare_period=previous, max_candidates=12,
-                              distances=distances), 2, 3)}
+                              distances=distances, stats=col_stats), 2, 3)}
         except drill.NotAdditive as e:
             return json.dumps({"error": str(e), "instruction": (
                 "Tell the user this measure is an average, ratio or distinct count, which "
@@ -787,6 +834,19 @@ def _tool_output_text(out) -> str:
 _RELOAD_FAILED = ("CUBE_SCHEMA_ERROR", "Cube restarted but did not become healthy")
 
 
+def _refresh_stats_for(config_text: str) -> None:
+    """A committed cube config changes what drill can split by: refresh the column
+    stats of the schema its SQL reads from (`SELECT * FROM mdbl.c_site`), in the
+    background. Never raises."""
+    m = re.search(r'\bFROM\s+"?(\w+)"?\s*\.\s*"?\w+', config_text, flags=re.I)
+    if not m:
+        return
+    try:
+        _stats_module().refresh_in_background(m.group(1))
+    except Exception as e:
+        print(f"[stats] refresh after commit not started: {e}")
+
+
 def safe_commit(mcp_commit, reload_tool, rollback_tool):
     """Wrap commit_cube_config_update so a change only stays if Cube compiles it:
     commit (a new version) -> reload Cube -> on a compile failure, roll back to
@@ -809,6 +869,7 @@ def safe_commit(mcp_commit, reload_tool, rollback_tool):
         reload_msg = _tool_output_text(await reload_tool.ainvoke({}))
         if not reload_msg.startswith(_RELOAD_FAILED):
             live = reload_msg.startswith("Cube restarted and ready")
+            _refresh_stats_for(committed_text)
             return json.dumps({"status": "committed and live" if live else
                                "committed, but Cube did not confirm the reload — check it",
                                "id": committed.get("id"),

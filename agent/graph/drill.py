@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import re
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
@@ -593,6 +594,16 @@ def _fan_out_note(values: dict, total: float) -> str:
             "(it reaches this measure through a join that repeats rows)")
 
 
+# A "break down by" option where one value holds this share or more shows one big
+# bar and slivers (e.g. status: 99.9% Complete). It's moved to the end of the list,
+# not dropped, since the right cut-off isn't known for every dataset yet.
+DOMINANT_SHARE = float(os.environ.get("DRILL_DOMINANT_SHARE", "0.95"))
+
+
+def _dominated(r) -> bool:
+    return any(m.share is not None and m.share >= DOMINANT_SHARE for m in r.members)
+
+
 def _sort_key(r) -> tuple:
     return (-(r.score if r.score is not None else -1), len(r.members), r.candidate.member)
 
@@ -747,5 +758,5 @@ async def rank_breakdown(
     report.rankings = _drop_duplicates(
         report.rankings, lambda m: (str(m.value), m.amount), report.skipped)
     if additive:
-        report.rankings.sort(key=_sort_key)
+        report.rankings.sort(key=lambda r: (_dominated(r),) + _sort_key(r))
     return report

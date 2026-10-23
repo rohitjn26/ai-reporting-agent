@@ -400,3 +400,13 @@ async def test_ids_and_json_values_are_skipped_as_unreadable():
     report = await rank_change(SCOPE, META, fake_cube(facts), time_dimension="sales.created_at",
                                period=MAR, compare_period=FEB)
     assert report.skipped["sales.region"] == "its values are ids or JSON, not readable labels"
+
+
+async def test_a_breakdown_where_one_value_is_almost_everything_goes_last():
+    # channel: Web holds 99% of revenue; region splits it in a way worth seeing
+    facts = [_row("2026-03-01", "West", "Web", 400), _row("2026-03-02", "East", "Web", 590),
+             _row("2026-03-03", "East", "Store", 10)]
+    report = await rank_breakdown({"measures": ["sales.revenue"]}, META, fake_cube(facts))
+    order = [r.candidate.member for r in report.rankings]
+    assert order.index("sales.region") < order.index("sales.channel")
+    assert "sales.channel" in order          # moved to the end, not dropped

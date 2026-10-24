@@ -1,4 +1,4 @@
-.PHONY: up down seed agent logs ps install install-dev test test-unit test-e2e db eval eval-routing eval-refusal
+.PHONY: up down seed agent logs ps install install-dev test test-unit test-e2e db eval eval-routing eval-refusal stats
 
 # Start the full stack (postgres, cube, library, MCP servers)
 up:
@@ -26,6 +26,11 @@ down:
 # Seed the library with e-commerce cube configs
 seed:
 	cd library && python seed.py
+
+# Column stats for drill-down (fill rate, distinct values) — every data schema,
+# or one: make stats SCHEMA=mdbl
+stats:
+	.venv/bin/python -m discovery.stats $(SCHEMA)
 
 # Run the interactive reporting agent (requires agent/.env with ANTHROPIC_API_KEY)
 agent:

@@ -410,3 +410,49 @@ async def test_a_breakdown_where_one_value_is_almost_everything_goes_last():
     order = [r.candidate.member for r in report.rankings]
     assert order.index("sales.region") < order.index("sales.channel")
     assert "sales.channel" in order          # moved to the end, not dropped
+
+
+# ── a selected range of points / rows ─────────────────────────────────────────
+
+from graph.drill import narrow, segment_filter  # noqa: E402
+from graph import query_builder as qb  # noqa: E402
+
+DAILY = {"measures": ["sales.revenue"],
+         "time_dimensions": [{"dimension": "sales.created_at", "granularity": "day", "dateRange": "this year"}]}
+
+
+def test_a_range_of_days_becomes_one_date_range_with_the_gaps_inside():
+    q = narrow(DAILY, {"sales.created_at.day": ["2026-02-10T00:00:00.000", "2026-02-13T00:00:00.000",
+                                                "2026-02-11T00:00:00.000"]})
+    assert q["time_dimensions"][0]["dateRange"] == ["2026-02-10", "2026-02-13"]
+
+
+def test_a_range_of_months_spans_whole_months():
+    monthly = {**DAILY, "time_dimensions": [{"dimension": "sales.created_at", "granularity": "month"}]}
+    q = narrow(monthly, {"sales.created_at.month": ["2026-02-01T00:00:00.000", "2026-03-01T00:00:00.000"]})
+    assert q["time_dimensions"][0]["dateRange"] == ["2026-02-01", "2026-03-31"]
+
+
+def test_drilling_a_range_into_a_dimension_keeps_the_range_and_drops_the_axis():
+    out = drill(DAILY, {"sales.created_at.day": ["2026-02-10T00:00:00.000", "2026-02-12T00:00:00.000"]},
+                Candidate("sales.region"))
+    assert out["dimensions"] == ["sales.region"]
+    assert out["time_dimensions"] == [{"dimension": "sales.created_at", "dateRange": ["2026-02-10", "2026-02-12"]}]
+
+
+@pytest.mark.parametrize("value,expected", [
+    (["West", "East"], {"member": "sales.region", "operator": "equals", "values": ["West", "East"]}),
+    (["West", "West"], {"member": "sales.region", "operator": "equals", "values": ["West"]}),
+    (["West", None], {"or": [{"member": "sales.region", "operator": "equals", "values": ["West"]},
+                             {"member": "sales.region", "operator": "notSet"}]}),
+    ([None], {"member": "sales.region", "operator": "notSet"}),
+])
+def test_several_selected_values_become_an_any_of_filter(value, expected):
+    assert segment_filter("sales.region", value) == expected
+
+
+def test_validation_looks_inside_and_or_filters():
+    bad = {"measures": ["sales.revenue"],
+           "filters": [{"or": [{"member": "sales.region", "operator": "set"},
+                               {"member": "sales.nope", "operator": "set"}]}]}
+    assert any("sales.nope" in p for p in qb.validate_query(bad, META))

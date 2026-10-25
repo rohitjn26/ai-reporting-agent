@@ -159,6 +159,17 @@ def _member_sets(metadata: list[dict]) -> tuple[set, set]:
     return measures, dims
 
 
+def _flat_filters(filters: list) -> list[dict]:
+    """Every member filter, including those nested in Cube's {"and"/"or": [...]}."""
+    out = []
+    for f in filters or []:
+        if not isinstance(f, dict):
+            continue
+        nested = f.get("and") or f.get("or")
+        out.extend(_flat_filters(nested) if isinstance(nested, list) else [f])
+    return out
+
+
 def validate_query(query: dict, metadata: list[dict]) -> list[str]:
     """Return human-readable problems; empty list means the query is well-formed
     against the live schema. This is the runtime twin of the eval invariant."""
@@ -180,7 +191,7 @@ def validate_query(query: dict, metadata: list[dict]) -> list[str]:
     for k in (query.get("order") or {}):
         if k not in known:
             problems.append(f"order references unknown member '{k}'")
-    for f in query.get("filters", []):
+    for f in _flat_filters(query.get("filters", [])):
         mem = f.get("member")
         if mem and mem not in known:
             problems.append(f"filter references unknown member '{mem}'")
@@ -189,7 +200,7 @@ def validate_query(query: dict, metadata: list[dict]) -> list[str]:
     referenced = set(query.get("measures", [])) | set(query.get("dimensions", []))
     referenced |= {td.get("dimension") for td in query.get("time_dimensions", []) if td.get("dimension")}
     referenced |= set(query.get("order") or {})
-    referenced |= {f.get("member") for f in query.get("filters", []) if f.get("member")}
+    referenced |= {f.get("member") for f in _flat_filters(query.get("filters", [])) if f.get("member")}
     views = {m.split(".")[0] for m in referenced if isinstance(m, str) and "." in m}
     if len(views) > 1:
         problems.append(

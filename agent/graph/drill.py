@@ -375,10 +375,33 @@ def _time_key(key: str, query: dict) -> Optional[tuple[int, str]]:
 
 
 def segment_filter(member: str, value: Any) -> dict:
-    """The Cube filter that keeps one member value (notSet for a null bucket)."""
+    """The Cube filter that keeps one member value (notSet for a null bucket), or
+    any of several when `value` is a list (a selected range of bars or rows)."""
+    if isinstance(value, list):
+        vals = list(dict.fromkeys(value))
+        if len(vals) == 1:
+            return segment_filter(member, vals[0])
+        named = [str(v) for v in vals if v is not None]
+        keep = {"member": member, "operator": "equals", "values": named}
+        if None not in vals:
+            return keep
+        blank = {"member": member, "operator": "notSet"}
+        return {"or": [keep, blank]} if named else blank
     if value is None:
         return {"member": member, "operator": "notSet"}
     return {"member": member, "operator": "equals", "values": [str(value)]}
+
+
+def range_of_buckets(values: list, granularity: str) -> Optional[list[str]]:
+    """The date range covering a run of time buckets: first one's start to the last
+    one's end, gaps included (days with no data inside a selected range still count).
+    None when no bucket has a date."""
+    dated = [v for v in values if v is not None]
+    if not dated:
+        return None
+    first = min(dated, key=lambda v: _parse_time(v))
+    last = max(dated, key=lambda v: _parse_time(v))
+    return [bucket_range(first, granularity)[0], bucket_range(last, granularity)[1]]
 
 
 def _clean(q: dict) -> dict:
@@ -388,7 +411,9 @@ def _clean(q: dict) -> dict:
 def narrow(query: dict, segment: dict[str, Any]) -> dict:
     """`query` cut down to `segment` (a clicked row's dimension values): each value
     becomes a filter and leaves the dimensions, a clicked time bucket becomes the
-    date range. The limit goes, since a parent's top-N says nothing about the child."""
+    date range. A value may be a list — a selected range: time buckets become one
+    date range spanning them, other values an "any of" filter. The limit goes, since
+    a parent's top-N says nothing about the child."""
     q = {k: v for k, v in query.items() if k != "limit"}
     q["filters"] = list(query.get("filters", []))
     q["time_dimensions"] = [dict(td) for td in query.get("time_dimensions", [])]
@@ -397,7 +422,12 @@ def narrow(query: dict, segment: dict[str, Any]) -> dict:
         tk = _time_key(key, query)
         if tk:
             i, gran = tk
-            q["time_dimensions"][i]["dateRange"] = bucket_range(value, gran)
+            if isinstance(value, list):           # a selected run of buckets
+                span = range_of_buckets(value, gran)
+                if span:
+                    q["time_dimensions"][i]["dateRange"] = span
+            else:
+                q["time_dimensions"][i]["dateRange"] = bucket_range(value, gran)
             continue
         if key in dims:
             dims.remove(key)

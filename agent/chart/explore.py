@@ -99,13 +99,15 @@ _PAGE = r"""<!DOCTYPE html>
   .crumbs span.cur { font-weight: 600; padding: 2px 4px; }
   .crumbs .sep { color: #94a3b8; }
   .hint { font-size: .78rem; color: #64748b; margin-bottom: 12px; }
-  .card { background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.08); padding: 20px; max-width: 980px; }
+  .card { position: relative; background: #fff; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.08); padding: 20px; max-width: 980px; }
+  .brush { position: absolute; background: rgba(99,102,241,.15); border: 1px solid #6366f1; border-radius: 3px; pointer-events: none; }
   canvas { max-height: 480px; }
   table { border-collapse: collapse; width: 100%; font-size: .85rem; }
   th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid #e2e8f0; }
   th { background: #f1f5f9; font-weight: 600; position: sticky; top: 0; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  tr.click { cursor: pointer; } tr.click:hover td { background: #eef2ff; }
+  tr.click { cursor: pointer; user-select: none; } tr.click:hover td { background: #eef2ff; }
+  tr.sel td { background: #e0e7ff; }
   .table-wrap { max-height: 520px; overflow: auto; }
   .menu { position: fixed; z-index: 10; background: #fff; border: 1px solid #e2e8f0; border-radius: 10px;
           box-shadow: 0 8px 28px rgba(15,23,42,.18); padding: 8px; width: 290px; max-height: 70vh; overflow: auto; font-size: .85rem; }
@@ -131,6 +133,8 @@ _PAGE = r"""<!DOCTYPE html>
 const START = __QUERY__;
 const stack = [];            // [{label, view}]
 let chart = null;
+let suppressClick = false;   // the click that ends a drag isn't a point click
+let anchor = null;           // table row a Shift+click range starts from
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const fmt = v => typeof v === 'number' ? v.toLocaleString(undefined, {maximumFractionDigits: 2}) : esc(v);
@@ -155,7 +159,10 @@ function draw(view) {
   crumbs();
   hideMenu();
   if (chart) { chart.destroy(); chart = null; }
-  $('hint').textContent = view.drillable ? 'Click a bar, point or row to drill in.'
+  anchor = null;
+  $('hint').textContent = view.drillable
+    ? (view.kind === 'table' ? 'Click a row to drill in — Shift+click another row to pick the rows between.'
+                             : 'Click a point to drill in — or drag across the chart to pick a range.')
     : (view.query.ungrouped ? `Underlying records (up to ${view.query.limit}).` : '');
   if (view.note) $('hint').textContent += ' ' + view.note;
   if (!view.rows.length) { $('card').innerHTML = '<div class="muted">No data.</div>'; return; }
@@ -175,9 +182,46 @@ function draw(view) {
       responsive: true, interaction: {mode: 'index', intersect: false},
       scales: {y: {beginAtZero: true}},
       onHover: (e, els) => e.native.target.style.cursor = els.length && view.drillable ? 'pointer' : 'default',
-      onClick: (e, els) => { if (els.length && view.drillable) openMenu(view, els[0].index, e.native); },
+      onClick: (e, els) => {
+        if (suppressClick) { suppressClick = false; return; }
+        if (els.length && view.drillable) openMenu(view, els[0].index, e.native);
+      },
     },
   });
+  if (view.drillable) addBrush(view);
+}
+
+// Drag across the chart to select a run of points; the menu then works on all of them.
+function addBrush(view) {
+  const canvas = $('c'), card = $('card');
+  let x0 = null, box = null;
+  const rel = ev => ev.clientX - canvas.getBoundingClientRect().left;
+  canvas.onmousedown = ev => { if (ev.button === 0) x0 = rel(ev); };
+  canvas.onmousemove = ev => {
+    if (x0 === null) return;
+    const x = rel(ev);
+    if (!box && Math.abs(x - x0) < 6) return;          // still a click, not a drag
+    const a = chart.chartArea;
+    const left = Math.max(a.left, Math.min(x, x0)), right = Math.min(a.right, Math.max(x, x0));
+    if (!box) { box = document.createElement('div'); box.className = 'brush'; card.appendChild(box); hideMenu(); }
+    Object.assign(box.style, {left: canvas.offsetLeft + left + 'px', width: Math.max(0, right - left) + 'px',
+                              top: canvas.offsetTop + a.top + 'px', height: a.bottom - a.top + 'px'});
+  };
+  const finish = (ev, clickFollows) => {
+    if (x0 === null) return;
+    const x = rel(ev), lo = Math.min(x, x0), hi = Math.max(x, x0);
+    x0 = null;
+    if (!box) return;                                   // a plain click: Chart.js handles it
+    box.remove(); box = null;
+    suppressClick = clickFollows;
+    const scale = chart.scales.x;
+    const idx = view.rows.map((_, i) => i).filter(i => {
+      const p = scale.getPixelForValue(i); return p >= lo && p <= hi; });
+    if (idx.length === 1) openMenu(view, idx[0], ev);
+    else if (idx.length > 1) openRangeMenu(view, idx[0], idx[idx.length - 1], ev);
+  };
+  canvas.onmouseup = ev => finish(ev, true);
+  canvas.onmouseleave = ev => finish(ev, false);
 }
 
 function drawTable(view) {
@@ -186,8 +230,22 @@ function drawTable(view) {
   const body = view.rows.map((r, i) => `<tr data-i="${i}" class="${view.drillable ? 'click' : ''}">` +
     r.cells.map((c, j) => `<td class="${typeof c === 'number' && j >= nKeys ? 'num' : ''}">${fmt(c)}</td>`).join('') + '</tr>').join('');
   $('card').innerHTML = `<div class="table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
-  if (view.drillable) $('card').querySelectorAll('tr.click').forEach(tr =>
-    tr.onclick = e => openMenu(view, +tr.dataset.i, e));
+  if (view.drillable) $('card').querySelectorAll('tr.click').forEach(tr => tr.onclick = e => {
+    const i = +tr.dataset.i;
+    if (e.shiftKey && anchor !== null && anchor !== i) {
+      const lo = Math.min(anchor, i), hi = Math.max(anchor, i);
+      markRows(lo, hi);
+      openRangeMenu(view, lo, hi, e);
+    } else {
+      anchor = i;
+      markRows(i, i);
+      openMenu(view, i, e);
+    }
+  });
+}
+
+function markRows(lo, hi) {
+  $('card').querySelectorAll('tr.click').forEach(tr => tr.classList.toggle('sel', +tr.dataset.i >= lo && +tr.dataset.i <= hi));
 }
 
 function segLabel(view, i) {
@@ -199,8 +257,30 @@ function hideMenu() { $('menu').hidden = true; }
 document.addEventListener('keydown', e => { if (e.key === 'Escape') hideMenu(); });
 document.addEventListener('click', e => { if (!$('menu').contains(e.target) && e.target.tagName !== 'CANVAS' && !e.target.closest('tr.click')) hideMenu(); });
 
-async function openMenu(view, i, ev) {
-  const m = $('menu'), seg = view.rows[i].segment, label = segLabel(view, i);
+// The segment for rows lo..hi: each key's value, or its distinct values when they
+// differ (the server turns time buckets into one date range, the rest into "any of").
+function rangeSegment(view, lo, hi) {
+  const rows = view.rows.slice(lo, hi + 1), seg = {};
+  for (const k of Object.keys(rows[0].segment)) {
+    const vals = [...new Set(rows.map(r => r.segment[k]))];
+    seg[k] = vals.length === 1 ? vals[0] : vals;
+  }
+  return seg;
+}
+
+function rangeLabel(view, lo, hi) {
+  const n = view.headers.length - view.measures.length, a = view.rows[lo].cells, b = view.rows[hi].cells;
+  const parts = [];
+  for (let k = 0; k < n; k++)
+    parts.push(a[k] === b[k] ? `${view.headers[k]} = ${a[k]}` : `${view.headers[k]} ${a[k]} – ${b[k]}`);
+  return `${parts.join(', ')} (${hi - lo + 1} ${view.kind === 'table' ? 'rows' : 'points'})`;
+}
+
+function openMenu(view, i, ev) { return showMenu(view, view.rows[i].segment, segLabel(view, i), ev); }
+function openRangeMenu(view, lo, hi, ev) { return showMenu(view, rangeSegment(view, lo, hi), rangeLabel(view, lo, hi), ev); }
+
+async function showMenu(view, seg, label, ev) {
+  const m = $('menu');
   m.style.left = Math.min(ev.clientX, innerWidth - 300) + 'px';
   m.style.top = Math.min(ev.clientY, innerHeight - 200) + 'px';
   m.innerHTML = `<h4>${esc(label)}</h4><div class="muted">Ranking what to drill into…</div>`;

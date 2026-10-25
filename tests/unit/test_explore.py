@@ -118,3 +118,13 @@ def test_records_fall_back_to_the_charts_own_columns_when_cube_rejects_them(clie
                                         "segment": {"sales.region": "West"}, "records": True}).json()
     assert v["query"]["dimensions"] == ["sales.region"]           # just what the chart showed
     assert "ambiguous" in v["note"] and v["rows"]
+
+
+def test_a_dragged_range_of_bars_drills_into_all_of_them(client):
+    base = {"measures": ["sales.revenue"], "dimensions": ["sales.region"]}
+    v = client.post("/drill/run", json={"query": base, "segment": {"sales.region": ["West", "East"]},
+                                        "candidate": {"member": "sales.channel"}}).json()
+    assert v["query"]["filters"] == [{"member": "sales.region", "operator": "equals", "values": ["West", "East"]}]
+    assert sum(r["values"][0] for r in v["rows"]) == sum(f["revenue"] for f in FACTS)
+    opts = client.post("/drill/options", json={"query": base, "segment": {"sales.region": ["West", "East"]}}).json()
+    assert "sales.channel" in [o["member"] for o in opts["options"]]

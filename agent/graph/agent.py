@@ -3,6 +3,7 @@ LangGraph ReAct agent wired to MCP tool servers + local chart/config tools.
 """
 import asyncio, json, os, re, sys, uuid
 from collections import OrderedDict
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
@@ -153,11 +154,14 @@ WHY A NUMBER CHANGED ("why is revenue down?", "what drove the jump in orders?"):
 1. Call build_query for the measure over the period the user means (e.g. "revenue
    last month"), so the measure and time dimension are validated.
 2. Call explain_change with that measure, time dimension, filters and period. Leave
-   compare_period out unless the user named one (it defaults to the previous period).
+   compare_period out unless the user named one: it defaults to the same days of the
+   week just before. If the result has "compare_adjusted", say which window was used.
 3. Answer in a few lines: the change (before → after), the dimension and values that
    account for most of it with their share of the change, and what `inside_top`
    adds. Say WHERE it happened, not why: the data can't show causes, so don't invent
    them. If the result has "note", lead with it and keep the explanation short.
+   If it has "no_driver", say plainly that nothing checked explained the change — never
+   fill the gap with guesses (one organization, "it was uniform", campaigns).
 4. To chart it, pass `chart_query` to query_cube unchanged, then create_chart.
 
 IMPORTANT query rules:
@@ -685,8 +689,11 @@ async def explain_change(
         time_dimension: the time dimension from build_query
         period: the period the user asks about, as a Cube dateRange: "last month",
                 "this week", or ["2026-09-01", "2026-09-30"]
-        compare_period: what to compare against; omit it for the previous period
-                        of the same length (last month → the month before)
+        compare_period: what to compare against — omit it unless the user named one.
+                        Either way the comparison has the same length and the same
+                        number of each weekday as `period` (the period shifted back by
+                        whole weeks); a window that doesn't is moved to the nearest one
+                        that does, and the result says so in "compare_adjusted".
         filters: build_query's filters, if any
 
     Returns:
@@ -694,8 +701,10 @@ async def explain_change(
         its top values: before, after, change, share of the total change), the same
         breakdown inside the top value (`inside_top`), and `chart_query`, which you
         may pass to query_cube to chart the top dimension. If it has "note", the
-        change is small or within noise: say so and don't over-explain it. Describe
-        WHERE the change happened; the data can't say why.
+        change is small or within noise: say so and don't over-explain it. If it has
+        "no_driver", none of the dimensions checked explains the change: say exactly
+        that, name a few that were checked, and offer to look at one the user names —
+        don't guess a cause. Describe WHERE the change happened; the data can't say why.
     """
     scope = {"measures": [measure], "filters": filters,
              "time_dimensions": [{"dimension": time_dimension}]}
@@ -721,7 +730,11 @@ async def explain_change(
         distances, col_stats = await drill_context(client, measure, view_meta)
         try:
             current = await resolve(period)
-            previous = await resolve(compare_period) if compare_period else drill.previous_period(current)
+            asked = await resolve(compare_period) if compare_period else None
+            previous = asked
+            if asked is None or drill.weekday_mix(asked) != drill.weekday_mix(current) \
+                    or asked[1] >= current[0]:
+                previous = drill.same_weekdays_before(current, not_after=asked[1] if asked else None)
             report = await drill.rank_change(scope, view_meta, run, time_dimension=time_dimension,
                                              period=current, compare_period=previous,
                                              distances=distances, stats=col_stats)
@@ -752,8 +765,27 @@ async def explain_change(
         "inside_top": inside,
         "skipped": report.skipped or None,
     }
+    weeks = (date.fromisoformat(current[0]) - date.fromisoformat(previous[0])).days // 7
+    out["compare_basis"] = f"same days of the week, {weeks} week{'s' * (weeks != 1)} earlier"
+    if asked is not None and previous != asked:
+        out["compare_adjusted"] = {
+            "asked": asked, "used": previous,
+            "why": f"{asked[0]}..{asked[1]} doesn't have the same number of each weekday as the "
+                   "period (or overlaps it), so the nearest window that does was used"}
     if report.note:
         out["note"] = report.note
+    if not report.rankings:
+        checked = list(report.skipped)
+        out["no_driver"] = {
+            "dimensions_checked": len(checked),
+            "examples": [m.split(".", 1)[-1] for m in checked[:6]],
+            "instruction": ("None of the dimensions checked splits this change in a useful way. "
+                            "Tell the user plainly that no driver was found among what was checked, "
+                            "name a few of them, and offer to look at a dimension they name. Do NOT "
+                            "speculate about causes or claim the change was uniform, came from one "
+                            "source, or was due to a campaign or system change."),
+        }
+        out.pop("skipped", None)
     if top:
         out["chart_query"] = {"measures": [measure], "dimensions": [top.candidate.member],
                               "filters": filters, "order": {measure: "desc"},

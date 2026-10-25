@@ -50,7 +50,10 @@ async def test_explains_the_drop_against_the_previous_month(monkeypatch):
     _patch_cube(monkeypatch)
     out = await _call(_history(BUILT))
     assert out["period"] == ["2026-03-01", "2026-03-31"]
-    assert out["compare_period"] == ["2026-02-01", "2026-02-28"]
+    # March (31 days) vs the same 31 days of the week, 5 weeks earlier — not February
+    assert out["compare_period"] == ["2026-01-25", "2026-02-24"]
+    assert out["compare_basis"] == "same days of the week, 5 weeks earlier"
+    assert "compare_adjusted" not in out
     assert (out["before"], out["after"], out["change"], out["pct_change"]) == (1000, 900, -100, -10)
     top = out["drivers"][0]
     assert top["dimension"] == "sales.region"
@@ -74,7 +77,26 @@ async def test_refuses_a_ratio_measure(monkeypatch):
     assert "can't be split" in out["error"] and "numerator" in out["instruction"]
 
 
-async def test_explicit_compare_period_is_used(monkeypatch):
+async def test_a_compare_period_with_the_same_weekdays_is_used_as_asked(monkeypatch):
+    _patch_cube(monkeypatch)
+    out = await _call(_history(BUILT), {**ARGS, "compare_period": ["2026-01-25", "2026-02-24"]})
+    assert out["compare_period"] == ["2026-01-25", "2026-02-24"] and "compare_adjusted" not in out
+
+
+async def test_a_compare_period_with_other_weekdays_is_moved_and_reported(monkeypatch):
     _patch_cube(monkeypatch)
     out = await _call(_history(BUILT), {**ARGS, "compare_period": ["2026-02-01", "2026-02-28"]})
-    assert out["compare_period"] == ["2026-02-01", "2026-02-28"] and out["change"] == -100
+    assert out["compare_period"] == ["2026-01-25", "2026-02-24"]    # ends before Feb 28, same weekdays
+    assert out["compare_adjusted"]["asked"] == ["2026-02-01", "2026-02-28"]
+    assert out["change"] == -100
+
+
+async def test_no_driver_is_said_plainly_not_left_for_the_model_to_fill(monkeypatch):
+    flat = [{**f, "region": "West", "channel": "Web"} for f in FACTS]   # nothing to split by
+    _patch_cube(monkeypatch, facts=flat)
+    out = await _call(_history(BUILT))
+    assert "drivers" not in out and "skipped" not in out
+    nd = out["no_driver"]
+    assert nd["dimensions_checked"] >= 2 and "sales.region" not in nd["examples"]
+    assert "region" in nd["examples"]
+    assert "Do NOT" in nd["instruction"]

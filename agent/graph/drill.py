@@ -455,18 +455,28 @@ def records_query(query: dict, segment: dict[str, Any], view_meta: list[dict],
                    "time_dimensions": tds, "ungrouped": True, "limit": limit})
 
 
-def previous_period(date_range: list) -> list[str]:
-    """The period just before `date_range` ([from, to], as Cube resolves it), of the
-    same length: whole calendar months step back by months (September → August,
-    not "the 30 days before"), anything else by its length in days."""
+def weekday_mix(date_range: list) -> list[int]:
+    """How many Mondays, Tuesdays, ... Sundays a [from, to] range holds."""
     start, end = (_parse_time(v).date() for v in date_range[:2])
-    if start.day == 1 and (end + timedelta(days=1)).day == 1:
-        months = (end.year - start.year) * 12 + end.month - start.month + 1
-        y, m = divmod(start.month - 1 - months, 12)
-        prev_start = date(start.year + y, m + 1, 1)
-        return [prev_start.isoformat(), (start - timedelta(days=1)).isoformat()]
-    days = (end - start).days + 1
-    return [(start - timedelta(days=days)).isoformat(), (start - timedelta(days=1)).isoformat()]
+    mix = [0] * 7
+    for i in range((end - start).days + 1):
+        mix[(start + timedelta(days=i)).weekday()] += 1
+    return mix
+
+
+def same_weekdays_before(date_range: list, not_after: Optional[Any] = None) -> list[str]:
+    """The window to compare `date_range` against: same length and the same number of
+    each weekday, so a period with two Mondays isn't measured against one with one.
+    That is the period shifted back by whole weeks — enough not to overlap it, and
+    when `not_after` is given, enough to end on or before that date."""
+    start, end = (_parse_time(v).date() for v in date_range[:2])
+    weeks = -(-((end - start).days + 1) // 7)          # ceil(days / 7): no overlap
+    if not_after is not None:
+        limit = _parse_time(not_after).date()
+        while end - timedelta(weeks=weeks) > limit:
+            weeks += 1
+    shift = timedelta(weeks=weeks)
+    return [(start - shift).isoformat(), (end - shift).isoformat()]
 
 
 def change_note(base: float, current: float, agg_type: Optional[str]) -> Optional[str]:

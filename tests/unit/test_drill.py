@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from graph.drill import (OTHER, Candidate, NotAdditive, bucket_range, candidates, change_note, previous_period, records_query,
+from graph.drill import (OTHER, Candidate, NotAdditive, bucket_range, candidates, change_note, records_query, same_weekdays_before, weekday_mix,
                          drill, rank_breakdown, rank_change)
 
 META = [{
@@ -266,14 +266,26 @@ async def test_breakdown_time_candidate_keeps_buckets_in_order():
 # ── periods, noise, duplicates ────────────────────────────────────────────────
 
 @pytest.mark.parametrize("period,expected", [
-    (["2026-09-01T00:00:00.000", "2026-09-30T23:59:59.999"], ["2026-08-01", "2026-08-31"]),
-    (["2026-01-01", "2026-03-31"], ["2025-10-01", "2025-12-31"]),          # a quarter
-    (["2026-03-01", "2026-03-31"], ["2026-02-01", "2026-02-28"]),
-    (["2026-10-12", "2026-10-18"], ["2026-10-05", "2026-10-11"]),          # a week
-    (["2026-09-10", "2026-10-09"], ["2026-08-11", "2026-09-09"]),          # last 30 days
+    (["2026-05-29", "2026-06-08"], ["2026-05-15", "2026-05-25"]),          # 11 days → 2 weeks back
+    (["2026-10-12", "2026-10-18"], ["2026-10-05", "2026-10-11"]),          # a week → 1 week back
+    (["2026-03-01T00:00:00.000", "2026-03-31T23:59:59.999"], ["2026-01-25", "2026-02-24"]),  # 31 days → 5 weeks
+    (["2026-06-03", "2026-06-03"], ["2026-05-27", "2026-05-27"]),          # one day → same weekday last week
 ])
-def test_previous_period(period, expected):
-    assert previous_period(period) == expected
+def test_comparison_has_the_same_length_and_weekdays(period, expected):
+    got = same_weekdays_before(period)
+    assert got == expected
+    assert weekday_mix(got) == weekday_mix(period)
+    assert got[1] < period[0][:10]                                         # never overlaps
+
+
+def test_comparison_can_be_pushed_back_to_end_before_a_date():
+    got = same_weekdays_before(["2026-05-29", "2026-06-08"], not_after="2026-05-20")
+    assert got == ["2026-05-08", "2026-05-18"] and weekday_mix(got) == weekday_mix(["2026-05-29", "2026-06-08"])
+
+
+def test_weekday_mix_counts_each_day():
+    # Fri May 29 .. Mon Jun 8: two Fridays..Mondays, one Tuesday..Thursday
+    assert weekday_mix(["2026-05-29", "2026-06-08"]) == [2, 1, 1, 1, 2, 2, 2]
 
 
 def test_change_note():

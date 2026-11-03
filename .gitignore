@@ -38,3 +38,6 @@ evals/eval_results.json
 
 # Claude Code local settings / session data
 .claude/
+
+# Published-dataset manifests (Schema tab → Publish)
+datasets/

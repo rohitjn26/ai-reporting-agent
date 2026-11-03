@@ -123,12 +123,19 @@ class FakeSelector:
         return self.queue.pop(0)
 
 
+def _plain(q: dict) -> dict:
+    """The query without the router's _view/_view_reason annotations."""
+    return {k: v for k, v in q.items() if not k.startswith("_view")}
+
+
 def test_build_query_routes_to_chosen_view():
     selector = FakeSelector(qb.ViewSelection(view="orders", reason="revenue is in orders"))
     llm = FakeLLM(qb.CubeQuery(measures=["orders.total_revenue"], dimensions=["orders.country"]))
     q = qb.build_query("revenue by country", MULTI, llm=llm, view_llm=selector)
     assert selector.calls == 1
-    assert q == {"measures": ["orders.total_revenue"], "dimensions": ["orders.country"]}
+    assert _plain(q) == {"measures": ["orders.total_revenue"], "dimensions": ["orders.country"]}
+    # the pick and the router's reason ride along for the query plan card
+    assert q["_view"] == "orders" and q["_view_reason"] == "revenue is in orders"
 
 
 def test_build_query_surfaces_view_boundary():
@@ -144,7 +151,8 @@ def test_single_view_skips_routing():
     # only one view -> no selector needed at all.
     llm = FakeLLM(qb.CubeQuery(measures=["orders.count"]))
     q = qb.build_query("how many orders", META, llm=llm)
-    assert q == {"measures": ["orders.count"]}
+    assert _plain(q) == {"measures": ["orders.count"]}
+    assert q["_view_reason"] == "the only view available"
 
 
 # ── build_query (with repair) ─────────────────────────────────────────────────
@@ -153,7 +161,7 @@ def test_build_query_clean_no_repair():
     llm = FakeLLM(qb.CubeQuery(measures=["orders.total_revenue"], dimensions=["orders.country"]))
     q = qb.build_query("revenue by country", META, llm=llm)
     assert llm.calls == 1
-    assert q == {"measures": ["orders.total_revenue"], "dimensions": ["orders.country"]}
+    assert _plain(q) == {"measures": ["orders.total_revenue"], "dimensions": ["orders.country"]}
     assert "_validation_problems" not in q
 
 

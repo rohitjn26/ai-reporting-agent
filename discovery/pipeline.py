@@ -11,6 +11,7 @@ from pathlib import Path
 
 import duckdb
 
+from .explain import explain_grain, explain_join
 from .grain import GrainResult, detect_all
 from .joins import JoinCandidate, classify_joins, discover_joins
 from .profile import TableProfile, load_folder, profile_all
@@ -63,17 +64,23 @@ class DiscoveryResult:
         return {"nodes": nodes, "edges": edges}
 
     def to_dict(self) -> dict:
+        bridges = self.bridges()
         return {
             "tables": {t: p.to_dict() for t, p in self.profiles.items()},
-            "grains": {t: g.to_dict() for t, g in self.grains.items()},
+            "grains": {t: {**g.to_dict(),
+                           "why": explain_grain(g, self.profiles[t], t in bridges)}
+                       for t, g in self.grains.items()},
             "joins": {
-                "accepted": [j.to_dict() for j in self.accepted],
-                "uncertain": [j.to_dict() for j in self.uncertain],
+                "accepted": [self._join_dict(j) for j in self.accepted],
+                "uncertain": [self._join_dict(j) for j in self.uncertain],
             },
-            "bridges": self.bridges(),
+            "bridges": bridges,
             "sources": self.sources,
             "graph": self.graph(),
         }
+
+    def _join_dict(self, j: JoinCandidate) -> dict:
+        return {**j.to_dict(), "why": explain_join(j, self.profiles)}
 
 
 def run_discovery(files: list[str | Path],

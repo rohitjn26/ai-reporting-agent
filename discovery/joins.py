@@ -55,6 +55,9 @@ class JoinCandidate:
     fk_ndv: int = 0             # distinct FK values — ranks columns into the same table
     primary: bool = False       # the one join a cube uses for this target (see pick_primary)
     relationship: str = "many_to_one"
+    # which rule in classify_joins accepted or held this join (see explain.py)
+    decision: str = ""
+    rivals: int = 0             # other tables this column also fits well enough to accept
     # hole check (integer keys): see _hole_check
     values_found: float | None = None   # share of distinct FK values present in the PK
     chance_rate: float | None = None    # share a random value in the FK's range would hit
@@ -111,6 +114,8 @@ class JoinCandidate:
             "chance_log10": None if self.chance_log10 is None else round(max(self.chance_log10, -999), 1),
             "coverage": _round(self.coverage),
             "confidence": round(self.confidence, 3),
+            "decision": self.decision,
+            "rivals": self.rivals,
             "join": self.cube_join,
         }
 
@@ -426,18 +431,27 @@ def classify_joins(candidates: list[JoinCandidate]
 
     accepted: list[JoinCandidate] = []
     for group in by_col.values():
-        eligible = [c for c in group
-                    if c.containment >= ACCEPT_CONTAINMENT and c.pk_unique]
+        for c in group:
+            c.decision = ("low_containment" if c.containment < ACCEPT_CONTAINMENT
+                          else "pk_not_unique" if not c.pk_unique else "")
+        eligible = [c for c in group if not c.decision]
         if not eligible:
             continue
+        for c in eligible:
+            c.rivals = len(eligible) - 1
         proven = [c for c in eligible if c.proven]
         if len(proven) == 1:
+            proven[0].decision = "proven_only"
             accepted.append(proven[0])
             continue
         best = max(_SIGNAL_RANK[c.name_signal] for c in eligible)
         top = [c for c in eligible if _SIGNAL_RANK[c.name_signal] == best]
         if best > 0 and len(top) == 1:
+            top[0].decision = "best_name"
             accepted.append(top[0])
+            continue
+        for c in eligible:
+            c.decision = "name_tie" if best > 0 else "no_evidence"
 
     for c in pick_primary(accepted):
         c.primary = True

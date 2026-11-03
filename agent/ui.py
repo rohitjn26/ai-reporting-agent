@@ -5,7 +5,7 @@ Split layout: chat on the left, live chart preview on the right.
 Run:  python ui.py
 Open: http://localhost:8501
 """
-import asyncio, json, os, sys
+import asyncio, json, os, sys, threading
 import httpx
 from pathlib import Path
 import asyncpg
@@ -337,6 +337,78 @@ async def discovery_describe(request: Request):
                                        body.get("tables"), body.get("dataset") or None)
     except Exception as e:
         return {"error": str(e)}
+
+
+def _publisher():
+    _load_run_discovery()  # puts the repo root on sys.path
+    from discovery import publish
+    return publish
+
+
+@app.get("/discovery/datasets")
+async def discovery_datasets():
+    """Datasets published from the Schema tab (each has a manifest)."""
+    return {"datasets": await asyncio.to_thread(_publisher().list_manifests)}
+
+
+@app.get("/discovery/datasets/{dataset}")
+async def discovery_dataset(dataset: str):
+    """One manifest: its tables, CSV sources and the saved review state."""
+    m = await asyncio.to_thread(_publisher().load_manifest, dataset)
+    return m or JSONResponse({"error": f"No published dataset '{dataset}'."}, status_code=404)
+
+
+async def _reload_cube() -> str:
+    """Restart Cube through the cube MCP server, as the agent's commits do."""
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+    from graph.agent import CUBE_MCP_URL
+    tools = await MultiServerMCPClient({"cube": {"url": CUBE_MCP_URL, "transport": "sse"}}).get_tools()
+    tool = next(t for t in tools if t.name == "reload_cube_schema")
+    return str(await tool.ainvoke({}))
+
+
+@app.post("/discovery/publish")
+async def discovery_publish(request: Request):
+    """Publish a draft. dry_run: say what would happen (tables to load, cubes and
+    views new/changed). Otherwise: load only the new tables' CSVs into Postgres,
+    upsert cubes + views, reload Cube — undoing the library writes if the schema
+    doesn't compile — then save the manifest and refresh the new tables' stats."""
+    body = await request.json()
+    draft = body.get("draft") or {}
+    pub = _publisher()
+    try:
+        library = await asyncio.to_thread(pub.library_entries)
+        plan = await asyncio.to_thread(pub.plan_publish, draft, library)
+    except Exception as e:
+        return {"error": str(e)}
+    problem = pub.check_publishable(plan, force=bool(body.get("force")))
+    if body.get("dry_run") or problem:
+        return {**plan, "problem": problem}
+    try:
+        loaded = await asyncio.to_thread(pub.load_data, draft, pub.DEFAULT_PG_URL, plan["load_tables"])
+        done = await asyncio.to_thread(pub.upsert_library, draft, library)
+    except Exception as e:
+        return {**plan, "error": f"publish failed: {e}"}
+    reload = await _reload_cube() if done else "nothing changed in the library — Cube not reloaded"
+    if reload.startswith("CUBE_SCHEMA_ERROR"):
+        failed = await asyncio.to_thread(pub.undo_library, done)
+        await _reload_cube()
+        return {**plan, "loaded": loaded, "error": "Cube could not compile the new schema, so the "
+                "library changes were undone" + (f" (except {', '.join(failed)})" if failed else "")
+                + ". " + reload}
+    await asyncio.to_thread(pub.record_publish, draft, body.get("state"))
+    if plan["load_tables"]:
+        st = _stats()
+        threading.Thread(target=lambda: _safe(st.refresh_stats, draft["dataset"], plan["load_tables"]),
+                         daemon=True).start()
+    return {**plan, "loaded": loaded, "written": [d["name"] for d in done], "reload": reload}
+
+
+def _safe(fn, *args):
+    try:
+        fn(*args)
+    except Exception as e:  # stats are an optimisation; never fail a publish over them
+        print(f"[stats] refresh failed: {e}")
 
 
 _QUERY_KEYS = ("measures", "dimensions", "filters", "time_dimensions", "order", "limit")
@@ -1513,6 +1585,18 @@ _HTML = """<!DOCTYPE html>
       color: #cbd5e1; cursor: pointer;
     }
     #run-btn { width: 100%; margin-top: 10px; }
+    #ds-select {
+      flex: 1; min-width: 0; background: #0f172a; border: 1px solid #334155; border-radius: 6px;
+      color: #e2e8f0; padding: 7px 8px; font: 0.82rem system-ui;
+    }
+    #ds-status { font-size: 0.75rem; color: #94a3b8; margin-top: 6px; }
+    #file-list label.locked { color: #94a3b8; cursor: default; }
+    #file-list label.taken { color: #64748b; cursor: default; }
+    .ftag { font-size: 0.65rem; border-radius: 4px; padding: 1px 5px; margin-left: auto; }
+    .ftag.pub { background: #1e3a5f; color: #93c5fd; }
+    .ftag.taken { background: #3b2a0b; color: #fcd34d; }
+    .tag-new { font: 0.62rem system-ui; background: #14532d; color: #86efac; border-radius: 4px;
+      padding: 1px 5px; margin-left: 6px; vertical-align: middle; }
     .join-item {
       border: 1px solid #334155; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px;
       font-size: 0.8rem; background: #0f172a;
@@ -1521,6 +1605,31 @@ _HTML = """<!DOCTYPE html>
     .join-item.uncertain { border-left: 3px solid #f59e0b; }
     .join-item .jt { color: #e2e8f0; font-family: ui-monospace, monospace; }
     .join-item .jm { color: #64748b; margin-top: 3px; }
+    details.why { margin-top: 5px; }
+    details.why summary { color: #7dd3fc; cursor: pointer; font-size: 0.75rem; list-style: none; }
+    details.why summary::before { content: '▸ '; }
+    details.why[open] summary::before { content: '▾ '; }
+    ul.why-list { list-style: none; margin: 4px 0 0; padding: 0; }
+    ul.why-list li { display: flex; gap: 6px; color: #cbd5e1; font-size: 0.76rem; line-height: 1.35;
+      margin-bottom: 3px; }
+    ul.why-list li .wi { flex-shrink: 0; width: 12px; text-align: center; }
+    ul.why-list li .wd { display: none; color: #64748b; font-size: 0.72rem; margin-top: 1px; }
+    ul.why-list.more li .wd { display: block; }
+    .why-more { background: none; border: none; color: #64748b; cursor: pointer; padding: 0;
+      font: 0.7rem system-ui; text-decoration: underline; }
+    ul.why-list li.ok .wi { color: #22c55e; }
+    ul.why-list li.no .wi { color: #f59e0b; }
+    ul.why-list li.na .wi { color: #64748b; }
+    #node-info {
+      position: absolute; top: 52px; right: 12px; width: 300px; max-height: 60%; overflow-y: auto;
+      background: #1e293bf2; border: 1px solid #334155; border-radius: 8px; padding: 10px 12px;
+      font-size: 0.8rem; color: #e2e8f0; display: none;
+    }
+    #node-info.show { display: block; }
+    #node-info .ni-head { display: flex; justify-content: space-between; align-items: center; }
+    #node-info .ni-head b { font-family: ui-monospace, monospace; }
+    #node-info .ni-head button { background: none; border: none; color: #94a3b8; cursor: pointer; }
+    #node-info .ni-sub { color: #94a3b8; margin: 4px 0 6px; font-size: 0.75rem; }
     #cy-wrap { flex: 1; position: relative; min-width: 0; }
     #cy { position: absolute; inset: 0; }
     #cy-empty {
@@ -1571,6 +1680,11 @@ _HTML = """<!DOCTYPE html>
       border-radius: 5px; padding: 4px 10px; font: 0.75rem system-ui;
     }
     #draft-copy:disabled, #draft-export:disabled { color: #475569; cursor: default; }
+    #draft-publish { background: #15803d; border: 1px solid #16a34a; color: #fff; cursor: pointer;
+      border-radius: 5px; padding: 4px 10px; font: 0.75rem system-ui; }
+    #draft-publish:disabled { background: #334155; border-color: #334155; color: #64748b; cursor: default; }
+    #publish-status { font-size: 0.75rem; color: #94a3b8; margin: 4px 0; white-space: pre-wrap; }
+    #publish-status.err { color: #f87171; }
     .draft-empty { color: #475569; font-size: 0.82rem; }
     .draft-sec { font-size: 0.72rem; text-transform: uppercase; letter-spacing: .05em;
       color: #64748b; margin: 14px 0 6px; }
@@ -1747,6 +1861,15 @@ _HTML = """<!DOCTYPE html>
 <!-- Schema discovery -->
 <div id="view-schema">
   <div id="schema-side">
+    <h2>Dataset</h2>
+    <div class="schema-row">
+      <select id="ds-select" title="Start a new dataset, or add CSVs (one table each) to a published one">
+        <option value="">— new dataset —</option>
+      </select>
+      <button class="primary" onclick="openDataset()">Open</button>
+    </div>
+    <div id="ds-status"></div>
+
     <h2>Data folder</h2>
     <div class="schema-row">
       <input id="folder-input" placeholder="/path/to/csv/folder"/>
@@ -1783,10 +1906,13 @@ _HTML = """<!DOCTYPE html>
   <div id="cy-wrap">
     <div id="cy"></div>
     <div id="cy-empty">The relationship graph will render here.</div>
+    <div id="node-info"></div>
     <div class="legend">
       <div><span class="sw" style="border-color:#22c55e"></span>accepted</div>
       <div><span class="sw" style="border-color:#f59e0b;border-top-style:dashed"></span>uncertain</div>
       <div><span class="sw" style="border-color:#475569;border-top-style:dotted"></span>alternative (not used)</div>
+      <div><span class="sw" style="border-color:#22c55e;border-top-style:dashed;width:12px;height:8px;border:1px dashed #22c55e"></span>new table (adding data)</div>
+      <div style="margin-top:4px;color:#64748b">tap a line or table for <i>why</i></div>
     </div>
     <div class="graph-tools">
       <button onclick="fitGraph()" title="Bring the whole graph back into view">⤢ Fit</button>
@@ -1821,6 +1947,8 @@ _HTML = """<!DOCTYPE html>
                 title="One AI call per table (Haiku) — business names, descriptions, synonyms">✨ Describe</button>
         <button id="draft-copy" onclick="copyDraft()" disabled>Copy JSON</button>
         <button id="draft-export" onclick="exportSemanticLayer()" disabled>Export semantic layer</button>
+        <button id="draft-publish" onclick="publishDraft()" disabled
+                title="Load the data into Postgres, write cubes + views to the library, reload Cube">Publish</button>
       </div>
     </div>
     <div id="dataset-row">
@@ -1834,6 +1962,7 @@ _HTML = """<!DOCTYPE html>
     </div>
     <div id="root-hint">The view starts here and walks the joins down; lookups hang off the table that references them.</div>
     <div id="describe-status"></div>
+    <div id="publish-status"></div>
     <div class="search-row">
       <input id="draft-search" type="search" placeholder="Search members — e.g. c_task name, created"
              oninput="renderDraft()"/>
@@ -3021,7 +3150,7 @@ _HTML = """<!DOCTYPE html>
     ['chat', 'schema', 'draft'].forEach(t =>
       document.getElementById('tab-' + t).classList.toggle('active', t === name));
     if (name === 'schema' && cy) cy.resize();  // canvas was hidden when laid out
-    if (name === 'schema') loadStats();
+    if (name === 'schema') { loadStats(); loadDatasets(); }
   }
 
   // ── column stats (what drill-down splits by) ──────────────────────────────
@@ -3071,12 +3200,16 @@ _HTML = """<!DOCTYPE html>
     const folder = document.getElementById('folder-input').value.trim();
     const status = document.getElementById('scan-status');
     const list = document.getElementById('file-list');
-    if (!folder) { status.textContent = 'Enter a folder path.'; return; }
+    if (!folder) {
+      if (openDs) { renderFileList([]); return; }
+      status.textContent = 'Enter a folder path.'; return;
+    }
     status.textContent = 'Scanning…';
     try {
       const r = await fetch('/discovery/list?folder=' + encodeURIComponent(folder));
       const d = await r.json();
       if (d.error) { status.textContent = d.error; return; }
+      if (openDs) { renderFileList(d.files); status.textContent = d.files.length + ' CSV file(s) in this folder.'; return; }
       if (!d.files.length) { status.textContent = 'No CSV files found.'; list.innerHTML = ''; return; }
       status.textContent = d.files.length + ' CSV file(s) found.';
       list.innerHTML = d.files.map(f => {
@@ -3086,6 +3219,158 @@ _HTML = """<!DOCTYPE html>
       }).join('');
       document.getElementById('run-btn').disabled = false;
     } catch (e) { status.textContent = 'Scan failed: ' + e.message; }
+  }
+
+  // ── adding data to a published dataset ──
+  // openDs is the dataset's manifest (discovery/publish.py). Its tables stay in
+  // every run, locked; each new CSV becomes one new table. Saved review decisions
+  // are re-applied after discovery, so only joins that involve a new table need review.
+  let openDs = null;
+
+  async function loadDatasets() {
+    const sel = document.getElementById('ds-select');
+    try {
+      const d = await (await fetch('/discovery/datasets')).json();
+      const keep = sel.value;
+      sel.innerHTML = '<option value="">— new dataset —</option>' + (d.datasets || []).map(x =>
+        '<option value="' + escapeHtml(x.dataset) + '">' + escapeHtml(x.dataset) + ' (' +
+        x.tables.length + ' tables)</option>').join('');
+      sel.value = keep;
+    } catch (e) {}
+  }
+
+  const csvStem = p => p.split('/').pop().replace(/[.]csv$/i, '');
+
+  async function openDataset() {
+    const ds = document.getElementById('ds-select').value;
+    const st = document.getElementById('ds-status');
+    if (!ds) {
+      openDs = null;
+      st.textContent = '';
+      document.getElementById('dataset-input').readOnly = false;
+      document.getElementById('file-list').innerHTML = '';
+      return scanFolder();
+    }
+    const r = await fetch('/discovery/datasets/' + encodeURIComponent(ds));
+    const m = await r.json();
+    if (m.error) { st.textContent = m.error; return; }
+    openDs = m;
+    st.innerHTML = 'Adding to <b>' + escapeHtml(ds) + '</b> — its ' + m.tables.length +
+      ' published tables stay as they are. Tick new CSVs (one table each) from this or another folder, then Run discovery.';
+    const folder = (m.state && m.state.folder) || '';
+    if (folder && !document.getElementById('folder-input').value.trim())
+      document.getElementById('folder-input').value = folder;
+    scanFolder();
+  }
+
+  // published tables first (locked), then this folder's CSVs that could be new tables
+  function renderFileList(files) {
+    const pub = openDs.sources || {};
+    const pubPaths = new Set(Object.values(pub));
+    const q = v => v.replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+    let html = Object.entries(pub).sort().map(([t, p]) =>
+      '<label class="locked" title="' + q(p) + '"><input type="checkbox" class="file-cb" value="' + q(p) +
+      '" checked disabled/> ' + escapeHtml(t) + '<span class="ftag pub">published</span></label>').join('');
+    files.filter(f => !pubPaths.has(f)).forEach(f => {
+      const name = f.split('/').pop();
+      if (pub[csvStem(f)]) {
+        html += '<label class="taken" title="A published table already has this name — rename the file to add it">' +
+                '<input type="checkbox" disabled/> ' + escapeHtml(name) + '<span class="ftag taken">name taken</span></label>';
+      } else {
+        html += '<label><input type="checkbox" class="file-cb" value="' + q(f) + '"/> ' + escapeHtml(name) + '</label>';
+      }
+    });
+    document.getElementById('file-list').innerHTML = html;
+    document.getElementById('run-btn').disabled = false;
+  }
+
+  // what the manifest keeps so the next add starts from today's review
+  function reviewState() {
+    const review = {};
+    Object.entries(relState).forEach(([k, r]) => review[k] = {
+      status: r.status, relationship: r.relationship, primary: !!r.primary, role: !!r.role,
+      j: r.status === 'accepted' ? r.j : undefined });
+    return {
+      folder: document.getElementById('folder-input').value.trim(),
+      root: draft ? draft.root : '',
+      cubeExcl: [...cubeExcl], viewExcl: [...viewExcl],
+      descriptions: { aiDesc, descEdits }, review };
+  }
+
+  // after a run in add mode: put back the published decisions; anything not seen
+  // before is flagged new, and a new join between two published tables is never
+  // accepted on its own (adding data mustn't silently change what's published)
+  function applySavedReview() {
+    const s = openDs.state || {};
+    const saved = s.review || {};
+    const pub = new Set(openDs.tables);
+    Object.entries(saved).forEach(([k, v]) => {
+      const r = relState[k];
+      if (r) Object.assign(r, { status: v.status, relationship: v.relationship, primary: !!v.primary, role: !!v.role });
+      else if (v.status === 'accepted' && v.j)   // a published join this run didn't find
+        relState[k] = { j: v.j, status: 'accepted', relationship: v.relationship, primary: !!v.primary, role: !!v.role };
+    });
+    Object.entries(relState).forEach(([k, r]) => {
+      if (saved[k]) return;
+      r.fresh = true;
+      if (pub.has(r.j.fk.table) && pub.has(r.j.pk.table) && r.status === 'accepted') {
+        r.status = 'uncertain'; r.primary = false;
+      }
+    });
+    cubeExcl = new Set(s.cubeExcl || []); viewExcl = new Set(s.viewExcl || []);
+    const desc = s.descriptions || {};
+    aiDesc = { tables: { ...aiDesc.tables, ...((desc.aiDesc || {}).tables || {}) } };
+    descEdits = { tables: { ...descEdits.tables, ...((desc.descEdits || {}).tables || {}) },
+                  views: { ...descEdits.views, ...((desc.descEdits || {}).views || {}) } };
+    if (s.root) document.getElementById('root-select').innerHTML =
+      '<option value="' + escapeHtml(s.root) + '" selected>' + escapeHtml(s.root) + '</option>';
+    const ds = document.getElementById('dataset-input');
+    ds.value = openDs.dataset; ds.readOnly = true;
+  }
+
+  async function publishDraft() {
+    if (!draft) return;
+    const st = document.getElementById('publish-status');
+    const btn = document.getElementById('draft-publish');
+    const d = effectiveDraft();
+    st.className = ''; st.textContent = 'Checking what would change…';
+    btn.disabled = true;
+    try {
+      const plan = await postJson('/discovery/publish', { draft: d, dry_run: true });
+      if (plan.error) { st.className = 'err'; st.textContent = plan.error; return; }
+      if (plan.dropped_tables && plan.dropped_tables.length) {
+        st.className = 'err'; st.textContent = plan.problem; return;
+      }
+      const list = (label, xs) => xs && xs.length ? '\\n' + label + ': ' + xs.join(', ') : '';
+      let msg = plan.first_publish
+        ? 'Publish new dataset "' + plan.dataset + '"?\\nLoads ' + plan.load_tables.length +
+          ' tables into Postgres schema ' + plan.dataset + '.'
+        : 'Add to "' + plan.dataset + '"?' + (plan.load_tables.length
+            ? '\\nNew tables to load: ' + plan.load_tables.join(', ')
+            : '\\nNo new tables — only the cubes/views below are updated.') +
+          '\\nPublished tables are not reloaded.';
+      msg += list('New cubes', plan.cubes.new) + list('Changed cubes', plan.cubes.changed) +
+             list('New views', plan.views.new) + list('Changed views', plan.views.changed);
+      if (plan.clashes.length) msg += '\\n\\nALREADY IN THE LIBRARY — will be overwritten:\\n' + plan.clashes.join(', ');
+      if (plan.stale.length) msg += '\\n\\nNo longer produced by this draft (left in place): ' + plan.stale.join(', ');
+      if (!confirm(msg)) { st.textContent = 'Publish cancelled.'; return; }
+      st.textContent = 'Publishing — loading data, writing the library, reloading Cube…';
+      const res = await postJson('/discovery/publish', { draft: d, force: plan.clashes.length > 0, state: reviewState() });
+      if (res.error || res.problem) { st.className = 'err'; st.textContent = res.error || res.problem; return; }
+      const rows = Object.entries(res.loaded || {}).map(([t, n]) => t + ' ' + n.toLocaleString() + ' rows');
+      st.textContent = 'Published ' + res.dataset + '. ' + (rows.length ? 'Loaded: ' + rows.join(', ') + '. ' : '') +
+        (res.written.length ? res.written.length + ' cubes/views written. ' : 'Library unchanged. ') + res.reload;
+      // from here on this is an add to the published dataset
+      document.getElementById('ds-select').value = res.dataset;
+      await loadDatasets();
+      document.getElementById('ds-select').value = res.dataset;
+      openDs = await (await fetch('/discovery/datasets/' + encodeURIComponent(res.dataset))).json();
+      Object.values(relState).forEach(r => r.fresh = false);
+      document.getElementById('ds-status').innerHTML = 'Adding to <b>' + escapeHtml(res.dataset) +
+        '</b> — tick new CSVs, then Run discovery.';
+      document.getElementById('dataset-input').readOnly = true;
+      scanFolder(); rebuild();
+    } finally { btn.disabled = !draft; }
   }
 
   // ── folder browser modal ──
@@ -3159,13 +3444,17 @@ _HTML = """<!DOCTYPE html>
       document.getElementById('root-select').innerHTML = '';  // recommended root on first draft
       aiDesc = { tables: {} }; descEdits = { tables: {}, views: {} };
       loadDescriptions();  // AI text + edits from an earlier visit to this folder
+      showNodeInfo(null);
       document.getElementById('describe-status').textContent = Object.keys(aiDesc.tables).length
         ? 'Restored descriptions for ' + Object.keys(aiDesc.tables).length + ' tables from this browser.' : '';
       const folder = document.getElementById('folder-input').value.trim().replace(/[/]+$/, '');
       document.getElementById('dataset-input').value = folder.split('/').pop() || '';
+      if (openDs) applySavedReview();
       refreshDraft();
+      const fresh = Object.values(relState).filter(r => r.fresh).length;
       status.textContent = 'Done — ' + d.joins.accepted.length + ' accepted, ' +
-                           d.joins.uncertain.length + ' uncertain.';
+                           d.joins.uncertain.length + ' uncertain' +
+                           (openDs ? ' · ' + fresh + ' new to review (search "new")' : '') + '.';
       rebuild();
     } catch (e) { status.textContent = 'Discovery failed: ' + e.message; }
     finally { btn.disabled = false; btn.textContent = 'Run discovery'; }
@@ -3220,12 +3509,14 @@ _HTML = """<!DOCTYPE html>
     const order = { accepted: 0, uncertain: 1, rejected: 2 };
     // alternatives into the same table sit together
     rels.sort((a, b) => order[a[1].status] - order[b[1].status] ||
+                        (b[1].fresh ? 1 : 0) - (a[1].fresh ? 1 : 0) ||
                         targetKey(a[1].j).localeCompare(targetKey(b[1].j)));
     const groups = acceptedGroups();
     const q = searchTerms('rel-search');
     const all = rels.length;
     rels = rels.filter(([, r]) => matchesAll(q,
       r.j.fk.table + '.' + r.j.fk.column + ' ' + r.j.pk.table + '.' + r.j.pk.column + ' ' + r.status +
+      (r.fresh ? ' new' : '') +
       (r.primary && r.status === 'accepted' ? ' primary' : '') + (r.role ? ' also' : '')));
     shownRels = rels.map(([key]) => key);
     document.getElementById('rel-accept-shown').disabled = !shownRels.length;
@@ -3256,14 +3547,9 @@ _HTML = """<!DOCTYPE html>
       html +=
         '<div class="join-item ' + r.status + (pick && !r.primary ? ' alt' : '') + (key === activeKey ? ' active' : '') +
              '" data-key="' + key + '" onclick="highlightRel(this.dataset.key)">' +
-          '<div class="jt">' + j.fk.table + '.' + j.fk.column + ' → ' + j.pk.table + '.' + j.pk.column + '</div>' +
-          '<div class="jm">conf ' + j.confidence + ' · containment ' + j.containment + ' · ' + j.name_signal +
-            (j.fk_ndv != null ? ' · ' + j.fk_ndv + ' distinct' : '') + '</div>' +
-          (j.evidence ? '<div class="jm">' + ({ proven: 'proof: data rules out luck', name: 'proof: name only',
-                                                 none: 'proof: none' })[j.evidence] +
-            (j.chance_rate != null ? ' · luck would match ' + Math.round(j.chance_rate * 100) + '%' +
-                                     ', found ' + Math.round((j.values_found || 0) * 100) + '%' : '') +
-            '</div>' : '') + aiLine(r) + pick +
+          '<div class="jt">' + j.fk.table + '.' + j.fk.column + ' → ' + j.pk.table + '.' + j.pk.column +
+            (r.fresh ? '<span class="tag-new">new</span>' : '') + '</div>' +
+          whyDetails(key, j.why) + aiLine(r) + pick +
           '<div class="join-actions" onclick="event.stopPropagation()">' +
             '<button class="' + (r.status === 'accepted' ? 'on-accept' : '') + '" ' +
               'onclick="setStatus(this.closest(\\'.join-item\\').dataset.key, \\'accepted\\')">Accept</button>' +
@@ -3286,6 +3572,46 @@ _HTML = """<!DOCTYPE html>
   const matchesAll = (terms, text) => { const t = text.toLowerCase(); return terms.every(w => t.includes(w)); };
 
   let shownRels = [];   // relationship keys passing the current search
+
+  // ── "why" — discovery's own reasons, in plain English (discovery/explain.py) ──
+  const whyOpen = new Set();   // relationship keys whose Why? is expanded
+  // short line per check; the numbers sit underneath in grey
+  function whyList(reasons) {
+    return '<ul class="why-list">' + (reasons || []).map(x =>
+      '<li class="' + (x.ok === true ? 'ok' : x.ok === false ? 'no' : 'na') + '"><span class="wi">' +
+      (x.ok === true ? '✓' : x.ok === false ? '✗' : '•') + '</span><span>' + escapeHtml(x.text) +
+      (x.detail ? '<span class="wd">' + escapeHtml(x.detail) + '</span>' : '') +
+      '</span></li>').join('') + '</ul>' +
+      ((reasons || []).some(x => x.detail)
+        ? '<button class="why-more" onclick="this.previousElementSibling.classList.toggle(&quot;more&quot;)">show numbers</button>' : '');
+  }
+  // the verdict is the summary line; the checks behind it unfold below
+  function whyDetails(key, reasons) {
+    if (!reasons || !reasons.length) return '';
+    const v = reasons[0].kind === 'verdict' ? reasons[0] : null;
+    return '<details class="why" data-key="' + escapeHtml(key) + '"' + (whyOpen.has(key) ? ' open' : '') +
+      ' onclick="event.stopPropagation()" ontoggle="toggleWhy(this)"><summary>' +
+      (v ? escapeHtml(v.text) : 'Why?') + '</summary>' +
+      whyList(v ? reasons.slice(1) : reasons) + '</details>';
+  }
+  function toggleWhy(el) { el.open ? whyOpen.add(el.dataset.key) : whyOpen.delete(el.dataset.key); }
+
+  function showNodeInfo(id) {
+    const box = document.getElementById('node-info');
+    if (!id || !discData) { box.classList.remove('show'); return; }
+    const t = discData.tables[id] || {}, g = discData.grains[id] || {};
+    const live = Object.values(relState).filter(r => r.status !== 'rejected');
+    const out = live.filter(r => r.j.fk.table === id).map(r => r.j.fk.column + ' → ' + r.j.pk.table);
+    const inn = live.filter(r => r.j.pk.table === id).map(r => r.j.fk.table + '.' + r.j.fk.column);
+    box.innerHTML =
+      '<div class="ni-head"><b>' + escapeHtml(id) + '</b><button onclick="showNodeInfo(null)">✕</button></div>' +
+      '<div class="ni-sub">' + (t.rows != null ? t.rows.toLocaleString() + ' rows · ' : '') +
+        (g.key ? 'key ' + escapeHtml(g.key.join(' + ')) : 'no key found') + '</div>' +
+      whyList(g.why) +
+      (out.length ? '<div class="ni-sub">Points to: ' + escapeHtml(out.join(', ')) + '</div>' : '') +
+      (inn.length ? '<div class="ni-sub">Referenced by: ' + escapeHtml(inn.join(', ')) + '</div>' : '');
+    box.classList.add('show');
+  }
   // ── AI verdicts on uncertain joins (suggestions; the user applies them) ──
   const colKey = j => j.fk.table + '.' + j.fk.column;
 
@@ -3373,7 +3699,7 @@ _HTML = """<!DOCTYPE html>
     g.nodes.forEach(n => els.push({ data: {
       id: n.id,
       label: n.id + '\\n' + n.rows + ' rows' + (n.grain ? '\\n▸ ' + n.grain.join('+') : ''),
-      role: n.role || 'table'
+      role: n.role || (openDs && !openDs.tables.includes(n.id) ? 'new' : 'table')
     }}));
     Object.entries(relState).forEach(([key, r]) => {
       if (r.status === 'rejected') return;
@@ -3397,6 +3723,8 @@ _HTML = """<!DOCTYPE html>
             'width': '110px', 'height': '58px', 'padding': '6px' } },
         { selector: 'node[role = "bridge"]', style: {
             'border-color': '#a855f7', 'background-color': '#2a1e3b' } },
+        { selector: 'node[role = "new"]', style: {
+            'border-color': '#22c55e', 'border-style': 'dashed', 'background-color': '#132a1f' } },
         { selector: 'edge', style: {
             'label': 'data(label)', 'font-size': '10px', 'color': '#94a3b8',
             'text-background-color': '#0f172a', 'text-background-opacity': 1,
@@ -3416,11 +3744,14 @@ _HTML = """<!DOCTYPE html>
     });
     cy.on('tap', 'edge', evt => {
       const key = evt.target.data('key');
+      whyOpen.add(key);
+      renderPanel();
       highlightRel(key);
       const el = Array.from(document.querySelectorAll('.join-item')).find(e => e.dataset.key === key);
       if (el) el.scrollIntoView({ block: 'nearest' });
     });
-    cy.on('tap', evt => { if (evt.target === cy) { activeKey = null; highlightRel(null); } });
+    cy.on('tap', 'node', evt => showNodeInfo(evt.target.id()));
+    cy.on('tap', evt => { if (evt.target === cy) { activeKey = null; highlightRel(null); showNodeInfo(null); } });
   }
 
   // ── semantic-layer draft preview ──
@@ -3590,6 +3921,7 @@ _HTML = """<!DOCTYPE html>
     const body = document.getElementById('draft-body');
     document.getElementById('draft-copy').disabled = !draft;
     document.getElementById('draft-export').disabled = !draft;
+    document.getElementById('draft-publish').disabled = !draft;
     const dbtn = document.getElementById('draft-describe');
     dbtn.disabled = !draft;
     if (discData) {

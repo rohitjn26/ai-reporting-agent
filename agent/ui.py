@@ -422,6 +422,7 @@ def _plan_event(trace_id: str | None, query: dict, source: str) -> str:
         "measures": query.get("measures", []), "dimensions": query.get("dimensions", []),
         "filters": query.get("filters", []), "time_dimensions": query.get("time_dimensions", []),
         "problems": query.get("_validation_problems", []),
+        "view": query.get("_view"), "view_reason": query.get("_view_reason"),
     }) + "\n\n"
 
 
@@ -1159,6 +1160,8 @@ _HTML = """<!DOCTYPE html>
     .query-plan .qp-dimension { background: #2e1065; border: 1px solid #6d28d9; color: #c4b5fd; }
     .query-plan .qp-filter    { background: #1e293b; border: 1px solid #334155; color: #94a3b8; }
     .query-plan .qp-problem   { color: #f59e0b; font-size: 0.72rem; }
+    .query-plan .qp-view      { color: #94a3b8; font-size: 0.75rem; line-height: 1.4; }
+    .query-plan .qp-view b    { color: #e2e8f0; font-weight: 600; }
 
     /* ── Feedback on the query plan ── */
     .fb-bar { display: flex; align-items: center; gap: 6px; border-top: 1px solid #21262d; padding-top: 6px; }
@@ -2485,6 +2488,8 @@ _HTML = """<!DOCTYPE html>
     let out = '<div class="qp-header">\\uD83E\\uDDED ' + (d.source === 'agent'
       ? 'Query the agent ran'
       : 'Query plan — what the model chose') + '</div>';
+    if (d.view) out += row('View', '<span class="qp-view"><b>' + escapeHtml(d.view) + '</b>' +
+      (d.view_reason ? ' — ' + escapeHtml(d.view_reason) : '') + '</span>');
     if (d.measures && d.measures.length)   out += row('Measures',   chips(d.measures, 'qp-measure'));
     if (d.dimensions && d.dimensions.length) out += row('Dimensions', chips(d.dimensions, 'qp-dimension'));
 

@@ -71,7 +71,7 @@ class CubeQuery(BaseModel):
 
 class ViewSelection(BaseModel):
     view: Optional[str] = None          # the one view that answers the request; None = spans views
-    reason: str = ""                    # why this view, or which views would be needed
+    reason: str = ""                    # short: which cube matched, or which views would be needed
 
 
 _SELECT_SYSTEM = """You route a data request to exactly ONE view.
@@ -81,7 +81,9 @@ members from two different views — they cannot be joined at query time.
 The cubes listed under a view are ALREADY joined inside it: a request touching
 several of one view's cubes (tasks, steps and responses) is fine for that view.
 
-- If one view covers the ENTIRE request, return its name in `view`.
+- If one view covers the ENTIRE request, return its name in `view`, and in
+  `reason` say in under 15 words which of its cubes matches the request
+  (e.g. "order items cover freight cost").
 - If answering would require members from two or more views, return view=null
   and name the views that would be needed in `reason`. Do NOT force-fit.
 Return only the selection."""
@@ -271,20 +273,21 @@ def _resolve_view(
     view_llm,
     cubes: list[dict] | None = None,
     config=None,
-) -> tuple[list[dict] | None, str | None]:
-    """Pick the single view this request lives in and return (view_metadata, error).
+) -> tuple[list[dict] | None, str | None, str]:
+    """Pick the single view this request lives in -> (view_metadata, error, reason).
     With 0–1 views there's nothing to route. `error` is set (and metadata None)
-    when no single view fits, so callers can surface the boundary honestly."""
+    when no single view fits, so callers can surface the boundary honestly.
+    `reason` is the router's own words for its pick, shown on the query plan card."""
     if len(metadata) <= 1:
-        return metadata, None
+        return metadata, None, "the only view available"
     sel = select_view(request, metadata, context=context, model=model, llm=view_llm, cubes=cubes,
                       config=config)
     if not sel.view:
-        return None, sel.reason or "request spans multiple views and can't be answered in one query"
+        return None, sel.reason or "request spans multiple views and can't be answered in one query", ""
     view_meta = [c for c in metadata if c.get("name") == sel.view]
     if not view_meta:
-        return None, f"selected view '{sel.view}' is not in the schema"
-    return view_meta, None
+        return None, f"selected view '{sel.view}' is not in the schema", ""
+    return view_meta, None, sel.reason
 
 
 def render_examples(examples: list[dict]) -> str:
@@ -352,8 +355,9 @@ def build_query(
     {request, query} pairs for the chosen view — human feedback reused as
     few-shot examples (see graph/feedback.py). `config` is the caller's RunnableConfig,
     forwarded to every LLM call."""
-    view_meta, view_error = _resolve_view(request, metadata, context=context, model=model,
-                                          view_llm=view_llm, cubes=cubes, config=config)
+    view_meta, view_error, view_reason = _resolve_view(request, metadata, context=context,
+                                                       model=model, view_llm=view_llm, cubes=cubes,
+                                                       config=config)
     if view_error:
         return {"_view_error": view_error}
 
@@ -375,6 +379,10 @@ def build_query(
     if problems:
         # Surface, don't silently ship a bad query. Caller decides what to do.
         query["_validation_problems"] = problems
+    # which view the router picked and why — for the query plan card
+    if view_meta:
+        query["_view"] = view_meta[0].get("name")
+        query["_view_reason"] = view_reason
     return query
 
 
@@ -394,8 +402,8 @@ def build_and_run(
     error repair ONCE using the error message. run_fn(query) -> result dict (with
     'error' on failure). Returns (final_query, result). When no single view fits,
     returns ({"_view_error": ...}, {"error": ...}) without calling run_fn."""
-    view_meta, view_error = _resolve_view(request, metadata, context=context, model=model,
-                                          view_llm=view_llm, cubes=cubes)
+    view_meta, view_error, _ = _resolve_view(request, metadata, context=context, model=model,
+                                             view_llm=view_llm, cubes=cubes)
     if view_error:
         return {"_view_error": view_error}, {"error": view_error}
 

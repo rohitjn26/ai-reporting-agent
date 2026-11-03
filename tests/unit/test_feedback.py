@@ -158,7 +158,7 @@ def test_build_query_puts_examples_in_prompt():
         return [{"request": "net sales by country", "query": {"measures": ["sales.net_revenue"]}}]
 
     q = qb.build_query("net sales", VIEW, llm=llm, examples_fn=examples_fn)
-    assert q == {"measures": ["sales.net_revenue"]}
+    assert {k: v for k, v in q.items() if not k.startswith("_view")} == {"measures": ["sales.net_revenue"]}
     assert seen["args"] == ("net sales", ["sales"])
     text = "\n".join(m[1] if isinstance(m[1], str) else m[1][0]["text"] for m in llm.msgs[0])
     assert "Verified examples" in text and "net sales by country" in text
@@ -180,7 +180,8 @@ def test_build_query_survives_a_failing_examples_fn():
     def boom(*_):
         raise RuntimeError("db down")
 
-    assert qb.build_query("orders", VIEW, llm=llm, examples_fn=boom) == {"measures": ["sales.count"]}
+    q = qb.build_query("orders", VIEW, llm=llm, examples_fn=boom)
+    assert {k: v for k, v in q.items() if not k.startswith("_view")} == {"measures": ["sales.count"]}
     assert not any("Verified examples" in m[1] for m in llm.msgs[0])
 
 

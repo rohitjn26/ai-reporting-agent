@@ -396,6 +396,21 @@ def test_semantic_root_can_be_chosen(ecommerce):
         "order_items", "order_items.orders", "order_items.products", "order_items.orders.customers"}
 
 
+def test_semantic_hub_that_is_the_only_parent_still_holds_children(ecommerce):
+    """orders is referenced by half the tables (a 'hub'), but it's the only
+    parent items/payments/reviews have — they must hang under it, not drop out."""
+    folder = ecommerce[0].parent
+    _csv(folder / "order_payments.csv", ["id", "order_id", "amount"],
+         [[i, i, 10.0 + i] for i in range(1, 121)])
+    _csv(folder / "order_reviews.csv", ["id", "order_id", "score"],
+         [[i, i, i % 5 + 1] for i in range(1, 121)])
+    d = draft_semantic_layer(run_discovery(sorted(folder.glob("*.csv"))).to_dict())
+    paths = _paths(_view(d, "customers"))
+    assert {"customers.orders.order_items", "customers.orders.order_payments",
+            "customers.orders.order_reviews"} <= set(paths)
+    assert not any("left out" in n or "referenced by most" in n for n in d["notes"])
+
+
 def test_semantic_branches_never_meet_only_at_the_root(tmp_path):
     """org -> site -> participant -> response -> answer; task is referenced by
     response AND event. Hanging task straight off org would cross-multiply it

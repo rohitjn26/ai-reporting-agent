@@ -292,7 +292,8 @@ def _plan_view(comp: list[str], joins: list[dict], discovery: dict,
       ties go to the smaller table (org over account).
     - spine: each table sits under its deepest parent (longest FK chain to the
       root), over complete FKs (every row filled in and found — anything less
-      drops rows when walking down) into non-hub tables; at equal depth the
+      drops rows when walking down) into non-hub tables (a hub only when it is the
+      table's sole way to the root: order_items under orders); at equal depth the
       bigger parent wins — the finer container (participant over task). The spine is the chain
       from every fact — a table nothing references — up to the root, reached
       downward (one_to_many).
@@ -341,8 +342,14 @@ def _plan_view(comp: list[str], joins: list[dict], discovery: dict,
 
     parents: dict[str, list[dict]] = defaultdict(list)
     for j in spine_edges:
-        if j["fk_table"] != root and j["pk_table"] not in hubs:
+        if j["fk_table"] != root:
             parents[j["fk_table"]].append(j)
+
+    def usable(t: str) -> list[dict]:
+        """t's parents leading to the root, hubs only if nothing else does —
+        order_items has nowhere to go but orders, though orders is referenced by half."""
+        ok = [j for j in parents[t] if dep(j["pk_table"]) is not None]
+        return [j for j in ok if j["pk_table"] not in hubs] or ok
 
     # longest chain to the root; an edge that closes a cycle is ignored
     depth: dict[str, int] = {root: 0}
@@ -354,7 +361,7 @@ def _plan_view(comp: list[str], joins: list[dict], discovery: dict,
         if state.get(t) == "visiting":
             return None
         state[t] = "visiting"
-        found = [d + 1 for j in parents[t] if (d := dep(j["pk_table"])) is not None]
+        found = [depth[j["pk_table"]] + 1 for j in usable(t)]
         state[t] = "done"
         if found:
             depth[t] = max(found)
@@ -363,7 +370,7 @@ def _plan_view(comp: list[str], joins: list[dict], discovery: dict,
     up: dict[str, dict] = {}  # table -> the join to its parent on the spine
     for t in comp:
         if t != root and dep(t) is not None:
-            up[t] = max((j for j in parents[t] if j["pk_table"] in depth),
+            up[t] = max(usable(t),
                         key=lambda j: (depth[j["pk_table"]], tables[j["pk_table"]]["rows"],
                                        _coverage(discovery, j), j["pk_table"]))
 
@@ -435,8 +442,9 @@ def _plan_view(comp: list[str], joins: list[dict], discovery: dict,
     if left_out:
         notes.append(f"view {root}: {', '.join(left_out)} not connected to {root} "
                      f"through usable joins — left out.")
-    return {"root": root, "entries": entries, "up": {t: up[t] for t in spine - {root}},
-            "hubs": sorted(hubs)}
+    up = {t: up[t] for t in spine - {root}}
+    return {"root": root, "entries": entries, "up": up,
+            "hubs": sorted(hubs - {j["pk_table"] for j in up.values()})}
 
 
 def _build_view(plan: dict, cubes: dict[str, dict], ds: str | None,

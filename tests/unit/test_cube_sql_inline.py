@@ -32,3 +32,18 @@ def test_higher_indices_replaced_first(cube_server_mod):
     params = list(range(1, 11))  # 10 params → values 1..10
     sql = cube_server_mod._inline_sql_params("$1 and $10", params)
     assert sql == "1 and 10"
+
+
+async def test_load_retries_while_cube_says_continue_wait(cube_server_mod, monkeypatch):
+    # Cube answers 200 {"error": "Continue wait"} for slow queries; that is not "no rows".
+    replies = [{"error": "Continue wait"}, {"data": [{"x": 1}]}]
+
+    async def fake_post(path, payload):
+        return replies.pop(0)
+
+    async def no_sleep(_):
+        pass
+
+    monkeypatch.setattr(cube_server_mod, "_cube_post", fake_post)
+    monkeypatch.setattr(cube_server_mod.asyncio, "sleep", no_sleep)
+    assert (await cube_server_mod._cube_load({}))["data"] == [{"x": 1}]

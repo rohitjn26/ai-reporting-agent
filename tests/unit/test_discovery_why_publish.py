@@ -164,6 +164,21 @@ def test_upsert_skips_unchanged_and_undo_reverses(monkeypatch):
     assert calls == [("DELETE", "L/v1/CUBE_CONFIG/new1"), ("POST", "L/v1/CUBE_CONFIG/idb/rollback")]
 
 
+def test_upsert_failure_undoes_earlier_writes(monkeypatch):
+    calls = []
+
+    def fake(url, payload=None, method="GET"):
+        calls.append((method, url))
+        if method == "POST" and url == "L/v1/VIEW":
+            raise RuntimeError("library POST: HTTP 500")
+        return {"id": "new1"} if method == "POST" else {}
+    monkeypatch.setattr(publish, "_request", fake)
+    draft = {"cubes": [{"name": "a", "data": {"x": 1}}], "views": [{"name": "v", "data": {}}]}
+    with pytest.raises(RuntimeError, match="earlier writes undone"):
+        publish.upsert_library(draft, {"CUBE_CONFIG": {}, "VIEW": {}}, base="L")
+    assert calls[-1] == ("DELETE", "L/v1/CUBE_CONFIG/new1")
+
+
 def test_load_data_with_no_tables_touches_nothing(shop):
     d = _draft(shop)
     assert publish.load_data(d, "postgresql://nowhere:1/x", tables=[]) == {}

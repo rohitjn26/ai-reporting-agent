@@ -16,14 +16,7 @@ import httpx
 
 from chart.renderer import build_chart_config, table_element_html
 
-CUBE_URL        = os.environ.get("CUBE_URL", "http://localhost:4000")
-CUBE_API_SECRET = os.environ.get("CUBE_API_SECRET", "local-dev-secret")
 LIBRARY_URL     = os.environ.get("LIBRARY_URL", "http://localhost:3001")
-
-_CUBE_HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {CUBE_API_SECRET}",
-}
 
 
 # ── pure helpers (no I/O — unit tested) ───────────────────────────────────────
@@ -195,11 +188,9 @@ def _to_cube_payload(cube_query: dict) -> dict:
 
 async def _cube_load(cube_query: dict) -> tuple[list[dict], dict]:
     """Run a query against Cube; return (rows, annotation)."""
-    payload = {"query": _to_cube_payload(cube_query)}
+    from graph.agent import _cube_load as load  # local: graph.agent imports this module
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(f"{CUBE_URL}/cubejs-api/v1/load", json=payload, headers=_CUBE_HEADERS)
-        resp.raise_for_status()
-        body = resp.json()
+        body = await load(client, _to_cube_payload(cube_query))  # handles "Continue wait"
     return body.get("data", []), body.get("annotation", {})
 
 

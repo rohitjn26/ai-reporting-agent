@@ -38,6 +38,16 @@ async def _cube_post(path: str, payload: dict) -> dict:
         return resp.json()
 
 
+async def _cube_load(query: dict) -> dict:
+    """POST /load, re-asking while Cube answers "Continue wait" (query still running)."""
+    for _ in range(10):
+        result = await _cube_post("/cubejs-api/v1/load", {"query": query})
+        if result.get("error") != "Continue wait":
+            return result
+        await asyncio.sleep(0.5)
+    raise RuntimeError("Cube is still running this query — try again shortly")
+
+
 async def _cube_get(path: str) -> dict:
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(f"{CUBE_URL}{path}", headers=_HEADERS)
@@ -164,7 +174,7 @@ async def query_cube(
 
     sql_path = f"/cubejs-api/v1/sql?query={urllib.parse.quote(json.dumps(query))}"
     result, sql_result = await asyncio.gather(
-        _cube_post("/cubejs-api/v1/load", {"query": query}),
+        _cube_load(query),
         _cube_get(sql_path),
         return_exceptions=True,
     )
@@ -178,6 +188,8 @@ async def query_cube(
             except Exception:
                 pass
         return json.dumps({"error": err_msg})
+    if result.get("error"):
+        return json.dumps({"error": result["error"]})
 
     sql = ""
     if not isinstance(sql_result, Exception):

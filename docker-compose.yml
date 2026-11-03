@@ -3,7 +3,7 @@ services:
   postgres:
     image: postgres:15-alpine
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -20,7 +20,7 @@ services:
   library-db:
     image: postgres:15-alpine
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -39,7 +39,7 @@ services:
     # share a lifecycle. Agent UI runs on the host → reach it at localhost:5434.
     image: postgres:15-alpine
     ports:
-      - "5434:5432"
+      - "127.0.0.1:5434:5432"
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -56,7 +56,7 @@ services:
   library:
     build: ./library
     ports:
-      - "3001:3001"
+      - "127.0.0.1:3001:3001"
     environment:
       DATABASE_URL: postgresql://postgres:postgres@library-db:5432/library
       PORT: "3001"
@@ -72,7 +72,7 @@ services:
   cube:
     build: ./cube
     ports:
-      - "4000:4000"
+      - "127.0.0.1:4000:4000"
     environment:
       CUBEJS_DB_TYPE: postgres
       CUBEJS_DB_HOST: postgres
@@ -98,7 +98,7 @@ services:
   cube-mcp:
     build: ./mcp
     ports:
-      - "5001:5001"
+      - "127.0.0.1:5001:5001"
     environment:
       CUBE_URL: http://cube:4000
       CUBE_API_SECRET: local-dev-secret
@@ -119,7 +119,7 @@ services:
   library-mcp:
     build: ./mcp
     ports:
-      - "5002:5002"
+      - "127.0.0.1:5002:5002"
     environment:
       LIBRARY_URL: http://library:3001
       MCP_HOST: "0.0.0.0"

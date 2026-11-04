@@ -247,7 +247,9 @@ async def preview_cube_config_update(
         }, indent=2)
 
     proposed_name = name if name is not None else current.get("name")
-    _staging[config_id] = {"name": proposed_name, "data": proposed_data}
+    # the version previewed, so commit can refuse if the config changed in between
+    _staging[config_id] = {"name": proposed_name, "data": proposed_data,
+                           "version": current.get("version")}
 
     return json.dumps({
         "config_id":  config_id,
@@ -270,7 +272,15 @@ async def commit_cube_config_update(config_id: str) -> str:
             "error": f"No staged update for config_id={config_id}. Call preview_cube_config_update first."
         })
     staged = _staging.pop(config_id)
-    result = await _put(f"/v1/CUBE_CONFIG/{config_id}", staged)
+    current = await _get(f"/v1/CUBE_CONFIG/{config_id}")
+    if current.get("version") != staged["version"]:
+        # committing the staged copy now would silently undo the newer version
+        return json.dumps({
+            "error": f"Config changed since the preview (v{staged['version']} -> "
+                     f"v{current.get('version')}). Call preview_cube_config_update again."
+        })
+    result = await _put(f"/v1/CUBE_CONFIG/{config_id}",
+                        {"name": staged["name"], "data": staged["data"]})
     return json.dumps(result, indent=2)
 
 

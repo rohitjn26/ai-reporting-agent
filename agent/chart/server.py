@@ -35,7 +35,7 @@ def _ensure_started():
         # Try the preferred port first, then let the OS pick a free one.
         for port in (preferred, 0):
             try:
-                server = http.server.HTTPServer(("", port), _Handler)
+                server = http.server.HTTPServer(("127.0.0.1", port), _Handler)
                 _PORT = server.server_address[1]  # actual port (matters when port=0)
                 break
             except OSError:

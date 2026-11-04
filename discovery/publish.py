@@ -178,21 +178,27 @@ def upsert_library(draft: dict, library: dict[str, dict[str, dict]],
                    base: str = LIBRARY_URL) -> list[dict]:
     """Create or update every cube config and view in the draft (cubes first,
     so the views' cubes exist). Each update is a new library version.
-    Returns what was written, for undo_library."""
+    Returns what was written, for undo_library. If a write fails, the earlier
+    ones are undone before the error is raised, so nothing is left half-published."""
     done = []
-    for rtype, key in _KINDS:
-        have = library.get(rtype, {})
-        for cfg in draft.get(key, []):
-            body = {"name": cfg["name"], "data": cfg["data"]}
-            old = have.get(cfg["name"])
-            if old is not None and _canon(old["data"]) == _canon(cfg["data"]):
-                continue  # unchanged: no new version
-            if old is not None:
-                _request(f"{base}/v1/{rtype}/{old['id']}", body, "PUT")
-                done.append({"type": rtype, "name": cfg["name"], "id": old["id"], "created": False})
-            else:
-                rid = _request(f"{base}/v1/{rtype}", body, "POST").get("id")
-                done.append({"type": rtype, "name": cfg["name"], "id": rid, "created": True})
+    try:
+        for rtype, key in _KINDS:
+            have = library.get(rtype, {})
+            for cfg in draft.get(key, []):
+                body = {"name": cfg["name"], "data": cfg["data"]}
+                old = have.get(cfg["name"])
+                if old is not None and _canon(old["data"]) == _canon(cfg["data"]):
+                    continue  # unchanged: no new version
+                if old is not None:
+                    _request(f"{base}/v1/{rtype}/{old['id']}", body, "PUT")
+                    done.append({"type": rtype, "name": cfg["name"], "id": old["id"], "created": False})
+                else:
+                    rid = _request(f"{base}/v1/{rtype}", body, "POST").get("id")
+                    done.append({"type": rtype, "name": cfg["name"], "id": rid, "created": True})
+    except Exception as e:
+        failed = undo_library(done, base)
+        raise RuntimeError(f"{e} — earlier writes undone"
+                           + (f" (except {', '.join(failed)})" if failed else "")) from e
     return done
 
 

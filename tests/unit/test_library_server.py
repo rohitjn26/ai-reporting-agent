@@ -56,3 +56,21 @@ def test_validator_accepts_running_total_and_sql_less_count():
         "hand_written": {"sql": "SUM(a) / COUNT(*)", "type": "number"},
     }, None) == []
     assert ls._validate_fields({"w": {"sql": "id", "type": "count", "rolling_window": {}}}, None)
+
+
+async def test_commit_refuses_when_config_changed_since_preview(monkeypatch):
+    versions = iter([3, 4])     # preview sees v3; someone publishes v4 before the commit
+    puts = []
+
+    async def fake_get(path, params={}):
+        return {"name": "c", "version": next(versions), "data": {"measures": dict(CURRENT)}}
+
+    async def fake_put(path, payload):
+        puts.append(payload)
+        return {}
+
+    monkeypatch.setattr(ls, "_get", fake_get)
+    monkeypatch.setattr(ls, "_put", fake_put)
+    await ls.preview_cube_config_update("cfg1", measures={"n": {"sql": "id", "type": "count"}})
+    out = await ls.commit_cube_config_update("cfg1")
+    assert "changed since the preview" in out and puts == []

@@ -105,6 +105,13 @@ def test_explore_page_starts_from_a_remembered_query(client):
     assert "no longer in memory" in client.get("/explore/missing").text
 
 
+def test_each_chart_keeps_its_own_link(client):
+    first, second = ui._remember(ui._charts, "<p>chart one</p>"), ui._remember(ui._charts, "<p>chart two</p>")
+    assert "chart one" in client.get(f"/chart/{first}").text
+    assert "chart two" in client.get(f"/chart/{second}").text
+    assert "no longer in memory" in client.get("/chart/missing").text
+
+
 def test_records_fall_back_to_the_charts_own_columns_when_cube_rejects_them(client, monkeypatch):
     real = ui._cube_load
 

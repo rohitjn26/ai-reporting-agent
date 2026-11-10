@@ -80,6 +80,20 @@ def chart():
     return _chart_server._current_html
 
 
+# Each chart the agent drew, by id, so an older "View chart" link in the chat
+# still shows its own chart. In memory and capped, like _explore_queries.
+_charts: dict[str, str] = {}
+
+
+@app.get("/chart/{cid}", response_class=HTMLResponse)
+def chart_by_id(cid: str):
+    html = _charts.get(cid)
+    if html is None:
+        return _replay_error_page("chart", "This chart is no longer in memory "
+                                  "(the UI restarted). Ask for the chart again.")
+    return html
+
+
 def _replay_error_page(kind: str, err: str) -> str:
     return (
         "<!DOCTYPE html><html><body style='font-family:system-ui;background:#f8fafc;"
@@ -119,13 +133,18 @@ _EXPLORE_KEEP = 200
 _DRILL_LIMIT = 100          # rows per drilled chart; ranking already skips wide splits
 
 
-def _remember_explore(query: dict) -> str:
+def _remember(store: dict, value) -> str:
+    """Keep `value` under a new id, dropping the oldest past _EXPLORE_KEEP."""
     import uuid
-    eid = uuid.uuid4().hex[:12]
-    _explore_queries[eid] = query
-    while len(_explore_queries) > _EXPLORE_KEEP:
-        _explore_queries.pop(next(iter(_explore_queries)))
-    return eid
+    rid = uuid.uuid4().hex[:12]
+    store[rid] = value
+    while len(store) > _EXPLORE_KEEP:
+        store.pop(next(iter(store)))
+    return rid
+
+
+def _remember_explore(query: dict) -> str:
+    return _remember(_explore_queries, query)
 
 
 @app.get("/explore/{eid}", response_class=HTMLResponse)
@@ -652,7 +671,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                     # Show the query/SQL behind the final visualization (if any).
                     async for ev in flush_query():
                         yield ev
-                    ev = {'type': 'chart', 'url': '/chart'}
+                    ev = {'type': 'chart', 'url': f"/chart/{_remember(_charts, _chart_server._current_html)}"}
                     if last_query and last_query.get("measures"):
                         ev['explore'] = f"/explore/{_remember_explore(last_query)}"
                     yield f"data: {json.dumps(ev)}\n\n"

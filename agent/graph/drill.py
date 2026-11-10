@@ -494,19 +494,34 @@ def weekday_mix(date_range: list) -> list[int]:
     return mix
 
 
-def same_weekdays_before(date_range: list, not_after: Optional[Any] = None) -> list[str]:
+def same_weekdays_before(date_range: list) -> list[str]:
     """The window to compare `date_range` against: same length and the same number of
     each weekday, so a period with two Mondays isn't measured against one with one.
-    That is the period shifted back by whole weeks — enough not to overlap it, and
-    when `not_after` is given, enough to end on or before that date."""
+    That is the period shifted back by whole weeks — just enough not to overlap it."""
     start, end = (_parse_time(v).date() for v in date_range[:2])
     weeks = -(-((end - start).days + 1) // 7)          # ceil(days / 7): no overlap
-    if not_after is not None:
-        limit = _parse_time(not_after).date()
-        while end - timedelta(weeks=weeks) > limit:
-            weeks += 1
     shift = timedelta(weeks=weeks)
     return [(start - shift).isoformat(), (end - shift).isoformat()]
+
+
+# Up to this long, the default comparison matches weekdays; past it the weekday mix
+# differs by a day at most, so the plain window just before reads more naturally.
+WEEKDAY_MATCH_MAX_DAYS = 91
+
+
+def default_compare(date_range: list) -> tuple[list[str], str]:
+    """The comparison window when the user named none, and a phrase saying what it is.
+    Short periods: the same days of the week, whole weeks earlier (same_weekdays_before).
+    Longer ones: the equally long window that ends the day before the period starts."""
+    start, end = (_parse_time(v).date() for v in date_range[:2])
+    days = (end - start).days + 1
+    if days <= WEEKDAY_MATCH_MAX_DAYS:
+        window = same_weekdays_before(date_range)
+        weeks = (start - date.fromisoformat(window[0])).days // 7
+        return window, f"same days of the week, {weeks} week{'s' * (weeks != 1)} earlier"
+    before = start - timedelta(days=1)
+    return ([(before - timedelta(days=days - 1)).isoformat(), before.isoformat()],
+            f"the {days} days just before")
 
 
 def change_note(base: float, current: float, agg_type: Optional[str]) -> Optional[str]:

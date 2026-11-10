@@ -83,12 +83,19 @@ async def test_a_compare_period_with_the_same_weekdays_is_used_as_asked(monkeypa
     assert out["compare_period"] == ["2026-01-25", "2026-02-24"] and "compare_adjusted" not in out
 
 
-async def test_a_compare_period_with_other_weekdays_is_moved_and_reported(monkeypatch):
+async def test_the_users_compare_period_is_kept_even_with_other_weekdays(monkeypatch):
     _patch_cube(monkeypatch)
     out = await _call(_history(BUILT), {**ARGS, "compare_period": ["2026-02-01", "2026-02-28"]})
-    assert out["compare_period"] == ["2026-01-25", "2026-02-24"]    # ends before Feb 28, same weekdays
-    assert out["compare_adjusted"]["asked"] == ["2026-02-01", "2026-02-28"]
-    assert out["change"] == -100
+    assert out["compare_period"] == ["2026-02-01", "2026-02-28"] and "compare_adjusted" not in out
+    assert out["compare_basis"] == "the period you asked for"
+    assert "31 vs 28 days" in out["length_note"]
+
+
+async def test_an_overlapping_compare_period_falls_back_to_the_default(monkeypatch):
+    _patch_cube(monkeypatch)
+    out = await _call(_history(BUILT), {**ARGS, "compare_period": ["2026-03-15", "2026-04-15"]})
+    assert out["compare_period"] == ["2026-01-25", "2026-02-24"]
+    assert out["compare_adjusted"]["asked"] == ["2026-03-15", "2026-04-15"]
 
 
 async def test_no_driver_is_said_plainly_not_left_for_the_model_to_fill(monkeypatch):

@@ -4,7 +4,7 @@ from datetime import date
 
 import pytest
 
-from graph.drill import (OTHER, Candidate, NotAdditive, bucket_range, candidates, change_note, records_query, same_weekdays_before, weekday_mix,
+from graph.drill import (OTHER, Candidate, NotAdditive, bucket_range, candidates, change_note, records_query, same_weekdays_before, weekday_mix, default_compare,
                          drill, rank_breakdown, rank_change)
 
 META = [{
@@ -278,11 +278,6 @@ def test_comparison_has_the_same_length_and_weekdays(period, expected):
     assert got[1] < period[0][:10]                                         # never overlaps
 
 
-def test_comparison_can_be_pushed_back_to_end_before_a_date():
-    got = same_weekdays_before(["2026-05-29", "2026-06-08"], not_after="2026-05-20")
-    assert got == ["2026-05-08", "2026-05-18"] and weekday_mix(got) == weekday_mix(["2026-05-29", "2026-06-08"])
-
-
 def test_weekday_mix_counts_each_day():
     # Fri May 29 .. Mon Jun 8: two Fridays..Mondays, one Tuesday..Thursday
     assert weekday_mix(["2026-05-29", "2026-06-08"]) == [2, 1, 1, 1, 2, 2, 2]
@@ -468,3 +463,11 @@ def test_validation_looks_inside_and_or_filters():
            "filters": [{"or": [{"member": "sales.region", "operator": "set"},
                                {"member": "sales.nope", "operator": "set"}]}]}
     assert any("sales.nope" in p for p in qb.validate_query(bad, META))
+
+
+def test_default_compare_matches_weekdays_for_short_periods_only():
+    assert default_compare(["2026-03-01", "2026-03-31"]) == (
+        ["2026-01-25", "2026-02-24"], "same days of the week, 5 weeks earlier")
+    # 22 months: the equally long window just before, not an odd whole-week shift
+    assert default_compare(["2020-01-01", "2021-10-31"]) == (
+        ["2018-03-02", "2019-12-31"], "the 670 days just before")

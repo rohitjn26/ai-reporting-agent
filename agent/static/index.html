@@ -2112,6 +2112,11 @@
         link.href = d.url; link.target = '_blank';
         link.className = 'chart-link';
         link.innerHTML = '📊 View chart →';
+        // plain click: show this chart in the panel; cmd/ctrl-click still opens a tab
+        link.onclick = e => {
+          if (e.metaKey || e.ctrlKey || e.shiftKey) return;
+          e.preventDefault(); showChart(d.url);
+        };
         const lw = document.createElement('div');
         lw.className = 'msg agent'; lw.appendChild(link);
         if (d.explore) {

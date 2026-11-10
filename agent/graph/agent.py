@@ -154,8 +154,11 @@ WHY A NUMBER CHANGED ("why is revenue down?", "what drove the jump in orders?"):
 1. Call build_query for the measure over the period the user means (e.g. "revenue
    last month"), so the measure and time dimension are validated.
 2. Call explain_change with that measure, time dimension, filters and period. Leave
-   compare_period out unless the user named one: it defaults to the same days of the
-   week just before. If the result has "compare_adjusted", say which window was used.
+   compare_period out unless the user named one (then pass it as they said it). Don't
+   ask the user for a comparison period — the default is sensible. Always say in one
+   line which window was compared (from `compare_basis` and `compare_period`) and offer
+   one alternative, e.g. "Compared with Mar 2018 – Dec 2019 (the 670 days just before) — want
+   the same period last year instead?". If it has "length_note", mention it.
 3. Answer in a few lines: the change (before → after), the dimension and values that
    account for most of it with their share of the change, and what `inside_top`
    adds. Say WHERE it happened, not why: the data can't show causes, so don't invent
@@ -689,11 +692,11 @@ async def explain_change(
         time_dimension: the time dimension from build_query
         period: the period the user asks about, as a Cube dateRange: "last month",
                 "this week", or ["2026-09-01", "2026-09-30"]
-        compare_period: what to compare against — omit it unless the user named one.
-                        Either way the comparison has the same length and the same
-                        number of each weekday as `period` (the period shifted back by
-                        whole weeks); a window that doesn't is moved to the nearest one
-                        that does, and the result says so in "compare_adjusted".
+        compare_period: what to compare against — ONLY when the user named it ("vs
+                        last year", "compared to Q2"); it is then used as asked. Omit it
+                        otherwise: up to ~3 months the default is the same days of the
+                        week, whole weeks earlier; longer periods compare with the equally
+                        long window just before. `compare_basis` says which was used.
         filters: build_query's filters, if any
 
     Returns:
@@ -731,10 +734,11 @@ async def explain_change(
         try:
             current = await resolve(period)
             asked = await resolve(compare_period) if compare_period else None
-            previous = asked
-            if asked is None or drill.weekday_mix(asked) != drill.weekday_mix(current) \
-                    or asked[1] >= current[0]:
-                previous = drill.same_weekdays_before(current, not_after=asked[1] if asked else None)
+            # the user's window as asked; only one that overlaps the period is replaced
+            if asked is not None and asked[1] < current[0]:
+                previous, basis = asked, "the period you asked for"
+            else:
+                previous, basis = drill.default_compare(current)
             report = await drill.rank_change(scope, view_meta, run, time_dimension=time_dimension,
                                              period=current, compare_period=previous,
                                              distances=distances, stats=col_stats)
@@ -765,13 +769,15 @@ async def explain_change(
         "inside_top": inside,
         "skipped": report.skipped or None,
     }
-    weeks = (date.fromisoformat(current[0]) - date.fromisoformat(previous[0])).days // 7
-    out["compare_basis"] = f"same days of the week, {weeks} week{'s' * (weeks != 1)} earlier"
+    out["compare_basis"] = basis
     if asked is not None and previous != asked:
         out["compare_adjusted"] = {
             "asked": asked, "used": previous,
-            "why": f"{asked[0]}..{asked[1]} doesn't have the same number of each weekday as the "
-                   "period (or overlaps it), so the nearest window that does was used"}
+            "why": f"{asked[0]}..{asked[1]} overlaps the period, so {basis} was used"}
+    days = lambda r: (date.fromisoformat(r[1]) - date.fromisoformat(r[0])).days + 1
+    if days(previous) != days(current):
+        out["length_note"] = (f"The periods differ in length ({days(current)} vs {days(previous)} "
+                              "days), so part of the change is just the number of days.")
     if report.note:
         out["note"] = report.note
     if not report.rankings:

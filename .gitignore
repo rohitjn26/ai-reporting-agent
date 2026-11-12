@@ -41,3 +41,4 @@ evals/eval_results.json
 
 # Published-dataset manifests (Schema tab → Publish)
 datasets/
+.superpowers/

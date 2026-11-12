@@ -557,6 +557,39 @@
     #new-chat-btn:hover { border-color: #6366f1; color: #fff; }
     #new-chat-btn:disabled { opacity: .4; cursor: default; }
     .chat-note { font-size: 0.72rem; color: #64748b; text-align: center; }
+
+    /* ── Compare mode: one question, two models side by side ── */
+    #chat-panel.cmp-wide { width: min(980px, 72vw); }
+    #compare-toggle {
+      display: none; align-items: center; gap: 6px; margin-right: 10px;
+      font-size: 0.75rem; color: #94a3b8; cursor: pointer;
+    }
+    .cmp-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .cmp-col {
+      min-width: 0; display: flex; flex-direction: column; gap: 10px;
+      border: 1px solid #334155; border-radius: 10px; padding: 8px;
+    }
+    .cmp-col .bubble { max-width: 100%; }
+    .cmp-head { display: flex; align-items: center; gap: 8px; font-size: 0.72rem; color: #94a3b8; }
+    .cmp-head b { color: #e2e8f0; }
+    .cmp-time { margin-left: auto; font-variant-numeric: tabular-nums; }
+    .cmp-chart { width: 100%; height: 260px; border: 0; border-radius: 6px; background: #0f172a; }
+    .cmp-verdict { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 0.75rem; color: #94a3b8; }
+    .cmp-verdict button, .cmp-stop {
+      background: #161b22; border: 1px solid #30363d; color: #cbd5e1; border-radius: 6px;
+      font-size: 0.75rem; padding: 4px 10px; cursor: pointer;
+    }
+    .cmp-stop { padding: 1px 8px; font-size: 0.7rem; }
+    .cmp-verdict button:hover, .cmp-stop:hover { border-color: #6366f1; color: #fff; }
+    .cmp-verdict button:focus-visible, .cmp-stop:focus-visible, #compare-toggle input:focus-visible {
+      outline: 2px solid #6366f1; outline-offset: 2px;
+    }
+    .cmp-verdict button:disabled { opacity: .4; cursor: default; }
+    .cmp-verdict input {
+      flex: 1; min-width: 120px; background: #0f172a; border: 1px solid #334155; color: #cbd5e1;
+      border-radius: 6px; padding: 4px 8px; font-size: 0.75rem;
+    }
+    @media (max-width: 700px) { .cmp-row { grid-template-columns: 1fr; } }
     #input-area {
       padding: 14px 16px;
       border-top: 1px solid #334155;
@@ -915,6 +948,9 @@
   <!-- Chat -->
   <div id="chat-panel">
     <div id="chat-toolbar">
+      <label id="compare-toggle" title="Ask both models every question and compare their answers">
+        <input type="checkbox" id="compare-check"> Compare models
+      </label>
       <button id="new-chat-btn" title="Start a fresh conversation — the agent forgets this one">&#xFF0B; New chat</button>
     </div>
     <div id="messages">
@@ -1074,6 +1110,14 @@
   });
 
   const messagesEl  = document.getElementById('messages');
+  // Where chat helpers append. Normally the transcript; in compare mode each stream's
+  // events are rendered with this pointed at its column (see into / handleStream).
+  let outEl = messagesEl;
+  function into(el, fn) {
+    const prev = outEl;
+    outEl = el;
+    try { return fn(); } finally { outEl = prev; }
+  }
   const input       = document.getElementById('msg-input');
   const sendBtn     = document.getElementById('send-btn');
   const frame       = document.getElementById('chart-frame');
@@ -1106,7 +1150,7 @@
     const n = document.createElement('div');
     n.className = 'chat-note';
     n.textContent = text;
-    messagesEl.appendChild(n);
+    outEl.appendChild(n);
   }
 
   // Start a fresh conversation: new thread id, clean transcript, cost total back to 0.
@@ -1132,7 +1176,7 @@
     bubble.className = 'bubble';
     bubble.textContent = text;
     wrap.appendChild(bubble);
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
     return bubble;
   }
@@ -1145,7 +1189,7 @@
     chip.className = 'model-chip ' + (known ? model : 'haiku');
     chip.innerHTML = (model === 'sonnet' ? '✦' : '⚡') + ' ' + model;
     wrap.appendChild(chip);
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
   }
 
@@ -1153,7 +1197,7 @@
     const wrap = document.createElement('div');
     wrap.className = 'msg agent';
     wrap.innerHTML = '<div class="typing"><span></span><span></span><span></span></div>';
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
     return wrap;
   }
@@ -1189,7 +1233,7 @@
     const wrap = document.createElement('div');
     wrap.className = 'msg agent';
     wrap.innerHTML = '<div class="tool-badge"><span class="spinner"></span>' + icon + ' ' + name + '</div>';
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
     if (!runId) return wrap;
 
@@ -1303,7 +1347,7 @@
     card.appendChild(freeRow);
 
     wrap.appendChild(card);
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
     if (!options || !options.length) freeInput.focus();
     return card;
@@ -1523,7 +1567,7 @@
     };
 
     wrap.appendChild(card);
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
   }
 
@@ -1537,7 +1581,7 @@
       '<div class="ec-title">&#9888; ' + title + '</div>' +
       '<div class="ec-body">' + body + '</div>';
     wrap.appendChild(card);
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
   }
 
@@ -1554,7 +1598,7 @@
       <pre></pre>`;
     block.querySelector('pre').textContent = sql;
     wrap.appendChild(block);
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
   }
 
@@ -1593,9 +1637,10 @@
       out += '<div class="qp-problem">\u26A0 ' + d.problems.map(escapeHtml).join('; ') + '</div>';
 
     card.innerHTML = out;
-    if (d.trace_id) attachFeedback(card, d.trace_id);
+    // 👍/👎 feed few-shot examples; hidden in compare mode so A and B can't leak into each other
+    if (d.trace_id && outEl === messagesEl) attachFeedback(card, d.trace_id);
     wrap.appendChild(card);
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
   }
 
@@ -1933,7 +1978,7 @@
       '<div class="cp-changes">' + rowsHtml + '</div>' +
       '<div class="cp-footer">Not saved yet — tell the agent to commit when ready</div>';
     wrap.appendChild(card);
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
   }
 
@@ -2035,12 +2080,14 @@
       '<span>' + kTok(d.input_tokens) + ' in (' + cached + '% cached) · ' + kTok(d.output_tokens) + ' out</span>' +
       '<span>peak context ' + kTok(d.max_context) + '</span>';
     wrap.appendChild(line);
-    messagesEl.appendChild(wrap);
+    outEl.appendChild(wrap);
     scrollBottom();
   }
 
   // ── core SSE handler — shared by /chat and /resume ─────────────────────────
-  function handleStream(es, typingEl) {
+  // target: where this stream renders (a compare column, or the transcript).
+  // onDone(failed): called instead of re-enabling input — compare mode waits for both columns.
+  function handleStream(es, typingEl, target = messagesEl, onDone = null) {
     let agentBubble = null;
     let agentRaw    = '';
     let firstToken  = true;
@@ -2053,7 +2100,7 @@
       const bubble = document.createElement('div');
       bubble.className = 'bubble';
       wrap.appendChild(bubble);
-      messagesEl.appendChild(wrap);
+      outEl.appendChild(wrap);
       return bubble;
     }
 
@@ -2074,7 +2121,9 @@
       agentRaw = '';
     }
 
-    es.onmessage = (e) => {
+    es.onmessage = (e) => into(target, () => onEvent(e));
+
+    function onEvent(e) {
       const d = JSON.parse(e.data);
 
       if (d.type === 'model') {
@@ -2101,6 +2150,7 @@
 
       } else if (d.type === 'query_plan') {
         showQueryPlan(d);
+        if (d.trace_id && target !== messagesEl) target.dataset.traceId = d.trace_id;
 
       } else if (d.type === 'config_preview') {
         showConfigPreview(d.current, d.proposed);
@@ -2127,7 +2177,13 @@
           ex.onclick = e => { e.preventDefault(); showChart(d.explore); };
           lw.appendChild(ex);
         }
-        messagesEl.appendChild(lw); scrollBottom();
+        outEl.appendChild(lw);
+        if (target !== messagesEl) {  // compare: each column shows its own chart inline
+          const f = document.createElement('iframe');
+          f.className = 'cmp-chart'; f.title = 'Chart'; f.src = d.url;
+          outEl.appendChild(f);
+        }
+        scrollBottom();
 
       } else if (d.type === 'dashboard') {
         finalizeAgentText();
@@ -2138,13 +2194,13 @@
         link.innerHTML = '📊 Open dashboard →';
         const lw = document.createElement('div');
         lw.className = 'msg agent'; lw.appendChild(link);
-        messagesEl.appendChild(lw); scrollBottom();
+        outEl.appendChild(lw); scrollBottom();
 
       } else if (d.type === 'status') {
         const note = document.createElement('div');
         note.style.cssText = 'font-size:0.65rem;color:#475569;text-align:center;padding:2px 0';
         note.textContent = '· ' + d.text + ' ·';
-        messagesEl.appendChild(note);
+        outEl.appendChild(note);
 
       } else if (d.type === 'error') {
         if (firstToken) { typingEl.remove(); firstToken = false; }
@@ -2159,7 +2215,7 @@
         const note = document.createElement('div');
         note.style.cssText = 'font-size:0.72rem;color:#f59e0b;text-align:center;padding:4px 0';
         note.textContent = '⚠ ' + d.text;
-        messagesEl.appendChild(note);
+        outEl.appendChild(note);
 
       } else if (d.type === 'interrupt') {
         // Graph paused — show question card or form, resume on answer
@@ -2171,12 +2227,12 @@
 
         const onAnswer = (answer) => {
           input.placeholder = 'Ask for a chart…';
-          const resumeTyping = addTyping();
+          const resumeTyping = into(target, addTyping);
           const res = new EventSource(
             '/resume?thread_id=' + encodeURIComponent(threadId) +
             '&answer='           + encodeURIComponent(answer)
           );
-          handleStream(res, resumeTyping);
+          handleStream(res, resumeTyping, target, onDone);
         };
 
         if (d.form_type === 'config_edit') {
@@ -2196,19 +2252,129 @@
       } else if (d.type === 'done') {
         finalizeAgentText();
         es.close();
+        if (onDone) { onDone(false); return; }
         sendBtn.disabled = false;
         input.placeholder = 'Ask for a chart…';
         input.focus();
         scrollBottom();
       }
-    };
+    }
 
     es.onerror = () => {
       es.close();
       if (firstToken) typingEl.remove();
+      if (onDone) { onDone(true); return; }
       sendBtn.disabled = false;
       input.placeholder = 'Ask for a chart…';
     };
+  }
+
+  // ── compare mode ───────────────────────────────────────────────────────────
+  // Each question runs on A (normal agent) and B (COMPARE_MODEL) at once, in two
+  // columns with their own conversations (B's thread = A's + "-b"); the user then
+  // picks which answered better and the verdict is saved (POST /compare/verdict).
+  let compareCfg = null;
+  let compareOn  = false;
+  const compareCheck = document.getElementById('compare-check');
+
+  function setCompare(on) {
+    compareOn = on;
+    compareCheck.checked = on;
+    document.getElementById('chat-panel').classList.toggle('cmp-wide', on);
+    try { localStorage.setItem('compareMode', on ? '1' : '0'); } catch (e) {}
+  }
+  compareCheck.addEventListener('change', () => setCompare(compareCheck.checked));
+  fetch('/compare/config').then(r => r.json()).then(cfg => {
+    if (!cfg.enabled) return;
+    compareCfg = cfg;
+    document.getElementById('compare-toggle').style.display = 'flex';
+    let saved = false;
+    try { saved = localStorage.getItem('compareMode') === '1'; } catch (e) {}
+    setCompare(saved);
+  }).catch(() => {});
+
+  function sendCompare(text) {
+    const row = document.createElement('div');
+    row.className = 'cmp-row';
+    messagesEl.appendChild(row);
+    let left = 2;
+    const cols = ['a', 'b'].map(lane => {
+      const col = document.createElement('div');
+      col.className = 'cmp-col';
+      const head = document.createElement('div');
+      head.className = 'cmp-head';
+      head.innerHTML = '<span>' + lane.toUpperCase() + ' · <b>' + escapeHtml(compareCfg[lane]) +
+                       '</b></span><span class="cmp-time">0.0 s</span>';
+      col.appendChild(head);
+      row.appendChild(col);
+      return { lane, col, head, tid: lane === 'a' ? threadId : threadId + '-b',
+               t0: performance.now(), seconds: null, finished: false };
+    });
+    const timeEl = c => c.head.querySelector('.cmp-time');
+
+    const finish = (c, answered) => {
+      if (c.finished) return;
+      c.finished = true;
+      clearInterval(c.timer);
+      if (answered) c.seconds = Math.round((performance.now() - c.t0) / 100) / 10;
+      timeEl(c).textContent = answered ? c.seconds.toFixed(1) + ' s' : 'no answer';
+      const stop = c.head.querySelector('.cmp-stop');
+      if (stop) stop.remove();
+      if (--left === 0) showVerdictRow(text, cols);
+    };
+
+    cols.forEach(c => {
+      c.timer = setInterval(() => {
+        timeEl(c).textContent = ((performance.now() - c.t0) / 1000).toFixed(1) + ' s';
+      }, 100);
+      const typing = into(c.col, addTyping);
+      const es = new EventSource('/chat?message=' + encodeURIComponent(text) +
+                                 '&thread_id=' + encodeURIComponent(c.tid) + '&lane=' + c.lane);
+      handleStream(es, typing, c.col, failed => finish(c, !failed));
+      if (c.lane === 'b') {  // the local model can be slow: let the user stop waiting for it
+        const stop = document.createElement('button');
+        stop.className = 'cmp-stop';
+        stop.textContent = 'Stop waiting';
+        stop.onclick = () => { es.close(); typing.remove(); finish(c, false); };
+        c.head.appendChild(stop);
+      }
+    });
+    scrollBottom();
+  }
+
+  function showVerdictRow(question, [a, b]) {
+    const row = document.createElement('div');
+    row.className = 'cmp-verdict';
+    row.innerHTML = '<span>Which is right?</span>';
+    const note = document.createElement('input');
+    note.placeholder = 'optional note…';
+    note.setAttribute('aria-label', 'Note on this comparison');
+    const choices = [['a', 'A is better'], ['b', 'B is better'],
+                     ['both_good', 'Both good'], ['both_wrong', 'Both wrong']];
+    choices.forEach(([verdict, label]) => {
+      const btn = document.createElement('button');
+      btn.textContent = label;
+      btn.onclick = async () => {
+        row.querySelectorAll('button').forEach(x => x.disabled = true);
+        const r = await postJson('/compare/verdict', {
+          question, thread_a: a.tid, thread_b: b.tid,
+          trace_a: a.col.dataset.traceId || null, trace_b: b.col.dataset.traceId || null,
+          seconds_a: a.seconds, seconds_b: b.seconds, verdict, note: note.value.trim() });
+        if (r.error) {
+          row.querySelectorAll('button').forEach(x => x.disabled = false);
+          row.querySelector('span').textContent = 'Not saved (' + r.error + ') — try again:';
+          return;
+        }
+        row.textContent = 'Saved: ' + label;
+      };
+      row.appendChild(btn);
+    });
+    row.appendChild(note);
+    messagesEl.appendChild(row);
+    sendBtn.disabled = false;
+    input.placeholder = 'Ask for a chart…';
+    input.focus();
+    scrollBottom();
   }
 
   // ── send a new message ─────────────────────────────────────────────────────
@@ -2219,6 +2385,7 @@
     input.style.height = 'auto';
     sendBtn.disabled = true;
     addMsg('user', text);
+    if (compareOn && compareCfg) return sendCompare(text);
     const typingEl = addTyping();
     const es = new EventSource(
       '/chat?message='   + encodeURIComponent(text) +

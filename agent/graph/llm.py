@@ -17,10 +17,23 @@ GATEWAY_KEY = os.environ.get("LLM_GATEWAY_KEY", "sk-local-dev")
 TIMEOUT_S = 180
 
 
+class _GatewayChat(ChatOpenAI):
+    """ChatOpenAI that keeps the raw usage on streamed calls too. langchain-openai
+    drops it when streaming, and it is the only place the gateway reports Anthropic
+    cache writes (cache_creation_input_tokens), which the cost meter prices."""
+
+    def _convert_chunk_to_generation_chunk(self, chunk, default_chunk_class, base_generation_info):
+        gen = super()._convert_chunk_to_generation_chunk(chunk, default_chunk_class,
+                                                         base_generation_info)
+        if gen is not None and chunk.get("usage"):
+            gen.message.response_metadata["token_usage"] = chunk["usage"]
+        return gen
+
+
 # Cached per (model, temperature): each client owns an httpx connection pool, and
 # re-creating one per call would open a fresh connection every time.
 @lru_cache(maxsize=None)
 def chat(model: str, temperature: float | None = None) -> ChatOpenAI:
-    return ChatOpenAI(base_url=GATEWAY_URL, api_key=GATEWAY_KEY, model=model,
+    return _GatewayChat(base_url=GATEWAY_URL, api_key=GATEWAY_KEY, model=model,
                       temperature=temperature, stream_usage=True, timeout=TIMEOUT_S,
                       max_retries=0)

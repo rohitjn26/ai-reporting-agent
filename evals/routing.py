@@ -132,7 +132,7 @@ def main():
     problems = check_cases(cases, {v["name"] for v in metadata})
     print(f"{len(metadata)} views, {len(cases)} cases, catalog "
           f"{len(qb.render_view_catalog(metadata, cubes))} chars, router model "
-          f"{os.environ.get('VIEW_SELECTOR_MODEL', 'claude-haiku-4-5-20251001')}")
+          f"{os.environ.get('VIEW_SELECTOR_MODEL', 'haiku')}")
     if problems:
         sys.exit("case file problems:\n  " + "\n  ".join(problems))
     if args.dry_run:

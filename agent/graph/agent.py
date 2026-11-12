@@ -4,11 +4,9 @@ LangGraph ReAct agent wired to MCP tool servers + local chart/config tools.
 import asyncio, json, os, re, sys, uuid
 from collections import OrderedDict
 from datetime import date
-from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 import httpx
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
@@ -35,6 +33,7 @@ from graph import query_builder as qb
 from graph import feedback
 from graph import guard
 from graph import drill
+from graph.llm import chat
 
 CUBE_MCP_URL    = os.environ.get("CUBE_MCP_URL",    "http://localhost:5001/sse")
 LIBRARY_MCP_URL = os.environ.get("LIBRARY_MCP_URL", "http://localhost:5002/sse")
@@ -47,7 +46,7 @@ CUBE_API_SECRET = os.environ.get("CUBE_API_SECRET", "local-dev-secret")
 # via a form interrupt, so the model only pre-fills suggestions the user
 # vets — Haiku is sufficient there. Override CLAUDE_MODEL to run the whole
 # loop on a stronger model if a workload needs it.
-MODEL       = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+MODEL       = os.environ.get("CLAUDE_MODEL", "haiku")
 MODEL_LABEL = next((n for n in ("haiku", "sonnet", "opus", "fable") if n in MODEL), MODEL)
 
 _agent = None
@@ -299,14 +298,13 @@ async def clear_thread(thread_id: str) -> None:
 # message on) is always kept as-is.
 SUMMARISE_AFTER = 10
 _SUMMARY_PREFIX = "[Conversation summary]"
-_SUMMARY_MODEL  = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
+_SUMMARY_MODEL  = os.environ.get("SUMMARY_MODEL", "haiku")
 
 
 # Reused across summarise calls so the httpx connection pool stays warm
 # (see the query_builder note on connection churn).
-@lru_cache(maxsize=None)
 def _summariser(model: str):
-    return ChatAnthropic(model=model)
+    return chat(model)
 
 
 def _extract_text(content) -> str:
@@ -1127,7 +1125,7 @@ async def build_agent():
     all_tools = mcp_tools + [build_query, explain_change, create_chart, edit_cube_config]
 
     _agent = create_react_agent(
-        ChatAnthropic(model=MODEL),
+        chat(MODEL),
         all_tools,
         state_modifier=_build_state_modifier,
         checkpointer=_checkpointer,

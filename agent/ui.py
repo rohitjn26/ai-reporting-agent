@@ -781,7 +781,7 @@ async def resume_stream(request: Request, answer: str, thread_id: str = "default
 # ── human feedback on built queries (see graph/feedback.py) ──────────────────
 
 def qb_model() -> str:
-    return os.environ.get("QUERY_BUILDER_MODEL", "claude-haiku-4-5-20251001")
+    return os.environ.get("QUERY_BUILDER_MODEL", "haiku")
 
 
 async def _view_meta(view: str | None) -> list[dict]:

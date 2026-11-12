@@ -213,20 +213,19 @@ def validate_query(query: dict, metadata: list[dict]) -> list[str]:
 
 # ── the LLM call ──────────────────────────────────────────────────────────────
 
-# Cached per model: each ChatAnthropic owns an httpx connection pool, and
-# build_query is a hot tool path. Re-creating one per call would open (and then
-# discard) a fresh TLS connection every time; memoizing keeps the pool warm so
-# repeated calls reuse the same keep-alive connection.
+# Cached per model: build_query is a hot tool path, and the gateway client
+# (graph/llm.py) keeps its connection pool warm across calls. Function calling,
+# not JSON-schema response_format: it works on both Anthropic and the local server.
 @lru_cache(maxsize=None)
 def _default_llm(model: str):
-    from langchain_anthropic import ChatAnthropic
-    return ChatAnthropic(model=model, temperature=0).with_structured_output(CubeQuery)
+    from graph.llm import chat
+    return chat(model, temperature=0).with_structured_output(CubeQuery, method="function_calling")
 
 
 @lru_cache(maxsize=None)
 def _default_view_llm(model: str):
-    from langchain_anthropic import ChatAnthropic
-    return ChatAnthropic(model=model, temperature=0).with_structured_output(ViewSelection)
+    from graph.llm import chat
+    return chat(model, temperature=0).with_structured_output(ViewSelection, method="function_calling")
 
 
 def _call(llm, msgs, config):
@@ -256,7 +255,7 @@ def select_view(
 ) -> ViewSelection:
     """Route a request to exactly one view. Returns ViewSelection(view=None) when
     the request would need to span views (Cube can't answer that in one query)."""
-    llm = llm or _default_view_llm(model or os.environ.get("VIEW_SELECTOR_MODEL", "claude-haiku-4-5-20251001"))
+    llm = llm or _default_view_llm(model or os.environ.get("VIEW_SELECTOR_MODEL", "haiku"))
     msgs = [("system", _SELECT_SYSTEM), ("human", _cached(f"Views:\n{render_view_catalog(metadata, cubes)}"))]
     if context:
         msgs.append(("human", f"Recent conversation (for follow-ups):\n{context}"))
@@ -361,7 +360,7 @@ def build_query(
     if view_error:
         return {"_view_error": view_error}
 
-    llm = llm or _default_llm(model or os.environ.get("QUERY_BUILDER_MODEL", "claude-haiku-4-5-20251001"))
+    llm = llm or _default_llm(model or os.environ.get("QUERY_BUILDER_MODEL", "haiku"))
     schema_text = render_schema(view_meta)
     examples = _get_examples(examples_fn, request, view_meta)
 
@@ -407,7 +406,7 @@ def build_and_run(
     if view_error:
         return {"_view_error": view_error}, {"error": view_error}
 
-    llm = llm or _default_llm(model or os.environ.get("QUERY_BUILDER_MODEL", "claude-haiku-4-5-20251001"))
+    llm = llm or _default_llm(model or os.environ.get("QUERY_BUILDER_MODEL", "haiku"))
     schema_text = render_schema(view_meta)
 
     # view_meta is a single view, so build_query won't re-route.

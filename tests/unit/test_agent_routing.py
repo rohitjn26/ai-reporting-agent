@@ -182,3 +182,80 @@ def test_build_query_stops_on_schema_compile_error(monkeypatch):
 def test_build_query_stops_when_cube_unreachable(monkeypatch):
     out = _build_with_meta_error(monkeypatch, httpx.ConnectError("connection refused"))
     assert out["_cube_unavailable"].startswith("Cube is unreachable (ConnectError")
+
+
+# ── model per run, read-only agent (compare mode) ─────────────────────────────
+
+def _tool_names(monkeypatch, read_only):
+    names = sorted(agent.WRITE_TOOLS | {"query_cube", "get_cube_metadata", "list_cube_configs"})
+
+    class _Client:
+        def __init__(self, servers):
+            pass
+
+        async def get_tools(self):
+            return [SimpleNamespace(name=n, description=n) for n in names]
+
+    seen = {}
+
+    def _create(model, tools, **kw):
+        seen["tools"] = {getattr(t, "name", None) for t in tools}
+        seen["model"] = model.model_name
+        return object()
+
+    async def _cp():
+        return None
+
+    monkeypatch.setattr(agent, "MultiServerMCPClient", _Client)
+    monkeypatch.setattr(agent, "create_react_agent", _create)
+    monkeypatch.setattr(agent, "_make_checkpointer", _cp)
+    monkeypatch.setattr(agent, "_checkpointer", None)
+    asyncio.run(agent.build_agent("local-qwen", read_only=read_only))
+    return seen
+
+
+def test_read_only_agent_has_no_write_tools(monkeypatch):
+    seen = _tool_names(monkeypatch, read_only=True)
+    assert not (seen["tools"] & agent.WRITE_TOOLS)
+    assert {"build_query", "query_cube", "create_chart"} <= seen["tools"]
+    assert seen["model"] == "local-qwen"
+
+
+def test_full_agent_keeps_write_tools(monkeypatch):
+    seen = _tool_names(monkeypatch, read_only=False)
+    assert {"edit_cube_config", "commit_cube_config_update", "save_graph"} <= seen["tools"]
+
+
+def test_concurrent_runs_keep_their_own_model(monkeypatch):
+    seen = []
+
+    def _fake_build(request, metadata, **kw):
+        seen.append(kw.get("model"))
+        return {"measures": []}
+
+    async def _meta():
+        return [], []
+
+    monkeypatch.setattr(agent.qb, "build_query", _fake_build)
+    monkeypatch.setattr(agent, "_fetch_cube_metadata", _meta)
+
+    async def both():
+        await asyncio.gather(
+            agent.build_query.ainvoke({"request": "x"}, config={"configurable": {"llm": "haiku"}}),
+            agent.build_query.ainvoke({"request": "y"}, config={"configurable": {"llm": "local-qwen"}}))
+
+    asyncio.run(both())
+    assert sorted(seen) == ["haiku", "local-qwen"]
+
+
+def test_summarise_uses_given_model(monkeypatch):
+    used = []
+
+    class _LLM:
+        async def ainvoke(self, msgs):
+            return SimpleNamespace(content="short summary")
+
+    monkeypatch.setattr(agent, "_summariser", lambda model: used.append(model) or _LLM())
+    msgs = _with_ids([HumanMessage(content=f"q{i}") for i in range(12)])
+    assert asyncio.run(agent.maybe_summarise(_FakeAgent(msgs), "t-b", model="local-qwen"))
+    assert used == ["local-qwen"]

@@ -24,9 +24,14 @@ CACHE_WRITE_X = 1.25
 CACHE_READ_X  = 0.10
 
 
+# LiteLLM gateway aliases (litellm/config.yaml) -> the model id they price as.
+ALIASES = {"haiku": "claude-haiku-4-5"}
+
+
 def price_for(model: str) -> tuple[float, float, float] | None:
     """(input, output, cache_read) for a model id, matching the longest known prefix
     so dated ids like claude-haiku-4-5-20251001 resolve. None if unknown."""
+    model = ALIASES.get(model, model)
     hits = [k for k in PRICES if (model or "").startswith(k)]
     if not hits:
         return None
@@ -34,17 +39,18 @@ def price_for(model: str) -> tuple[float, float, float] | None:
     return p[0], p[1], p[2] if len(p) > 2 else p[0] * CACHE_READ_X
 
 
-def call_cost(model: str, usage: dict) -> float | None:
+def call_cost(model: str, usage: dict, raw: dict | None = None) -> float | None:
     """Cost of one call from LangChain usage_metadata. `input_tokens` there is the
     total input including cache reads and writes, which are split out in
-    `input_token_details`."""
+    `input_token_details`. Through the gateway, cache writes are only in the raw
+    `token_usage` (`raw`), as `cache_creation_input_tokens`."""
     p = price_for(model)
     if p is None:
         return None
     pin, pout, pread = p
     details = usage.get("input_token_details") or {}
     read  = details.get("cache_read") or 0
-    write = details.get("cache_creation") or 0
+    write = details.get("cache_creation") or (raw or {}).get("cache_creation_input_tokens") or 0
     fresh = max((usage.get("input_tokens") or 0) - read - write, 0)
     return (fresh * pin + write * pin * CACHE_WRITE_X + read * pread
             + (usage.get("output_tokens") or 0) * pout) / 1_000_000
@@ -60,7 +66,7 @@ class RequestCost:
     dollars: float = 0.0
     unpriced: set[str] = field(default_factory=set)
 
-    def add(self, model: str, usage: dict | None) -> None:
+    def add(self, model: str, usage: dict | None, raw: dict | None = None) -> None:
         if not usage:
             return
         self.calls += 1
@@ -69,7 +75,7 @@ class RequestCost:
         self.max_context = max(self.max_context, inp)
         self.cache_read += (usage.get("input_token_details") or {}).get("cache_read") or 0
         self.output_tokens += usage.get("output_tokens") or 0
-        cost = call_cost(model, usage)
+        cost = call_cost(model, usage, raw)
         if cost is None:
             self.unpriced.add(model or "unknown")
         else:

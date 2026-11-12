@@ -69,3 +69,16 @@ def test_build_query_calls_in_a_worker_thread_reach_the_event_stream():
         return seen
 
     assert asyncio.run(run()) == [10]
+
+
+def test_cache_writes_read_from_raw_usage_and_alias_priced():
+    # Through the gateway, ChatOpenAI reports cache reads in usage_metadata but
+    # cache writes only in the raw token_usage (spike, 2026-11-12).
+    usage = {"input_tokens": 8775, "output_tokens": 10, "input_token_details": {"cache_read": 5776}}
+    raw = {"cache_creation_input_tokens": 2994}
+    assert pricing.call_cost("haiku", usage, raw) == pytest.approx(
+        (5 * 1.0 + 2994 * 1.25 + 5776 * 0.1 + 10 * 5.0) / 1e6)
+    assert pricing.call_cost("local-qwen", usage, raw) is None
+    c = pricing.RequestCost()
+    c.add("haiku", usage, raw)
+    assert c.dollars == pytest.approx(pricing.call_cost("haiku", usage, raw))

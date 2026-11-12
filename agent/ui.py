@@ -564,7 +564,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 meta = getattr(out, "response_metadata", None) or {}
                 cost.add(meta.get("model") or meta.get("model_name")
                          or (event.get("metadata") or {}).get("ls_model_name", ""),
-                         getattr(out, "usage_metadata", None))
+                         getattr(out, "usage_metadata", None), meta.get("token_usage"))
 
             elif kind == "on_tool_start":
                 run_id = event.get("run_id", "")

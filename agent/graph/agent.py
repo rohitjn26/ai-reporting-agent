@@ -330,7 +330,7 @@ def _latest_turn_start(messages) -> int | None:
     return None
 
 
-async def maybe_summarise(agent, thread_id: str) -> bool:
+async def maybe_summarise(agent, thread_id: str, model: str | None = None) -> bool:
     """
     If the stored message history for this thread is longer than SUMMARISE_AFTER,
     ask a fast model to compress the old messages into one summary message
@@ -375,7 +375,7 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
         + conversation
     )
 
-    summariser = _summariser(_SUMMARY_MODEL)
+    summariser = _summariser(model or _SUMMARY_MODEL)
     response   = await summariser.ainvoke([HumanMessage(content=prompt)])
     summary    = response.content if isinstance(response.content, str) else _extract_text(response.content)
 
@@ -583,8 +583,11 @@ async def build_query(request: str, config: RunnableConfig, context: str = "") -
     # build_query is sync (structured LLM call) — run off the event loop.
     # examples_fn: past requests users confirmed/corrected on the chosen view,
     # shown to the model as few-shot examples (graph/feedback.py).
+    # The run's model (compare mode runs A and B side by side) rides in the config;
+    # None falls back to QUERY_BUILDER_MODEL / VIEW_SELECTOR_MODEL.
+    model = (config.get("configurable") or {}).get("llm")
     query = await asyncio.to_thread(qb.build_query, request, metadata,
-                                    context=context or None, cubes=cubes,
+                                    context=context or None, cubes=cubes, model=model,
                                     examples_fn=feedback.examples_for, config=config)
     if isinstance(query, dict) and query.get("_view_error"):
         # A single query can't span two views. Stop the tool chain here and hand the
@@ -1090,7 +1093,16 @@ def _with_cache_breakpoint(history: list) -> list:
     return history[:-1] + [last]
 
 
-async def build_agent():
+# Tools that change something (Cube config, saved graphs, dashboards). The compare
+# agent (column B) runs without them, so a compared turn never writes twice.
+WRITE_TOOLS = frozenset({
+    "create_cube_config", "preview_cube_config_update", "commit_cube_config_update",
+    "rollback_cube_config", "delete_cube_config", "reload_cube_schema", "edit_cube_config",
+    "save_graph", "delete_graph", "create_dashboard", "delete_dashboard",
+})
+
+
+async def build_agent(model: str = MODEL, read_only: bool = False):
     """
     Build the single agent (one model, see MODEL) over a shared checkpointer.
     Every turn — data queries and config edits alike — runs on the same model
@@ -1119,11 +1131,15 @@ async def build_agent():
                              by_name["rollback_cube_config"])
         mcp_tools = [commit if t.name == "commit_cube_config_update" else t for t in mcp_tools]
     all_tools = mcp_tools + [build_query, explain_change, create_chart, edit_cube_config]
+    if read_only:
+        all_tools = [t for t in all_tools if t.name not in WRITE_TOOLS]
 
-    _agent = create_react_agent(
-        chat(MODEL),
+    built = create_react_agent(
+        chat(model),
         all_tools,
         state_modifier=_build_state_modifier,
         checkpointer=_checkpointer,
     )
-    return _agent
+    if not read_only:
+        _agent = built
+    return built

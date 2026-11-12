@@ -4,9 +4,19 @@ model_list:
     litellm_params:
       model: anthropic/claude-haiku-4-5-20251001
       api_key: os.environ/ANTHROPIC_API_KEY
+  # Any Anthropic model id (e.g. claude-haiku-4-5-20251001 in an older .env) passes
+  # straight through, so existing model settings keep working.
+  - model_name: claude-*
+    litellm_params:
+      model: anthropic/claude-*
+      api_key: os.environ/ANTHROPIC_API_KEY
   # mlx_lm.server on the spare M1 (see LOCAL_LLM_BASE)
   - model_name: local-qwen
     litellm_params:
       model: openai/mlx-community/Qwen3-8B-4bit
       api_base: os.environ/LOCAL_LLM_BASE
       api_key: local
+      # Fail fast when the M1 is asleep: the default timeout is 6000 s and the
+      # client's own retries stacked to a 12-minute wait (measured 2026-11-12).
+      timeout: 150
+      max_retries: 0

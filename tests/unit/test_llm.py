@@ -11,6 +11,7 @@ def test_chat_factory_points_at_gateway():
     assert m.model_name == "local-qwen"
     assert str(m.openai_api_base).startswith("http://localhost:4001/v1")
     assert m.request_timeout == 180
+    assert m.max_retries == 0                   # the gateway retries; retrying here multiplies waits
     assert llm.chat("local-qwen") is m          # cached: one connection pool per model
 
 

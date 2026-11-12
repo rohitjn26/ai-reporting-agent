@@ -12,7 +12,8 @@ from langchain_openai import ChatOpenAI
 
 GATEWAY_URL = os.environ.get("LLM_GATEWAY_URL", "http://localhost:4001/v1")
 GATEWAY_KEY = os.environ.get("LLM_GATEWAY_KEY", "sk-local-dev")
-# A slow or hung local model must not hold a column forever.
+# A slow or hung local model must not hold a column forever. No client-side retries:
+# the gateway retries, and stacking both multiplied a dead M1 into a 10+ minute wait.
 TIMEOUT_S = 180
 
 
@@ -21,4 +22,5 @@ TIMEOUT_S = 180
 @lru_cache(maxsize=None)
 def chat(model: str, temperature: float | None = None) -> ChatOpenAI:
     return ChatOpenAI(base_url=GATEWAY_URL, api_key=GATEWAY_KEY, model=model,
-                      temperature=temperature, stream_usage=True, timeout=TIMEOUT_S)
+                      temperature=temperature, stream_usage=True, timeout=TIMEOUT_S,
+                      max_retries=0)

@@ -215,6 +215,8 @@ class FeedbackStore:
         """Save a compare-mode verdict. Analysis only: never feeds few-shot examples."""
         if verdict not in COMPARE_VERDICTS:
             raise ValueError(f"verdict must be one of {sorted(COMPARE_VERDICTS)}")
+        if not (question and thread_a and thread_b):
+            raise ValueError("question, thread_a and thread_b are required")
         cid = uuid.uuid4().hex
         self._exec(
             "INSERT INTO model_comparisons (id, created_at, question, thread_a, thread_b, model_a, "

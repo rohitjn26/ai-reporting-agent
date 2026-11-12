@@ -1,0 +1,13 @@
+{"id": "org_participants_by_site", "kind": "clear", "prompt": "number of participants per site", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "org_task_responses_trend", "kind": "clear", "prompt": "task responses completed per week", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "org_signed_documents", "kind": "clear", "prompt": "how many documents are still pending signature", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "org_visits_by_site", "kind": "clear", "prompt": "scheduled visits by site", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "org_step_answers", "kind": "clear", "prompt": "distribution of answers for each survey step", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "org_document_invites", "kind": "clear", "prompt": "document invites sent per template", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "org_task_assignments", "kind": "clear", "prompt": "task assignments per organization", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "member_compliance_by_activity", "kind": "member_only", "prompt": "get me compliance vs activity names", "accept": ["mdbl_org_view"], "note": "compliance_ratio exists only on mdbl_c_site; the router sees no members"}
+{"id": "member_cumulative_participants", "kind": "member_only", "prompt": "cumulative participant count over time", "accept": ["mdbl_org_view"], "note": "cumulative_count exists only on mdbl_c_public_user"}
+{"id": "member_open_queries", "kind": "member_only", "prompt": "average open queries per participant", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "word_sites_not_sales", "kind": "overlap_word", "prompt": "count of sites", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "word_accounts", "kind": "overlap_word", "prompt": "user accounts by locale", "accept": ["mdbl_org_view", "flu28_org_view"]}
+{"id": "word_responses", "kind": "overlap_word", "prompt": "response count by day", "accept": ["mdbl_org_view", "flu28_org_view"]}

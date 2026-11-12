@@ -1,0 +1,1 @@
+{"id": "dim_income", "kind": "missing_dimension", "prompt": "participants by income bracket", "absent": ["income", "salary"], "absent_in": ["mdbl_org_view", "flu28_org_view"], "note": "income is a revenue synonym in sales; participants have none"}

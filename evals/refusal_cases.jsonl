@@ -6,7 +6,6 @@
 {"id": "dim_sales_rep", "kind": "missing_dimension", "prompt": "revenue by sales rep", "absent": ["sales_rep", "salesperson", "rep_"]}
 {"id": "dim_marketing_channel", "kind": "missing_dimension", "prompt": "orders by marketing channel", "absent": ["channel", "campaign", "utm"]}
 {"id": "dim_warehouse", "kind": "missing_dimension", "prompt": "units sold by warehouse", "absent": ["warehouse"]}
-{"id": "dim_income", "kind": "missing_dimension", "prompt": "participants by income bracket", "absent": ["income", "salary"], "absent_in": ["mdbl_org_view", "flu28_org_view"], "note": "income is a revenue synonym in sales; participants have none"}
 {"id": "dim_payment_method", "kind": "missing_dimension", "prompt": "orders by payment method", "absent": ["payment"]}
 {"id": "near_city", "kind": "near_miss", "prompt": "order count by city", "absent": ["city"], "absent_in": ["sales", "discovery_orders_view", "product_sales", "discovery_order_items_view"], "note": "only site addresses (clinical) mention a city"}
 {"id": "near_state", "kind": "near_miss", "prompt": "average order value by state", "absent": ["state"], "absent_in": ["sales", "discovery_orders_view", "product_sales", "discovery_order_items_view"], "note": "account.state exists in the clinical views, a different meaning"}

@@ -1237,6 +1237,7 @@
     scrollBottom();
     if (!runId) return wrap;
 
+    const host = outEl;  // the timer fires after outEl is reset: keep the card in this column
     const timer = setTimeout(() => {
       const entry = _badgeMap.get(runId);
       if (!entry) return;
@@ -1245,10 +1246,10 @@
         spinner.outerHTML = '<span class="badge-warn">⏳</span>';
         entry.el.classList.add('timed-out');
       }
-      showErrorCard(
+      into(host, () => showErrorCard(
         icon + ' ' + name + ' is taking too long',
         'This tool has been running for over ' + (TOOL_TIMEOUT_MS / 1000) + 's.\nIt may be stuck. Check Docker / Cube / network connectivity.'
-      );
+      ));
     }, TOOL_TIMEOUT_MS);
 
     _badgeMap.set(runId, { el: wrap.querySelector('.tool-badge'), name, timer });

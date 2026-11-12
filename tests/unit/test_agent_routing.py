@@ -3,7 +3,6 @@ import asyncio
 from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
-from langchain_anthropic.chat_models import _format_messages
 
 from graph import agent
 
@@ -77,10 +76,9 @@ def _call(tid="t1", name="list_cube_configs"):
 def test_state_modifier_caches_history_on_last_tool_result():
     msgs = [HumanMessage(content="q"), _call(), _tool("rows")]
     result = agent._build_state_modifier({"messages": msgs})
-    _, formatted = _format_messages(result)
-    block = formatted[-1]["content"][-1]
-    assert block["type"] == "tool_result" and block["tool_use_id"] == "t1"
-    assert block["cache_control"] == _CC and block["content"] == "rows"
+    # OpenAI-style text block: the shape the LiteLLM gateway turns into a cached tool result
+    assert result[-1].content == [{"type": "text", "text": "rows", "cache_control": _CC}]
+    assert result[-1].tool_call_id == "t1"
     assert msgs[-1].content == "rows"  # stored state untouched
 
 
@@ -92,7 +90,7 @@ def test_state_modifier_trims_large_tool_results_from_earlier_turns_only():
     result = agent._build_state_modifier({"messages": msgs})
     old, current = result[3], result[7]
     assert len(old.content) < 700 and "trimmed" in old.content and "list_cube_configs" in old.content
-    assert current.content[0]["content"] == big  # this turn's result is whole
+    assert current.content[0]["text"] == big     # this turn's result is whole
     assert len(msgs[2].content) == 60_000         # stored state untouched
 
 

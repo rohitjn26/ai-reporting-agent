@@ -1075,13 +1075,9 @@ def _with_cache_breakpoint(history: list) -> list:
         return history
     last = history[-1]
     cc = {"type": "ephemeral"}
-    if isinstance(last, ToolMessage) and isinstance(last.content, str):
-        # A tool_result block carries the breakpoint; langchain-anthropic passes
-        # an all-tool_result ToolMessage through unchanged.
-        block = {"type": "tool_result", "content": last.content, "tool_use_id": last.tool_call_id,
-                 "is_error": last.status == "error", "cache_control": cc}
-        last = last.model_copy(update={"content": [block]})
-    elif isinstance(last, HumanMessage) and isinstance(last.content, str):
+    # A plain text block carries the breakpoint, for tool results too: the LiteLLM
+    # gateway turns it into a cached Anthropic tool_result (verified 2026-11-12).
+    if isinstance(last, (HumanMessage, ToolMessage)) and isinstance(last.content, str):
         last = last.model_copy(update={"content": [{"type": "text", "text": last.content,
                                                     "cache_control": cc}]})
     elif isinstance(last, (HumanMessage, ToolMessage)) and isinstance(last.content, list) \

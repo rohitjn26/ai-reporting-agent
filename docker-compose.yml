@@ -134,6 +134,20 @@ services:
       timeout: 5s
       retries: 15
 
+  # ── LLM gateway ───────────────────────────────────────────────────────────
+  # One OpenAI-compatible endpoint for the agent; models are aliases in the config.
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    command: ["--config", "/app/config.yaml"]
+    ports:
+      - "127.0.0.1:4001:4000"
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-local-dev}
+      LOCAL_LLM_BASE: ${LOCAL_LLM_BASE:-http://Rohits-MacBook-Pro-2.local:8081/v1}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+
 volumes:
   postgres-data:
   library-db-data:

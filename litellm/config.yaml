@@ -1,0 +1,12 @@
+# LiteLLM gateway: every chat-path LLM call goes through here by alias.
+model_list:
+  - model_name: haiku
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/ANTHROPIC_API_KEY
+  # mlx_lm.server on the spare M1 (see LOCAL_LLM_BASE)
+  - model_name: local-qwen
+    litellm_params:
+      model: openai/mlx-community/Qwen3-8B-4bit
+      api_base: os.environ/LOCAL_LLM_BASE
+      api_key: local

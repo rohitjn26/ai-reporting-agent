@@ -36,6 +36,9 @@ from graph import drill
 os.environ.setdefault("CHART_OPEN_BROWSER", "false")
 
 _agent = None
+# Compare mode: column B runs every LLM step on this gateway alias (unset = off).
+COMPARE_MODEL = os.environ.get("COMPARE_MODEL") or None
+_agent_b = None
 _ui_port: int = 0
 _HTML = (Path(__file__).parent / "static" / "index.html").read_text()  # the whole front end
 
@@ -55,8 +58,13 @@ def _free_port(preferred: int) -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _agent
+    global _agent, _agent_b
     _agent = await build_agent()
+    if COMPARE_MODEL:
+        try:  # B is optional: a failure here only leaves compare mode off
+            _agent_b = await build_agent(COMPARE_MODEL, read_only=True)
+        except Exception as e:
+            print(f"[compare] B agent ({COMPARE_MODEL}) not built: {e}")
     _chart_server._ensure_started()
     print(f"\n  Chat UI  → http://localhost:{_ui_port}")
     print(f"  Charts   → http://localhost:{_chart_server._PORT}\n")
@@ -482,15 +490,18 @@ def _sse_headers():
 
 
 async def _stream_agent(request: Request, input_, thread_id: str, agent=None, model_name=None,
-                        retried: bool = False):
+                        retried: bool = False, llm: str | None = None):
     """
     Core SSE generator — drives the agent, emits typed events, detects interrupts.
     `input_` is either {"messages": [...]} for new turns or Command(resume=...) for resumes.
     `model_name` (if given) is surfaced to the UI so it can badge which model handled the turn.
+    `llm` (compare mode, column B) runs every LLM step of the turn on that gateway alias;
+    None keeps the env-configured models.
     """
     if agent is None:
         agent = _agent
-    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 50,
+    configurable = {"thread_id": thread_id, **({"llm": llm} if llm else {})}
+    config = {"configurable": configurable, "recursion_limit": 50,
               "callbacks": tracing.callbacks(), "metadata": tracing.metadata(thread_id, tags=["ui"])}
     # Tell the UI which model is handling this turn (routed Haiku vs Sonnet).
     if model_name:
@@ -531,7 +542,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 tid = await asyncio.to_thread(
                     store.record_trace, request=_last_user_request(agent, config, user_message),
                     query=pending_direct, thread_id=thread_id, user_message=user_message,
-                    model=MODEL_LABEL)
+                    model=llm or MODEL_LABEL)
                 await asyncio.to_thread(store.attach_execution, tid, pending_direct, pending_sql)
             except Exception as e:  # feedback must never break a turn
                 print(f"[feedback] trace not recorded: {e}")
@@ -618,7 +629,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                                     feedback.get_store().record_trace,
                                     request=tin.get("request") or user_message or "",
                                     context=tin.get("context"), query=parsed, thread_id=thread_id,
-                                    user_message=user_message, model=qb_model())
+                                    user_message=user_message, model=llm or qb_model())
                             except Exception as e:  # feedback must never break a turn
                                 print(f"[feedback] trace not recorded: {e}")
                                 trace_id = None
@@ -708,7 +719,8 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 pass
             yield f"data: {json.dumps({'type': 'session_reset', 'text': 'Session was corrupted (page refreshed mid-tool-call). Cleared and retrying...'})}\n\n"
             # Replay the original message now that the thread is clean.
-            async for chunk in _stream_agent(request, input_, thread_id, agent=agent, retried=True):
+            async for chunk in _stream_agent(request, input_, thread_id, agent=agent,
+                                             model_name=model_name, retried=True, llm=llm):
                 yield chunk
             return
         yield f"data: {json.dumps({'type': 'error', 'text': err_text})}\n\n"
@@ -737,7 +749,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
 
     # Summarise history if it has grown too long (only at clean done points).
     try:
-        did_summarise = await maybe_summarise(agent, thread_id)
+        did_summarise = await maybe_summarise(agent, thread_id, model=llm)
         if did_summarise:
             yield f"data: {json.dumps({'type': 'status', 'text': 'History compressed'})}\n\n"
     except Exception:
@@ -757,15 +769,44 @@ _COSTED_ACTIONS = {
 
 
 @app.get("/chat")
-async def chat_stream(request: Request, message: str, thread_id: str = "default"):
-    """SSE — new user message. One model handles every turn (see agent.MODEL)."""
-    print(f"[chat] model={MODEL_LABEL}  thread={thread_id}  msg={message[:80]!r}")
+async def chat_stream(request: Request, message: str, thread_id: str = "default", lane: str = "a"):
+    """SSE — new user message. One model handles every turn (see agent.MODEL);
+    lane=b is compare mode's column B (read-only agent on COMPARE_MODEL)."""
+    if lane == "b":
+        if _agent_b is None:
+            return JSONResponse({"error": "compare mode is not available"}, status_code=404)
+        agent, label, llm = _agent_b, COMPARE_MODEL, COMPARE_MODEL
+    else:
+        agent, label, llm = _agent, MODEL_LABEL, None
+    print(f"[chat] model={label}  thread={thread_id}  msg={message[:80]!r}")
     return StreamingResponse(
         _stream_agent(request, {"messages": [HumanMessage(content=message)]}, thread_id,
-                      agent=_agent, model_name=MODEL_LABEL),
+                      agent=agent, model_name=label, llm=llm),
         media_type="text/event-stream",
         headers=_sse_headers(),
     )
+
+
+@app.get("/compare/config")
+async def compare_config():
+    """Whether compare mode can run, and the two models it compares."""
+    on = _agent_b is not None
+    return {"enabled": on, "a": MODEL_LABEL, "b": COMPARE_MODEL if on else None}
+
+
+@app.post("/compare/verdict")
+async def compare_verdict(request: Request):
+    """Save which column answered better. Models are filled in here, not by the page."""
+    body = await request.json()
+    fields = ("question", "thread_a", "thread_b", "trace_a", "trace_b",
+              "seconds_a", "seconds_b", "verdict", "note")
+    try:
+        cid = await asyncio.to_thread(
+            feedback.get_store().add_comparison, model_a=MODEL_LABEL, model_b=COMPARE_MODEL or "",
+            **{k: body.get(k) for k in fields})
+    except (ValueError, TypeError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return {"id": cid}
 
 
 @app.get("/resume")

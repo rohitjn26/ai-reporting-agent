@@ -42,6 +42,8 @@ from typing import Any
 from graph.query_builder import validate_query
 
 VERDICTS = {"up", "down"}
+# Compare mode (A = the normal model, B = COMPARE_MODEL)
+COMPARE_VERDICTS = {"a", "b", "both_good", "both_wrong"}
 STATUSES = {"pending", "approved", "rejected"}
 TAGS = {"wrong_measure", "wrong_dimension", "wrong_filter", "wrong_view", "wrong_time_grain", "other"}
 
@@ -68,6 +70,22 @@ _SCHEMA = [
         corrected_query TEXT,
         note            TEXT,
         status          TEXT NOT NULL
+    )""",
+    # Compare mode: one row per question answered by two models side by side.
+    """CREATE TABLE IF NOT EXISTS model_comparisons (
+        id              TEXT PRIMARY KEY,
+        created_at      TEXT NOT NULL,
+        question        TEXT NOT NULL,
+        thread_a        TEXT NOT NULL,
+        thread_b        TEXT NOT NULL,
+        model_a         TEXT NOT NULL,
+        model_b         TEXT NOT NULL,
+        trace_a         TEXT,
+        trace_b         TEXT,
+        seconds_a       DOUBLE PRECISION,
+        seconds_b       DOUBLE PRECISION,
+        verdict         TEXT NOT NULL,
+        note            TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS query_traces_view ON query_traces(view)",
     "CREATE INDEX IF NOT EXISTS query_feedback_trace ON query_feedback(trace_id)",
@@ -189,6 +207,23 @@ class FeedbackStore:
              note or None, status),
         )
         return {"id": fid, "status": status}
+
+    def add_comparison(self, *, question: str, thread_a: str, thread_b: str, model_a: str,
+                       model_b: str, verdict: str, trace_a: str | None = None,
+                       trace_b: str | None = None, seconds_a: float | None = None,
+                       seconds_b: float | None = None, note: str | None = None) -> str:
+        """Save a compare-mode verdict. Analysis only: never feeds few-shot examples."""
+        if verdict not in COMPARE_VERDICTS:
+            raise ValueError(f"verdict must be one of {sorted(COMPARE_VERDICTS)}")
+        cid = uuid.uuid4().hex
+        self._exec(
+            "INSERT INTO model_comparisons (id, created_at, question, thread_a, thread_b, model_a, "
+            "model_b, trace_a, trace_b, seconds_a, seconds_b, verdict, note) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (cid, _now(), question, thread_a, thread_b, model_a, model_b, trace_a or None,
+             trace_b or None, seconds_a, seconds_b, verdict, note or None),
+        )
+        return cid
 
     def list_feedback(self, status: str | None = None, limit: int = 100) -> list[dict]:
         sql = ("SELECT f.*, t.request, t.view, t.built_query, t.executed_query "

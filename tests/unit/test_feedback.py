@@ -283,3 +283,33 @@ async def test_stream_traces_direct_query_and_shows_sql(monkeypatch, store):
     assert trace["request"] == "orders by status"
     assert trace["executed_query"] == DirectQueryAgent.QUERY
     assert trace["sql"] == "SELECT status, count(*)"
+
+
+# ── compare mode verdicts ─────────────────────────────────────────────────────
+
+def _comparison(store, **kw):
+    args = dict(question="customers by state", thread_a="t", thread_b="t-b",
+                model_a="haiku", model_b="local-qwen", verdict="both_good")
+    args.update(kw)
+    cid = store.add_comparison(**args)
+    return store._exec("SELECT * FROM model_comparisons WHERE id = ?", (cid,), fetch=True)[0]
+
+
+def test_comparison_roundtrip_and_validation(store):
+    row = _comparison(store, seconds_a=3.1, seconds_b=24.6, trace_a="ta", trace_b="tb", note="same")
+    assert row["verdict"] == "both_good" and row["model_b"] == "local-qwen"
+    assert row["seconds_b"] == 24.6 and row["trace_a"] == "ta" and row["note"] == "same"
+    with pytest.raises(ValueError):
+        _comparison(store, verdict="meh")
+
+
+def test_verdict_without_b_answer(store):
+    row = _comparison(store, verdict="a", seconds_a=2.0)
+    assert row["seconds_b"] is None and row["trace_b"] is None
+
+
+def test_comparison_requires_question_and_threads(store):
+    with pytest.raises(ValueError):
+        _comparison(store, question="")
+    with pytest.raises(ValueError):
+        _comparison(store, thread_b=None)

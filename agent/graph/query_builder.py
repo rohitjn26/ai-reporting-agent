@@ -52,6 +52,11 @@ class CubeQuery(BaseModel):
     time_dimensions: list[TimeDimension] = Field(default_factory=list)
     order: dict[str, str] = Field(default_factory=dict)   # member -> asc|desc
     limit: Optional[int] = None
+    # parts of the request no schema member covers — reported, never substituted
+    missing: list[str] = Field(default_factory=list, description=(
+        "Parts of the request that no measure or dimension in the schema covers, in the "
+        "user's words, e.g. 'days between review creation and answer'. Empty when every "
+        "part maps to an existing member."))
 
     def to_query(self) -> dict:
         """Drop empties so the result matches what query_cube expects."""
@@ -98,6 +103,9 @@ Rules:
 - For "top N" / "highest" / "lowest", set order (member -> asc|desc) AND limit.
 - Read each field's description — it lists synonyms (e.g. revenue = sales = earnings).
 - Do NOT invent fields, filters, or metrics that weren't asked for.
+- If part of the request has no matching member — e.g. a difference between two dates,
+  a ratio, or a field that isn't listed — name that part in `missing`. Never substitute
+  a different member that merely sounds related; a wrong answer is worse than none.
 Return only the query."""
 
 
@@ -370,12 +378,14 @@ def build_query(
     problems = validate_query(query, view_meta)
 
     repairs = 0
-    while problems and repairs < max_repairs:
+    # a repair can't conjure a member that doesn't exist, so don't retry when parts are missing
+    while problems and repairs < max_repairs and not result.missing:
         result = _invoke(llm, request, schema_text, context, query, problems, examples, config)
         query = result.to_query()
         problems = validate_query(query, view_meta)
         repairs += 1
 
+    problems += [f"no field in the schema for: {m}" for m in result.missing]
     if problems:
         # Surface, don't silently ship a bad query. Caller decides what to do.
         query["_validation_problems"] = problems

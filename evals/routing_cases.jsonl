@@ -10,3 +10,4 @@
 {"id": "span_revenue_and_participants", "kind": "span", "prompt": "revenue by month next to participant count by month", "accept": []}
 {"id": "span_orders_and_visits", "kind": "span", "prompt": "compare number of orders with number of visits per country", "accept": []}
 {"id": "span_products_and_tasks", "kind": "span", "prompt": "units sold per product and task responses per task in one table", "accept": []}
+{"id": "member_payment_installments", "kind": "member_only", "prompt": "average number of payment installments per order", "accept": ["us_ecom_customers_view"], "note": "payment installments exist only on us_ecom_customers_view (order_payments); the router sees no members"}

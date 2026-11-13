@@ -186,6 +186,18 @@ def test_build_query_surfaces_problems_if_still_bad():
     assert "_validation_problems" in q               # not silently shipped
 
 
+def test_missing_part_is_reported_not_substituted():
+    # "days between order and delivery" has no member: the builder names it, the
+    # query is flagged (so query_cube is blocked and the agent offers to add it),
+    # and no repair is attempted — a retry can't produce a member that doesn't exist
+    llm = FakeLLM(qb.CubeQuery(measures=["orders.count"],
+                               missing=["days between order and delivery"]))
+    q = qb.build_query("distribution of days between order and delivery", META, llm=llm)
+    assert llm.calls == 1
+    assert q["_validation_problems"] == ["no field in the schema for: days between order and delivery"]
+    assert "missing" not in q
+
+
 # ── build_and_run (runtime-error repair) ──────────────────────────────────────
 
 def test_build_and_run_success_first_try():

@@ -25,7 +25,7 @@ down:
 
 # Seed the library with e-commerce cube configs
 seed:
-	cd library && python seed.py
+	cd library && ../.venv/bin/python seed.py
 
 # Column stats for drill-down (fill rate, distinct values) — every data schema,
 # or one: make stats SCHEMA=mdbl
@@ -39,7 +39,7 @@ agent:
 	  echo "[!] Created agent/.env — add your ANTHROPIC_API_KEY then re-run make agent"; \
 	  exit 1; \
 	fi
-	cd agent && python main.py
+	cd agent && ../.venv/bin/python main.py
 
 # Create virtualenv and install agent dependencies
 install:

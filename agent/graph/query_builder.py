@@ -131,6 +131,12 @@ def _view_cubes(view: dict) -> list[str]:
     return seen
 
 
+def _cubes_of(view: dict) -> list[str]:
+    """Cube names a view is built from, as the router's catalog lists them."""
+    carried = [m["name"] for m in ((view.get("meta") or {}).get("cubes") or [])]
+    return carried or _view_cubes(view)
+
+
 def render_view_catalog(metadata: list[dict], cubes: list[dict] | None = None) -> str:
     """Catalog for routing: each view's description plus every cube it's built
     from, with that cube's description. Members are left out on purpose: a view
@@ -144,7 +150,7 @@ def render_view_catalog(metadata: list[dict], cubes: list[dict] | None = None) -
         # a view published from a draft carries its cubes in meta (works outside
         # dev mode, where private cubes never reach /meta)
         carried = {m["name"]: m for m in ((c.get("meta") or {}).get("cubes") or [])}
-        for name in carried or _view_cubes(c):
+        for name in _cubes_of(c):
             cube = carried.get(name) or info.get(name, {})
             title = cube.get("title") or name
             cdesc = f": {cube['description']}" if cube.get("description") else ""
@@ -222,6 +228,9 @@ def _default_llm(model: str):
     return chat(model, temperature=0).with_structured_output(CubeQuery, method="function_calling")
 
 
+# No enum of view names in the schema: on Qwen3 8B it made the router name a view
+# even when the request spans several (span cases 3/3 -> 1/3, 2026-11-13).
+# select_view checks the answer and retries once instead.
 @lru_cache(maxsize=None)
 def _default_view_llm(model: str):
     from graph.llm import chat
@@ -255,12 +264,26 @@ def select_view(
 ) -> ViewSelection:
     """Route a request to exactly one view. Returns ViewSelection(view=None) when
     the request would need to span views (Cube can't answer that in one query)."""
+    names = [m.get("name") for m in metadata]
     llm = llm or _default_view_llm(model or os.environ.get("VIEW_SELECTOR_MODEL", "haiku"))
     msgs = [("system", _SELECT_SYSTEM), ("human", _cached(f"Views:\n{render_view_catalog(metadata, cubes)}"))]
     if context:
         msgs.append(("human", f"Recent conversation (for follow-ups):\n{context}"))
     msgs.append(("human", f"Request: {request}"))
-    return _call(llm, msgs, config)
+    sel = _call(llm, msgs, config)
+    if sel.view and sel.view not in names:
+        # Qwen3 8B names the right cube dressed as a view (us_ecom_orders -> us_ecom_orders_view):
+        # take the one view built from that cube, if exactly one is.
+        cube = sel.view.removesuffix("_view")
+        owners = [m["name"] for m in metadata if cube in _cubes_of(m)]
+        if len(owners) == 1:
+            return sel.model_copy(update={"view": owners[0]})
+    if sel.view and sel.view not in names:
+        # Otherwise an invented name: one retry with the real ones.
+        msgs.append(("human", f"'{sel.view}' is not one of the views. Answer with exactly one of: "
+                              f"{', '.join(names)} — or no view if the request spans several."))
+        sel = _call(llm, msgs, config)
+    return sel
 
 
 def _resolve_view(
@@ -285,7 +308,7 @@ def _resolve_view(
         return None, sel.reason or "request spans multiple views and can't be answered in one query", ""
     view_meta = [c for c in metadata if c.get("name") == sel.view]
     if not view_meta:
-        return None, f"selected view '{sel.view}' is not in the schema", ""
+        return None, f"the router named a view that doesn't exist ('{sel.view}'); try rephrasing", ""
     return view_meta, None, sel.reason
 
 

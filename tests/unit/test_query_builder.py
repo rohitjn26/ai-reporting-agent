@@ -117,9 +117,11 @@ class FakeSelector:
     def __init__(self, *selections):
         self.queue = list(selections)
         self.calls = 0
+        self.seen = []
 
     def invoke(self, msgs):
         self.calls += 1
+        self.seen.append(msgs)
         return self.queue.pop(0)
 
 
@@ -145,6 +147,47 @@ def test_build_query_surfaces_view_boundary():
     q = qb.build_query("revenue vs stock levels", MULTI, llm=llm, view_llm=selector)
     assert q == {"_view_error": "needs orders and inventory"}
     assert llm.calls == 0
+
+
+def test_invented_view_name_gets_one_retry_with_the_real_names():
+    # Small local models sometimes name a plausible view that doesn't exist.
+    selector = FakeSelector(qb.ViewSelection(view="orders_view", reason="guess"),
+                            qb.ViewSelection(view="orders", reason="revenue is in orders"))
+    llm = FakeLLM(qb.CubeQuery(measures=["orders.total_revenue"]))
+    q = qb.build_query("revenue", MULTI, llm=llm, view_llm=selector)
+    assert selector.calls == 2 and q["_view"] == "orders"
+    retry_note = selector.seen[1][-1][1]
+    assert "orders_view" in retry_note and "orders" in retry_note and "inventory" in retry_note
+
+
+# Two views built from cubes; "payments" is only in the shop view, "orders" in both.
+CUBE_VIEWS = [
+    {"name": "shop_view", "measures": [{"name": "shop_view.amount", "aliasMember": "payments.amount"},
+                                       {"name": "shop_view.n", "aliasMember": "orders.count"}],
+     "dimensions": []},
+    {"name": "geo_view", "measures": [{"name": "geo_view.n", "aliasMember": "orders.count"}],
+     "dimensions": []},
+]
+
+
+def test_cube_name_dressed_as_a_view_maps_to_the_one_view_holding_it():
+    # Qwen names the right table plus "_view" (us_ecom_orders -> us_ecom_orders_view).
+    selector = FakeSelector(qb.ViewSelection(view="payments_view", reason="installments are payments"))
+    sel = qb.select_view("installments per order", CUBE_VIEWS, llm=selector)
+    assert sel.view == "shop_view" and selector.calls == 1
+
+
+def test_cube_in_several_views_is_not_guessed():
+    selector = FakeSelector(qb.ViewSelection(view="orders_view"), qb.ViewSelection(view="geo_view"))
+    sel = qb.select_view("orders", CUBE_VIEWS, llm=selector)
+    assert sel.view == "geo_view" and selector.calls == 2   # ambiguous table -> retry instead
+
+
+def test_invented_view_name_twice_is_an_honest_error():
+    selector = FakeSelector(qb.ViewSelection(view="orders_view"), qb.ViewSelection(view="sales_view"))
+    llm = FakeLLM()  # must never be called
+    q = qb.build_query("revenue", MULTI, llm=llm, view_llm=selector)
+    assert "sales_view" in q["_view_error"] and llm.calls == 0
 
 
 def test_single_view_skips_routing():

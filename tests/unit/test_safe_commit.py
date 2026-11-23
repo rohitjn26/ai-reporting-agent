@@ -124,3 +124,38 @@ def test_a_new_field_is_added_to_views_that_list_the_cube(monkeypatch):
     assert path == "/v1/VIEW/v1"
     assert body["data"]["cubes"][0]["includes"] == ["count", "review_score", "answer_days"]
     assert body["data"]["cubes"][1]["includes"] == ["count"]          # other cubes untouched
+
+
+# ── checked_preview: a field's SQL must run against the table before staging ──
+
+def _preview(monkeypatch, problems):
+    seen = {}
+
+    async def check(source, fields):
+        seen["source"], seen["fields"] = source, fields
+        return problems, ["review_creation_date", "review_answer_timestamp"]
+
+    lib = httpx.MockTransport(lambda req: httpx.Response(
+        200, json={"data": {"sql": "SELECT * FROM shop.reviews"}}))
+    real = httpx.AsyncClient
+    monkeypatch.setattr(agent.httpx, "AsyncClient", lambda **kw: real(transport=lib, **kw))
+    monkeypatch.setattr(agent, "field_sql_problems", check)
+    mcp = _Tool(json.dumps({"status": "staged"}))
+    mcp.description = "Stage a cube config update for review."
+    tool = agent.checked_preview(mcp)
+    out = json.loads(asyncio.run(tool.ainvoke({
+        "config_id": "k1", "measures": {"days": {"sql": "seller_response_created_at", "type": "avg"}}})))
+    return out, mcp, seen
+
+
+def test_preview_rejects_sql_that_does_not_run_and_lists_real_columns(monkeypatch):
+    out, mcp, seen = _preview(monkeypatch, ['days: column "seller_response_created_at" does not exist'])
+    assert out["error"].startswith("Not staged") and "review_answer_timestamp" in out["columns"]
+    assert not mcp.calls                                     # nothing staged
+    assert seen["source"] == "SELECT * FROM shop.reviews" and "measure 'days'" in seen["fields"]
+
+
+def test_preview_stages_when_the_sql_runs(monkeypatch):
+    out, mcp, _ = _preview(monkeypatch, [])
+    assert out == {"status": "staged"}
+    assert mcp.calls == [{"config_id": "k1", "measures": {"days": {"sql": "seller_response_created_at", "type": "avg"}}}]

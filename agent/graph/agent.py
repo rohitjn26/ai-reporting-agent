@@ -6,7 +6,7 @@ from collections import OrderedDict
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Optional
 import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, ToolMessage
@@ -933,6 +933,78 @@ async def _rollback_views(views: list[dict]) -> None:
             await c.post(f"{LIBRARY_API}/v1/VIEW/{v['id']}/rollback", json={})
 
 
+DATA_DB_URL = os.environ.get("DATA_DB_URL", "postgresql://postgres:postgres@localhost:5432/reporting")
+
+
+async def field_sql_problems(source_sql: str, fields: dict[str, dict]) -> tuple[list[str], list[str]]:
+    """Run each field's SQL over the cube's source with LIMIT 0 -> (problems, the
+    source's real columns). Postgres still plans the query, so a made-up column or bad
+    syntax fails here. Cube's reload only checks the definition, not the SQL, so
+    without this a wrong column surfaces only at the first query."""
+    import asyncpg
+    problems = []
+    conn = await asyncpg.connect(DATA_DB_URL)
+    try:
+        columns = [a.name for a in (await conn.prepare(
+            f"SELECT * FROM ({source_sql}) AS cube_src LIMIT 0")).get_attributes()]
+        for key, cfg in fields.items():
+            sql = (cfg or {}).get("sql")
+            if not sql or re.search(r"\$\{(?!CUBE\})", sql):  # refers to another cube: can't test alone
+                continue
+            expr = re.sub(r"\$?\{CUBE\}", "cube_src", sql)
+            try:
+                await conn.fetch(f"SELECT ({expr}) FROM ({source_sql}) AS cube_src LIMIT 0")
+            except asyncpg.PostgresError as e:
+                problems.append(f"{key}: {e}")
+    finally:
+        await conn.close()
+    return problems, columns
+
+
+def checked_preview(mcp_preview):
+    """Wrap preview_cube_config_update so a field whose SQL doesn't run against the
+    table is rejected before it is staged, with the table's real columns to fix it
+    from. Same name, args and description as the MCP tool."""
+
+    @tool
+    async def preview_cube_config_update(
+        config_id: str,
+        name: Optional[str] = None,
+        sql: Optional[str] = None,
+        measures: Optional[dict] = None,
+        dimensions: Optional[dict] = None,
+        remove_measures: Optional[list[str]] = None,
+        remove_dimensions: Optional[list[str]] = None,
+        description: Optional[str] = None,
+    ) -> str:
+        """Stage a cube config update for review."""
+        args = {k: v for k, v in {
+            "config_id": config_id, "name": name, "sql": sql, "measures": measures,
+            "dimensions": dimensions, "remove_measures": remove_measures,
+            "remove_dimensions": remove_dimensions, "description": description,
+        }.items() if v is not None}
+        fields = {f"{kind[:-1]} '{k}'": v for kind, group in (("measures", measures), ("dimensions", dimensions))
+                  for k, v in (group or {}).items()}
+        if fields:
+            try:
+                async with httpx.AsyncClient(timeout=10) as c:
+                    r = await c.get(f"{LIBRARY_API}/v1/CUBE_CONFIG/{config_id}")
+                    r.raise_for_status()
+                problems, columns = await field_sql_problems(sql or r.json()["data"]["sql"], fields)
+            except Exception as e:  # can't check (DB or library down): stage as before
+                print(f"[preview] SQL not checked: {e}")
+                problems = []
+            if problems:
+                return json.dumps({
+                    "error": "Not staged: this SQL doesn't run against the table. Rewrite it using "
+                             "only the columns listed, then preview again.",
+                    "details": problems, "columns": columns})
+        return _tool_output_text(await mcp_preview.ainvoke(args))
+
+    preview_cube_config_update.description = mcp_preview.description or preview_cube_config_update.description
+    return preview_cube_config_update
+
+
 def safe_commit(mcp_commit, reload_tool, rollback_tool):
     """Wrap commit_cube_config_update so a change only stays if Cube compiles it:
     commit (a new version) -> reload Cube -> on a compile failure, roll back to
@@ -1178,6 +1250,8 @@ async def build_agent():
     mcp_tools = [gated_cube_metadata(t) if t.name == "get_cube_metadata" else t for t in mcp_tools]
     # commit_cube_config_update is swapped for one that reloads Cube and rolls the
     # change back if it doesn't compile (needs both MCP servers' tools).
+    # preview tests a new field's SQL against the table before staging it
+    mcp_tools = [checked_preview(t) if t.name == "preview_cube_config_update" else t for t in mcp_tools]
     by_name = {t.name: t for t in mcp_tools}
     if {"commit_cube_config_update", "reload_cube_schema", "rollback_cube_config"} <= by_name.keys():
         commit = safe_commit(by_name["commit_cube_config_update"], by_name["reload_cube_schema"],

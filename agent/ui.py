@@ -446,18 +446,18 @@ def _plan_event(trace_id: str | None, query: dict, source: str) -> str:
     }) + "\n\n"
 
 
-def _last_user_request(agent, config, user_message: str | None) -> str:
+async def _last_user_request(agent, config, user_message: str | None) -> str:
     """The user's request for a trace: this turn's message, or (on /resume) the
     last real human message in the thread."""
     if user_message:
         return user_message
     try:
-        for m in reversed(agent.get_state(config).values.get("messages", [])):
+        for m in reversed((await agent.aget_state(config)).values.get("messages", [])):
             if isinstance(m, HumanMessage) and isinstance(m.content, str) \
                     and not m.content.startswith("[Conversation summary]"):
                 return m.content
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[feedback] could not read the thread's last request: {e}")
     return ""
 
 
@@ -529,7 +529,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
             try:
                 store = feedback.get_store()
                 tid = await asyncio.to_thread(
-                    store.record_trace, request=_last_user_request(agent, config, user_message),
+                    store.record_trace, request=await _last_user_request(agent, config, user_message),
                     query=pending_direct, thread_id=thread_id, user_message=user_message,
                     model=MODEL_LABEL)
                 await asyncio.to_thread(store.attach_execution, tid, pending_direct, pending_sql)
@@ -722,7 +722,8 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
 
     # After the stream ends, check whether the graph paused on an interrupt.
     try:
-        state = agent.get_state(config)
+        # async: the Postgres checkpointer refuses sync reads on the event loop
+        state = await agent.aget_state(config)
         for task in state.tasks:
             if task.interrupts:
                 iv = task.interrupts[0].value   # dict passed to interrupt()
@@ -732,16 +733,17 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 yield cost_event()
                 yield f"data: {json.dumps({'type': 'interrupted'})}\n\n"
                 return
-    except Exception:
-        pass
+    except Exception as e:  # a hidden failure here leaves the user waiting on a form they never see
+        print(f"[interrupt] could not read thread state: {e}")
+        yield f"data: {json.dumps({'type': 'error', 'text': f'Could not check for a pending form: {e}'})}\n\n"
 
     # Summarise history if it has grown too long (only at clean done points).
     try:
         did_summarise = await maybe_summarise(agent, thread_id)
         if did_summarise:
             yield f"data: {json.dumps({'type': 'status', 'text': 'History compressed'})}\n\n"
-    except Exception:
-        pass
+    except Exception as e:  # summarising is an optimisation; log it, never fail the turn
+        print(f"[summarise] skipped: {e}")
 
     yield cost_event()
     yield f"data: {json.dumps({'type': 'done'})}\n\n"

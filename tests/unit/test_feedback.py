@@ -257,8 +257,37 @@ class DirectQueryAgent:
         yield {"event": "on_tool_end", "name": "query_cube", "run_id": "r1",
                "data": {"output": '{"data": [], "sql": "SELECT status, count(*)"}'}}
 
-    def get_state(self, config):
+    async def aget_state(self, config):
         return _State()
+
+    def get_state(self, config):  # what the Postgres checkpointer does on the event loop
+        raise RuntimeError("Synchronous calls to AsyncPostgresSaver are only allowed from a different thread")
+
+
+class FormAgent(DirectQueryAgent):
+    """Pauses on edit_cube_config's form, like a real interrupt."""
+    async def astream_events(self, input_, config, version):
+        return
+        yield
+
+    async def aget_state(self, config):
+        from types import SimpleNamespace
+        task = SimpleNamespace(interrupts=[SimpleNamespace(value={"form_type": "config_edit"})])
+        return SimpleNamespace(tasks=[task], next=("tools",), values={"messages": []})
+
+
+async def test_a_pending_form_reaches_the_browser():
+    import json
+    import ui
+
+    class Req:
+        async def is_disconnected(self):
+            return False
+
+    events = [json.loads(c[len("data: "):]) async for c in ui._stream_agent(Req(), {"messages": []}, "t1",
+                                                                             agent=FormAgent())]
+    form = next(e for e in events if e["type"] == "interrupt")
+    assert form["form_type"] == "config_edit" and events[-1]["type"] == "interrupted"
 
 
 async def test_stream_traces_direct_query_and_shows_sql(monkeypatch, store):

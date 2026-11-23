@@ -100,10 +100,10 @@ class _FakeAgent:
     def __init__(self, messages):
         self.messages, self.updates = messages, []
 
-    def get_state(self, config):
+    async def aget_state(self, config):
         return SimpleNamespace(next=(), values={"messages": self.messages})
 
-    def update_state(self, config, update):
+    async def aupdate_state(self, config, update):
         self.updates.append(update)
 
 

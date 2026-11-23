@@ -349,7 +349,7 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
     Never runs when an interrupt is pending.
     """
     config = {"configurable": {"thread_id": thread_id}}
-    state  = agent.get_state(config)
+    state  = await agent.aget_state(config)
 
     # Don't touch state if a task is still pending (e.g. mid-interrupt).
     if state.next:
@@ -388,7 +388,7 @@ async def maybe_summarise(agent, thread_id: str) -> bool:
 
     remove_ops   = [RemoveMessage(id=m.id) for m in to_summarise]
     summary_msg  = HumanMessage(content=f"{_SUMMARY_PREFIX}\n{summary}")
-    agent.update_state(config, {"messages": remove_ops + [summary_msg]})
+    await agent.aupdate_state(config, {"messages": remove_ops + [summary_msg]})
     return True
 
 

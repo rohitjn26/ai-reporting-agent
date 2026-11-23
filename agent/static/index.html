@@ -1161,6 +1161,8 @@
   // ── tool badges ────────────────────────────────────────────────────────────
   const _badgeMap = new Map();   // runId → {el, name, timer}
   const TOOL_TIMEOUT_MS = 35000; // warn if a tool spins longer than this
+  // tools that restart Cube (up to ~40s each, twice if a change is rolled back)
+  const SLOW_TOOL_TIMEOUT_MS = { commit_cube_config_update: 120000, reload_cube_schema: 90000 };
 
   const TOOL_ICONS = {
     list_cube_configs:          '🔍',
@@ -1193,6 +1195,7 @@
     scrollBottom();
     if (!runId) return wrap;
 
+    const limit = SLOW_TOOL_TIMEOUT_MS[name] || TOOL_TIMEOUT_MS;
     const timer = setTimeout(() => {
       const entry = _badgeMap.get(runId);
       if (!entry) return;
@@ -1203,12 +1206,24 @@
       }
       showErrorCard(
         icon + ' ' + name + ' is taking too long',
-        'This tool has been running for over ' + (TOOL_TIMEOUT_MS / 1000) + 's.\nIt may be stuck. Check Docker / Cube / network connectivity.'
+        'This tool has been running for over ' + (limit / 1000) + 's.\nIt may be stuck. Check Docker / Cube / network connectivity.'
       );
-    }, TOOL_TIMEOUT_MS);
+    }, limit);
 
     _badgeMap.set(runId, { el: wrap.querySelector('.tool-badge'), name, timer });
     return wrap;
+  }
+
+  // The agent paused for the user (a form or a question): a tool waiting on a person
+  // isn't stuck, so stop its timer. Resuming re-runs the tool under a new badge.
+  function settleToolBadgesForInput() {
+    for (const [runId, entry] of _badgeMap) {
+      clearTimeout(entry.timer);
+      const indicator = entry.el.querySelector('.spinner, .badge-warn');
+      if (indicator) indicator.outerHTML = '<span title="waiting for you">✋</span>';
+      entry.el.classList.remove('timed-out');
+      _badgeMap.delete(runId);
+    }
   }
 
   function resolveToolBadge(runId, error, output) {
@@ -2163,6 +2178,7 @@
 
       } else if (d.type === 'interrupt') {
         // Graph paused — show question card or form, resume on answer
+        settleToolBadgesForInput();
         if (firstToken) typingEl.remove();
         finalizeAgentText();
         es.close();

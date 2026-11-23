@@ -30,7 +30,7 @@ except ImportError:  # postgres extras not installed — dev keeps using MemoryS
 from chart.renderer import render_chart
 from chart.replay import apply_mapping, build_table_grid, normalize_mapping
 from chart.server import serve_chart
-from graph.config_editor import edit_cube_config
+from graph.config_editor import LIBRARY_API, edit_cube_config
 from graph import query_builder as qb
 from graph import feedback
 from graph import guard
@@ -211,6 +211,11 @@ When the user asks to MODIFY an existing cube config, use this exact flow — ne
    user the change was NOT applied, explain the compile error in plain words, and
    offer a corrected change. Do not call reload_cube_schema yourself.
 5. On success, call get_cube_config_detail to show the saved result for verification.
+   New fields are added to the views that list this cube (`views_updated`), so
+   build_query can use them right away.
+6. If the field was added to answer a question the user asked earlier (build_query had
+   reported it missing), don't stop there: call build_query for that original question
+   again and chart it, so the user gets the answer they asked for.
 
 To UNDO a committed change ("revert", "roll back", "undo that"), call
 rollback_cube_config (optionally with to_version from list_cube_config_versions),
@@ -885,6 +890,49 @@ def _refresh_stats_for(config_text: str) -> None:
         print(f"[stats] refresh after commit not started: {e}")
 
 
+def _names(includes: list) -> set[str]:
+    return {i if isinstance(i, str) else (i or {}).get("name") for i in includes}
+
+
+async def extend_views(committed: dict) -> list[dict]:
+    """A field newly added to a cube reaches the agent only through views, and a view
+    that lists a cube's fields by name won't show one it doesn't list. So add the new
+    fields to every such view, as a new view version. Returns the views changed, so a
+    failed reload can roll them back too. Views with includes "*" already show them."""
+    cube, data = committed.get("name"), committed.get("data") or {}
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{LIBRARY_API}/v1/CUBE_CONFIG/{committed['id']}/versions")
+        r.raise_for_status()
+        # the version this commit replaced: newest earlier one not rejected by a rollback
+        before = next((v["data"] for v in r.json()["data"]
+                       if v["version"] < committed["version"] and v["status"] != "REJECTED"), {})
+        new = {k for kind in ("measures", "dimensions") for k in (data.get(kind) or {})
+               if k not in (before.get(kind) or {})}
+        if not new:
+            return []
+        r = await c.get(f"{LIBRARY_API}/v1/VIEW")
+        r.raise_for_status()
+        changed = []
+        for view in r.json()["data"]:
+            vdata, touched = view["data"], False
+            for entry in vdata.get("cubes") or []:
+                inc = entry.get("includes")
+                if entry.get("join_path", "").split(".")[-1] == cube and isinstance(inc, list):
+                    add = sorted(new - _names(inc))
+                    if add:
+                        entry["includes"], touched = inc + add, True
+            if touched:
+                (await c.put(f"{LIBRARY_API}/v1/VIEW/{view['id']}", json={"data": vdata})).raise_for_status()
+                changed.append({"id": view["id"], "name": view["name"]})
+    return changed
+
+
+async def _rollback_views(views: list[dict]) -> None:
+    async with httpx.AsyncClient(timeout=10) as c:
+        for v in views:
+            await c.post(f"{LIBRARY_API}/v1/VIEW/{v['id']}/rollback", json={})
+
+
 def safe_commit(mcp_commit, reload_tool, rollback_tool):
     """Wrap commit_cube_config_update so a change only stays if Cube compiles it:
     commit (a new version) -> reload Cube -> on a compile failure, roll back to
@@ -904,18 +952,29 @@ def safe_commit(mcp_commit, reload_tool, rollback_tool):
         if not isinstance(committed, dict) or committed.get("error"):
             return committed_text
 
+        try:
+            views = await extend_views(committed)
+        except (httpx.HTTPError, KeyError, ValueError) as e:  # the cube change still stands
+            views, view_error = [], f"new fields not added to views: {e}"
+        else:
+            view_error = None
         reload_msg = _tool_output_text(await reload_tool.ainvoke({}))
         if not reload_msg.startswith(_RELOAD_FAILED):
             live = reload_msg.startswith("Cube restarted and ready")
             _refresh_stats_for(committed_text)
-            return json.dumps({"status": "committed and live" if live else
-                               "committed, but Cube did not confirm the reload — check it",
-                               "id": committed.get("id"),
-                               "name": committed.get("name"), "version": committed.get("version"),
-                               "cube": reload_msg})
+            out = {"status": "committed and live" if live else
+                   "committed, but Cube did not confirm the reload — check it",
+                   "id": committed.get("id"),
+                   "name": committed.get("name"), "version": committed.get("version"),
+                   "views_updated": [v["name"] for v in views], "cube": reload_msg}
+            if view_error:
+                out["view_error"] = view_error
+            return json.dumps(out)
 
         print(f"[commit] {committed.get('name')} v{committed.get('version')} broke the schema — rolling back")
         rb_text = _tool_output_text(await rollback_tool.ainvoke({"config_id": config_id}))
+        if views:
+            await _rollback_views(views)
         try:
             rb = json.loads(rb_text)
         except ValueError:

@@ -4,6 +4,7 @@ import json
 
 import httpx
 import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from graph import agent
 
@@ -33,9 +34,14 @@ class _Tool:
         return self.outputs.pop(0)
 
 
-def _run(commit, reload, rollback):
+# a preview, then the user's yes: what every allowed commit looks like
+_CONFIRMED = [ToolMessage(content="{}", name="preview_cube_config_update", tool_call_id="p1"),
+              HumanMessage(content="yes, commit")]
+
+
+def _run(commit, reload, rollback, messages=_CONFIRMED):
     tool = agent.safe_commit(commit, reload, rollback)
-    return json.loads(asyncio.run(tool.ainvoke({"config_id": "k1"})))
+    return json.loads(asyncio.run(tool.ainvoke({"config_id": "k1", "state": {"messages": messages}})))
 
 
 _COMMITTED = json.dumps({"id": "k1", "name": "mdbl_c_site", "version": 3})
@@ -159,3 +165,25 @@ def test_preview_stages_when_the_sql_runs(monkeypatch):
     out, mcp, _ = _preview(monkeypatch, [])
     assert out == {"status": "staged"}
     assert mcp.calls == [{"config_id": "k1", "measures": {"days": {"sql": "seller_response_created_at", "type": "avg"}}}]
+
+
+
+# ── the user must confirm between preview and commit ──────────────────────────
+
+def test_commit_right_after_preview_is_refused_until_the_user_says_yes():
+    preview = ToolMessage(content="{}", name="preview_cube_config_update", tool_call_id="p1")
+    summary = HumanMessage(content="[Conversation summary]\nadded a measure")   # not the user
+    commit = _Tool(_COMMITTED)
+    for history in ([preview], [preview, AIMessage(content="fixed it, committing"), summary]):
+        out = _run(commit, _Tool(), _Tool(), messages=[HumanMessage(content="add it"), *history])
+        assert out["guard"] == "user_confirmation_required" and "ask whether to commit" in out["error"]
+    assert not commit.calls
+
+
+def test_commit_after_the_users_yes_goes_ahead():
+    preview = ToolMessage(content="{}", name="preview_cube_config_update", tool_call_id="p1")
+    summary = HumanMessage(content="[Conversation summary]\nadded a measure")
+    reload = _Tool("Cube restarted and ready — 1 cube(s) loaded from library.")
+    out = _run(_Tool(_COMMITTED), reload, _Tool(),
+               messages=[preview, AIMessage(content="Commit?"), summary, HumanMessage(content="ok commit")])
+    assert out["status"] == "committed and live"

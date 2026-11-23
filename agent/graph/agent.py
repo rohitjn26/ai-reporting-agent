@@ -1005,6 +1005,20 @@ def checked_preview(mcp_preview):
     return preview_cube_config_update
 
 
+def unconfirmed_commit(messages: list) -> str | None:
+    """None when the user has said something since the latest preview; else the reason
+    to give the model. The prompt already says to commit only after the user confirms,
+    but the model sometimes previews and commits in one go — this makes it a rule."""
+    for m in reversed(messages or []):
+        if isinstance(m, HumanMessage) and not _is_summary(m):
+            return None
+        if isinstance(m, ToolMessage) and m.name == "preview_cube_config_update":
+            return ("Not committed: the user hasn't confirmed this change yet. Tell them in a "
+                    "line what the preview changes and ask whether to commit it; call "
+                    "commit_cube_config_update only after they say yes.")
+    return None
+
+
 def safe_commit(mcp_commit, reload_tool, rollback_tool):
     """Wrap commit_cube_config_update so a change only stays if Cube compiles it:
     commit (a new version) -> reload Cube -> on a compile failure, roll back to
@@ -1012,10 +1026,13 @@ def safe_commit(mcp_commit, reload_tool, rollback_tool):
     Same name and args as the MCP tool, so the UI and prompt keep working."""
 
     @tool
-    async def commit_cube_config_update(config_id: str) -> str:
+    async def commit_cube_config_update(config_id: str, state: Annotated[dict, InjectedState]) -> str:
         """Persist the staged cube config update as a new version, reload Cube, and
         keep it only if Cube compiles it — otherwise it is rolled back automatically.
         Must call preview_cube_config_update first, and only after the user confirmed."""
+        problem = unconfirmed_commit(state.get("messages", []))
+        if problem:
+            return json.dumps({"error": problem, "guard": "user_confirmation_required"})
         committed_text = _tool_output_text(await mcp_commit.ainvoke({"config_id": config_id}))
         try:
             committed = json.loads(committed_text)

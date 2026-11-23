@@ -84,12 +84,29 @@ const joinPathToFunction = (joinPath) => {
   return new Function(base, `return ${joinPath};`);
 };
 
+// Postgres cuts identifiers at 63 chars, and Cube names each result column
+// <view>__<member>_<granularity> — so with a long view name, e.g.
+// us_ecom_customers_view__order_reviews_review_creation_date_month (64), the
+// column comes back truncated and Cube fails with "Member name not found for alias".
+// Long view names get a short, stable SQL alias instead; it only changes the
+// generated SQL, never the member names the agent and saved graphs use.
+// shortcut: member names over ~43 chars still overflow (10 alias + __ + member + _quarter); shorten the member if one appears.
+const VIEW_ALIAS_MAX = 12;
+export const viewSqlAlias = (name) => {
+  if (!name || name.length <= VIEW_ALIAS_MAX) return undefined;
+  let h = 5381;  // djb2: same name -> same alias across restarts
+  for (let i = 0; i < name.length; i++) h = ((h * 33) ^ name.charCodeAt(i)) >>> 0;
+  return `v_${h.toString(36)}`;
+};
+
 export const transformView = (viewData) => {
   const cubes = (viewData.cubes || []).map((entry) => ({
     ...entry,
     join_path: joinPathToFunction(entry.join_path),
   }));
   const view = { cubes };
+  const alias = viewSqlAlias(viewData.name);
+  if (alias) view.sqlAlias = alias;
   if (!isDescriptionEmpty(viewData.description)) view.description = viewData.description;
   if (viewData.title) view.title = viewData.title;
   if (viewData.public !== undefined) view.public = viewData.public;

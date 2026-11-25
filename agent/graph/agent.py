@@ -79,6 +79,9 @@ When the user asks for a chart or data insight:
    the schema, translates the request into a validated Cube query (mapping synonyms via
    field descriptions), and auto-repairs invalid members. It returns JSON with
    measures / dimensions / filters / time_dimensions / order / limit.
+   - "_reads_as" says in plain words what the query returns. Before running it, check it
+     against what the user asked; when you answer, describe the result in those words —
+     never as the thing the user asked for if the two differ.
    - If the result contains "_validation_problems", the request cannot be fully mapped to
      existing fields. Do NOT guess — tell the user what's missing and offer to add it
      (see the add-field flow below).
@@ -961,6 +964,41 @@ async def field_sql_problems(source_sql: str, fields: dict[str, dict]) -> tuple[
     return problems, columns
 
 
+# avg/sum/min/max over a per-row value: the value itself is worth a dimension
+_ROW_AGGS = {"avg": "avg", "sum": "total", "min": "min", "max": "max"}
+_AGG_CALL = re.compile(r"\b(count|sum|avg|min|max)\s*\(", re.I)
+
+
+def with_row_dimensions(measures: dict | None, dimensions: dict | None,
+                        existing: dict) -> tuple[dict | None, dict | None, list[str]]:
+    """A new avg/sum/min/max measure over a per-row expression (no aggregate inside)
+    describes each row, e.g. days to answer a review. As a measure it can only be
+    averaged or summed; as a dimension it can also be grouped by (a distribution),
+    filtered and bucketed. So add the dimension too. Cube keeps measures and
+    dimensions in one namespace: the dimension gets the plain name and the measure an
+    aggregate prefix (response_time_days + avg_response_time_days).
+    -> (measures, dimensions, names of the dimensions added)."""
+    taken = set(existing.get("measures") or {}) | set(existing.get("dimensions") or {})
+    taken |= set(dimensions or {})
+    out_m, out_d, added = {}, dict(dimensions or {}), []
+    for key, cfg in (measures or {}).items():
+        agg, sql = _ROW_AGGS.get((cfg or {}).get("type", "")), (cfg or {}).get("sql") or ""
+        if key in taken or not agg or not sql or _AGG_CALL.search(sql) or "${" in sql.replace("${CUBE}", ""):
+            out_m[key] = cfg
+            continue
+        base = key[len(agg) + 1:] if key.startswith(agg + "_") else key
+        mkey = key if base != key else f"{agg}_{key}"
+        if base in taken or mkey in taken:
+            out_m[key] = cfg
+            continue
+        title = cfg.get("title") or base.replace("_", " ").title()
+        out_d[base] = {"sql": sql, "type": "number", "title": title,
+                       **({"description": cfg["description"]} if cfg.get("description") else {})}
+        out_m[mkey] = {**cfg, "title": title if mkey == key else f"{agg.title()} {title}"}
+        added.append(base)
+    return out_m or None, out_d or None, added
+
+
 def checked_preview(mcp_preview):
     """Wrap preview_cube_config_update so a field whose SQL doesn't run against the
     table is rejected before it is staged, with the table's real columns to fix it
@@ -978,28 +1016,49 @@ def checked_preview(mcp_preview):
         description: Optional[str] = None,
     ) -> str:
         """Stage a cube config update for review."""
+        added: list[str] = []
+        if measures or dimensions:
+            try:
+                async with httpx.AsyncClient(timeout=10) as c:
+                    r = await c.get(f"{LIBRARY_API}/v1/CUBE_CONFIG/{config_id}")
+                    r.raise_for_status()
+                current = r.json()["data"]
+            except Exception as e:  # library down: stage as asked, unchecked
+                print(f"[preview] config not read: {e}")
+                current = None
+            if current is not None:
+                measures, dimensions, added = with_row_dimensions(measures, dimensions, current)
+                fields = {f"{kind[:-1]} '{k}'": v for kind, group in
+                          (("measures", measures), ("dimensions", dimensions)) for k, v in (group or {}).items()}
+                try:
+                    problems, columns = await field_sql_problems(sql or current["sql"], fields)
+                except Exception as e:  # can't check (DB down): stage as before
+                    print(f"[preview] SQL not checked: {e}")
+                    problems = []
+                if problems:
+                    return json.dumps({
+                        "error": "Not staged: this SQL doesn't run against the table. Rewrite it "
+                                 "using only the columns listed, then preview again.",
+                        "details": problems, "columns": columns})
         args = {k: v for k, v in {
             "config_id": config_id, "name": name, "sql": sql, "measures": measures,
             "dimensions": dimensions, "remove_measures": remove_measures,
             "remove_dimensions": remove_dimensions, "description": description,
         }.items() if v is not None}
-        fields = {f"{kind[:-1]} '{k}'": v for kind, group in (("measures", measures), ("dimensions", dimensions))
-                  for k, v in (group or {}).items()}
-        if fields:
+        out = _tool_output_text(await mcp_preview.ainvoke(args))
+        if added:
             try:
-                async with httpx.AsyncClient(timeout=10) as c:
-                    r = await c.get(f"{LIBRARY_API}/v1/CUBE_CONFIG/{config_id}")
-                    r.raise_for_status()
-                problems, columns = await field_sql_problems(sql or r.json()["data"]["sql"], fields)
-            except Exception as e:  # can't check (DB or library down): stage as before
-                print(f"[preview] SQL not checked: {e}")
-                problems = []
-            if problems:
-                return json.dumps({
-                    "error": "Not staged: this SQL doesn't run against the table. Rewrite it using "
-                             "only the columns listed, then preview again.",
-                    "details": problems, "columns": columns})
-        return _tool_output_text(await mcp_preview.ainvoke(args))
+                staged = json.loads(out)
+            except ValueError:
+                return out
+            if isinstance(staged, dict) and not staged.get("error"):
+                staged["also_added"] = {
+                    "dimensions": added,
+                    "why": "the value is per row, so it is also a dimension: it can be grouped by "
+                           "(a distribution), filtered and bucketed; the measure keeps the aggregate. "
+                           "Mention this when you summarise the change."}
+                return json.dumps(staged, indent=2)
+        return out
 
     preview_cube_config_update.description = mcp_preview.description or preview_cube_config_update.description
     return preview_cube_config_update

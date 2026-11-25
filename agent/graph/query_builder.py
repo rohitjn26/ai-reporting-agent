@@ -52,6 +52,11 @@ class CubeQuery(BaseModel):
     time_dimensions: list[TimeDimension] = Field(default_factory=list)
     order: dict[str, str] = Field(default_factory=dict)   # member -> asc|desc
     limit: Optional[int] = None
+    # what the result will show, in plain words — written down so a mismatch with
+    # the request is visible (to the model, the agent and the user's plan card)
+    reads_as: str = Field(default="", description=(
+        "One plain sentence saying what this query's result shows, e.g. 'Average "
+        "response time in days for each review score'. Describe the query, not the request."))
     # parts of the request no schema member covers — reported, never substituted
     missing: list[str] = Field(default_factory=list, description=(
         "Parts of the request that no measure or dimension in the schema covers, in the "
@@ -103,6 +108,10 @@ Rules:
 - For "top N" / "highest" / "lowest", set order (member -> asc|desc) AND limit.
 - Read each field's description — it lists synonyms (e.g. revenue = sales = earnings).
 - Do NOT invent fields, filters, or metrics that weren't asked for.
+- In `reads_as`, say in one plain sentence what the result shows. Then compare it with
+  the request: if they differ in what is counted, grouped or compared, the gap belongs in
+  `missing` (e.g. a distribution of a value that exists only as a measure, since measures
+  can't be grouped by).
 - If part of the request has no matching member — e.g. a difference between two dates,
   a ratio, or a field that isn't listed — name that part in `missing`. Never substitute
   a different member that merely sounds related; a wrong answer is worse than none.
@@ -390,6 +399,8 @@ def build_query(
         # Surface, don't silently ship a bad query. Caller decides what to do.
         query["_validation_problems"] = problems
     # which view the router picked and why — for the query plan card
+    if result.reads_as:
+        query["_reads_as"] = result.reads_as
     if view_meta:
         query["_view"] = view_meta[0].get("name")
         query["_view_reason"] = view_reason

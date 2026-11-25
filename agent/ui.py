@@ -443,6 +443,7 @@ def _plan_event(trace_id: str | None, query: dict, source: str) -> str:
         "filters": query.get("filters", []), "time_dimensions": query.get("time_dimensions", []),
         "problems": query.get("_validation_problems", []),
         "view": query.get("_view"), "view_reason": query.get("_view_reason"),
+        "reads_as": query.get("_reads_as"),
     }) + "\n\n"
 
 

@@ -186,6 +186,14 @@ def test_build_query_surfaces_problems_if_still_bad():
     assert "_validation_problems" in q               # not silently shipped
 
 
+def test_reads_as_is_passed_on_for_the_plan_card():
+    llm = FakeLLM(qb.CubeQuery(measures=["orders.total_revenue"], dimensions=["orders.country"],
+                               reads_as="Total revenue for each country"))
+    q = qb.build_query("revenue by country", META, llm=llm)
+    assert q["_reads_as"] == "Total revenue for each country"
+    assert "reads_as" not in q          # never reaches query_cube as a field
+
+
 def test_missing_part_is_reported_not_substituted():
     # "days between order and delivery" has no member: the builder names it, the
     # query is flagged (so query_cube is blocked and the agent offers to add it),

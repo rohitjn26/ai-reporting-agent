@@ -164,6 +164,7 @@
 
     .tool-badge.done        { color: #64748b; border-color: #1e293b; }
     .tool-badge.errored     { color: #f87171; border-color: #7f1d1d; background: #1c0a0a; }
+    .qp-reads-as { font-size: 0.8rem; color: #e2e8f0; margin: 2px 0 6px; }
     .tool-badge.timed-out   { color: #f59e0b; border-color: #78350f; background: #1c1200; }
 
     .chart-link {
@@ -1589,6 +1590,7 @@
     let out = '<div class="qp-header">\uD83E\uDDED ' + (d.source === 'agent'
       ? 'Query the agent ran'
       : 'Query plan — what the model chose') + '</div>';
+    if (d.reads_as) out += '<div class="qp-reads-as">This shows: ' + escapeHtml(d.reads_as) + '</div>';
     if (d.view) out += row('View', '<span class="qp-view"><b>' + escapeHtml(d.view) + '</b>' +
       (d.view_reason ? ' — ' + escapeHtml(d.view_reason) : '') + '</span>');
     if (d.measures && d.measures.length)   out += row('Measures',   chips(d.measures, 'qp-measure'));

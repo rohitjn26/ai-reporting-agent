@@ -1,6 +1,6 @@
 # Plan: driver tree for averages
 
-Status: draft for review — nothing built yet. Replaces the flat version on this branch
+Status: agreed (2026-11-25) — not built yet. Replaces the flat version on this branch
 (`compare_segments`, `key_drivers`), keeping its maths and tests where they still apply.
 
 ## Goal
@@ -116,12 +116,16 @@ At each node, for each candidate dimension not used yet on that path:
 3. **Test** the merged split: one-way ANOVA F-test (between vs within variance), with a
    Bonferroni adjustment for the number of ways the categories could have been merged.
 
-Pick the candidate with the smallest adjusted p-value. Split if p < 0.05 and every child
-has at least 1% of the node's rows (and at least 500). Otherwise the node is a leaf.
+Pick the candidate with the smallest adjusted p-value. A split is kept only if all hold:
 
-Stop at depth 3. Also stop when the best split changes the average by less than a
-minimum effect (default 0.05 for ratings, 2% of the mean otherwise), so a big dataset
-doesn't produce "significant" but meaningless splits.
+- **Real:** adjusted p < 0.10 — loose on purpose; this is exploration, not proof.
+- **Big enough to care (minimum effect):** at least one child's average differs from the
+  parent's by ≥ 0.05 for ratings (e.g. 4.05★ → 4.00★), or ≥ 2% of the parent's average for
+  other measures. With ~1M rows almost any gap is "significant"; this stops 0.01★ splits.
+- **Not tiny:** every child has at least 1% of the node's rows and at least 500.
+
+Otherwise the node is a leaf. Stop at depth 3. All four numbers are constants in
+drill.py, overridable by env var.
 
 Implemented in `agent/graph/drill.py` (~150 lines). No new dependency: scikit-learn's
 trees only split in two and aren't installed; the Python CHAID packages are unmaintained.
@@ -232,5 +236,7 @@ minimum effect meaningful; say "nothing checked explains it" when the root has n
 ## Open questions
 
 1. ~~Per-item version: offer only, or v1?~~ Decided: supported in v1.
-2. Time as a candidate in v1: yes as planned, or later?
-3. Defaults: depth 3, p < 0.05, minimum effect 0.05★ / 2% — OK?
+2. ~~Time as a candidate in v1?~~ Decided: yes.
+3. ~~Defaults?~~ Decided: depth 3, p < 0.10, minimum effect 0.05★ / 2%, min child 1% / 500 rows.
+
+No open questions — ready to build.

@@ -238,10 +238,11 @@
     .query-plan .qp-label {
       font-size: 0.7rem; color: #64748b; min-width: 74px; flex-shrink: 0; padding-top: 2px;
     }
-    .query-plan .qp-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+    .query-plan .qp-chips { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-width: 0; }
     .query-plan .qp-chip {
       font-family: ui-monospace, monospace; font-size: 0.72rem;
       border-radius: 6px; padding: 2px 8px;
+      max-width: 100%; overflow-wrap: break-word;   /* fallback when a name has no . or _ */
     }
     .query-plan .qp-measure   { background: #0c2a3a; border: 1px solid #0369a1; color: #7dd3fc; }
     .query-plan .qp-dimension { background: #2e1065; border: 1px solid #6d28d9; color: #c4b5fd; }
@@ -1600,7 +1601,9 @@
 
     const chips = (items, cls) =>
       '<div class="qp-chips">' +
-      items.map(x => '<span class="qp-chip ' + cls + '">' + escapeHtml(String(x)) + '</span>').join('') +
+      // <wbr> after . and _ so long member names break between words, not mid-word
+      items.map(x => '<span class="qp-chip ' + cls + '">' +
+        escapeHtml(String(x)).replace(/([._])/g, '$1<wbr>') + '</span>').join('') +
       '</div>';
     const row = (label, html) =>
       '<div class="qp-row"><span class="qp-label">' + label + '</span>' + html + '</div>';

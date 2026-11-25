@@ -150,7 +150,7 @@ def _preview(monkeypatch, problems):
     mcp.description = "Stage a cube config update for review."
     tool = agent.checked_preview(mcp)
     out = json.loads(asyncio.run(tool.ainvoke({
-        "config_id": "k1", "measures": {"days": {"sql": "seller_response_created_at", "type": "avg"}}})))
+        "config_id": "k1", "measures": {"days": {"sql": "seller_response_created_at", "type": "number"}}})))
     return out, mcp, seen
 
 
@@ -164,7 +164,7 @@ def test_preview_rejects_sql_that_does_not_run_and_lists_real_columns(monkeypatc
 def test_preview_stages_when_the_sql_runs(monkeypatch):
     out, mcp, _ = _preview(monkeypatch, [])
     assert out == {"status": "staged"}
-    assert mcp.calls == [{"config_id": "k1", "measures": {"days": {"sql": "seller_response_created_at", "type": "avg"}}}]
+    assert mcp.calls == [{"config_id": "k1", "measures": {"days": {"sql": "seller_response_created_at", "type": "number"}}}]
 
 
 
@@ -187,3 +187,35 @@ def test_commit_after_the_users_yes_goes_ahead():
     out = _run(_Tool(_COMMITTED), reload, _Tool(),
                messages=[preview, AIMessage(content="Commit?"), summary, HumanMessage(content="ok commit")])
     assert out["status"] == "committed and live"
+
+
+
+# ── per-row measures also become dimensions ───────────────────────────────────
+
+_DAYS = "EXTRACT(EPOCH FROM review_answer_timestamp - review_creation_date) / 86400"
+
+
+def test_an_avg_over_a_per_row_value_also_adds_the_dimension():
+    m, d, added = agent.with_row_dimensions(
+        {"response_time_days": {"sql": _DAYS, "type": "avg", "title": "Response Time (Days)"}},
+        None, {"measures": {"count": {}}, "dimensions": {"review_score": {}}})
+    assert added == ["response_time_days"]
+    assert d == {"response_time_days": {"sql": _DAYS, "type": "number", "title": "Response Time (Days)"}}
+    assert m == {"avg_response_time_days": {"sql": _DAYS, "type": "avg", "title": "Avg Response Time (Days)"}}
+
+
+def test_a_prefixed_measure_keeps_its_name_and_gives_the_plain_one_to_the_dimension():
+    m, d, added = agent.with_row_dimensions({"total_freight": {"sql": "freight_value", "type": "sum"}}, None, {})
+    assert added == ["freight"] and set(m) == {"total_freight"} and set(d) == {"freight"}
+
+
+def test_aggregates_counts_cross_cube_refs_and_existing_fields_are_left_alone():
+    measures = {
+        "ratio": {"sql": "SUM(a) / COUNT(b)", "type": "number"},       # already aggregated
+        "n": {"sql": "id", "type": "count"},                           # a count isn't per-row maths
+        "other": {"sql": "${orders.amount}", "type": "sum"},           # another cube: skip
+        "review_score_avg": {"sql": "review_score", "type": "avg"},    # dimension name taken below
+    }
+    m, d, added = agent.with_row_dimensions(measures, None, {"dimensions": {"review_score": {}},
+                                                             "measures": {"review_score_avg": {}}})
+    assert added == [] and m == measures and d is None

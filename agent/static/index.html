@@ -1166,6 +1166,8 @@
   const TOOL_TIMEOUT_MS = 35000; // warn if a tool spins longer than this
   // tools that restart Cube (up to ~40s each, twice if a change is rolled back)
   const SLOW_TOOL_TIMEOUT_MS = { commit_cube_config_update: 120000, reload_cube_schema: 90000 };
+  // tools that wait for the user (a form to review) are never "stuck"
+  const INTERACTIVE_TOOLS = new Set(['edit_cube_config']);
 
   const TOOL_ICONS = {
     list_cube_configs:          '🔍',
@@ -1199,7 +1201,7 @@
     if (!runId) return wrap;
 
     const limit = SLOW_TOOL_TIMEOUT_MS[name] || TOOL_TIMEOUT_MS;
-    const timer = setTimeout(() => {
+    const timer = INTERACTIVE_TOOLS.has(name) ? null : setTimeout(() => {
       const entry = _badgeMap.get(runId);
       if (!entry) return;
       const spinner = entry.el.querySelector('.spinner');

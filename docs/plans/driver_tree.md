@@ -60,9 +60,9 @@ us_ecom, for review ratings:
 When a relationship is missing, keep the dimension but rely on the existing check (do the
 parts add up to the whole?) to drop it if it double counts.
 
-When a dimension is excluded for this reason, the result says so ("product category: each
-review would count once per item"), so the agent can offer the per-item version of the
-question instead of silently ignoring it.
+When a dimension is excluded for this reason, the result says so ("product category:
+a review's order can hold items of several categories") and the per-item mode below can
+answer the question instead.
 
 ### Order and filters
 
@@ -136,18 +136,57 @@ trees only split in two and aren't installed; the Python CHAID packages are unma
 
 If no mix explains the gap, the answer is "lower across the board" — a finding.
 
-Note: in us_ecom, category comes through order items, so a per-review comparison by
-category is excluded (see Candidates). The agent offers the per-item version.
+In us_ecom, category comes through order items, so "electronics vs the rest" runs in
+per-item mode automatically (next section).
+
+## Per-item mode (v1)
+
+A review is about a whole order; product category, product and seller belong to each
+item. Per review, those dimensions have no single value, so they can't be splits. Per
+item, they can: each item carries its order's rating.
+
+Example — order #42 rated 2★, with headphones (electronics), a phone case (electronics)
+and a lamp (home): per item that is three rows, all 2★; electronics gets the 2★ twice,
+home once. Orders with more items weigh more. That is a different question from per
+review, and the answer always says which one it is.
+
+(For the record: Cube's default is neither. Asked for review count by category it uses
+`count(distinct review_id)`, so each review counts once in every category its order
+touches — 469,466 "electronics reviews" = reviews of orders with at least one electronics
+item. The engine never uses that implicit definition.)
+
+How it works — the grain moves to the item cube:
+
+- **Weight** = the item cube's count measure (order_items.count) instead of review count.
+- **Value** = the averaged column as a per-row dimension (`review_score`; for other
+  averages, the per-row dimension PR #50 adds). If no such dimension exists, per-item mode
+  isn't available for that measure and the answer says so.
+- **Cells** = item count grouped by the candidates + the value → avg = Σ value × items ÷
+  Σ items, and the value distribution for the significance test, as before.
+- **Candidates** are picked from the item cube's side: items → orders, products, sellers
+  (many_to_one) and orders → customers are safe; items → payments is not.
+- The value's own path must not fan out either: items → orders → reviews is one_to_many
+  in the config, but the data has at most one review per order (checked: max 1). The
+  existing "parts add up to the whole" check verifies this on every run.
+
+When it is used — decided by the engine, not the user:
+
+- A comparison on a fan-out dimension ("electronics vs the rest" by product category) →
+  per item.
+- Otherwise per review; if the per-review tree excluded fan-out dimensions, the result
+  lists them, and the agent may re-run per item to include them, saying so.
+- Every result and every narrated number carries its unit: "per review" or "per item".
 
 ## Agent tools
 
 Replace `compare_segments` and `key_drivers` with one tool:
 
 ```
-explain_average(measure, filters=[], compare=None)
+explain_average(measure, filters=[], compare=None, per_item=None)
 ```
 
 - `compare` = {dimension, values}: group vs the rest (or vs named values).
+- `per_item`: None = the engine decides (see Per-item mode); True / False to force it.
 - Returns: the tree (path, rows, average, children), excluded dimensions with reasons,
   and `chart_query` for the top split (the guard already accepts it, as for
   `explain_change`).
@@ -172,21 +211,26 @@ minimum effect meaningful; say "nothing checked explains it" when the root has n
   split on pure noise; respects minimum size and depth.
 - Candidates: one_to_many paths excluded with a reason; missing relationship falls back to
   the empirical check.
+- Per-item mode: weights by item count (the order #42 example gives electronics 2★ × 2,
+  home 2★ × 1); picks candidates from the item side; chosen automatically for a fan-out
+  comparison; refused with a reason when the value has no per-row dimension.
 - Size cap: drops candidates until the estimate fits; retries once on a full result.
 - Cache: same key reuses cells with no query; config change drops them.
 - Tool through LangGraph (fake Cube): guard, output shape, chart_query.
-- Live check, no LLM: us_ecom review ratings, timing and the tree printed.
+- Live check, no LLM: us_ecom review ratings per review, and electronics vs the rest
+  per item; timing and both trees printed.
 
 ## Steps
 
 1. Candidates from joins + size cap.
 2. Cells query + memory cache.
 3. CHAID tree on cells.
+3b. Per-item mode (grain switch, candidates from the item side).
 4. `explain_average` tool + prompt; remove the flat tools.
 5. Live check on us_ecom; PR.
 
 ## Open questions
 
-1. Per-item version for fan-out dimensions: offer only, or support it in v1?
+1. ~~Per-item version: offer only, or v1?~~ Decided: supported in v1.
 2. Time as a candidate in v1: yes as planned, or later?
 3. Defaults: depth 3, p < 0.05, minimum effect 0.05★ / 2% — OK?

@@ -1115,6 +1115,7 @@
   function newChat() {
     if (sendBtn.disabled) return;          // a reply is still streaming
     threadId = makeUUID();
+    pendingForm = null;                    // an open form belonged to the old chat
     sessionStorage.setItem('threadId', threadId);
     messagesEl.innerHTML = WELCOME_HTML;
     document.getElementById('chat-panel').classList.remove('fb-wide');
@@ -1161,9 +1162,12 @@
 
   // ── tool badges ────────────────────────────────────────────────────────────
   const _badgeMap = new Map();   // runId → {el, name, timer}
+  let pendingForm = null;        // the open config-edit form: {reject(feedback)}
   const TOOL_TIMEOUT_MS = 35000; // warn if a tool spins longer than this
   // tools that restart Cube (up to ~40s each, twice if a change is rolled back)
   const SLOW_TOOL_TIMEOUT_MS = { commit_cube_config_update: 120000, reload_cube_schema: 90000 };
+  // tools that wait for the user (a form to review) are never "stuck"
+  const INTERACTIVE_TOOLS = new Set(['edit_cube_config']);
 
   const TOOL_ICONS = {
     list_cube_configs:          '🔍',
@@ -1197,7 +1201,7 @@
     if (!runId) return wrap;
 
     const limit = SLOW_TOOL_TIMEOUT_MS[name] || TOOL_TIMEOUT_MS;
-    const timer = setTimeout(() => {
+    const timer = INTERACTIVE_TOOLS.has(name) ? null : setTimeout(() => {
       const entry = _badgeMap.get(runId);
       if (!entry) return;
       const spinner = entry.el.querySelector('.spinner');
@@ -1388,7 +1392,9 @@
       <div style="display:flex;gap:8px;margin-top:4px">
         <button class="iq-send" id="cef-test" style="flex:0 0 auto;padding:10px 18px;background:#2a2a3a;border:1px solid #444">Test SQL</button>
         <button class="iq-send" id="cef-submit" style="flex:1;padding:10px">Apply change</button>
+        <button class="iq-send" id="cef-reject" style="flex:0 0 auto;padding:10px 18px;background:#2a2a3a;border:1px solid #7f1d1d;color:#fca5a5">Reject</button>
       </div>
+      <div style="font-size:12px;color:#94a3b8">Or type below what to change — the agent will redo the suggestion.</div>
       <div id="cef-test-result" style="display:none;margin-top:8px;border-radius:8px;overflow:hidden;font-size:12px"></div>`;
 
     // toggle button groups
@@ -1512,7 +1518,19 @@
       }
     };
 
+    // Reject (optionally with a reason typed in the chat box): the agent gets the
+    // feedback instead of a field, and redoes or drops the suggestion.
+    const reject = (feedback) => {
+      card.classList.add('answered');
+      card.querySelectorAll('button, input, select, textarea').forEach(el => el.disabled = true);
+      addMsg('user', feedback ? 'Rejected the suggestion: ' + feedback : 'Rejected the suggestion.');
+      onAnswer(JSON.stringify({ rejected: true, feedback: feedback || '' }));
+    };
+    card.querySelector('#cef-reject').onclick = () => reject('');
+    pendingForm = { reject };
+
     card.querySelector('#cef-submit').onclick = () => {
+      pendingForm = null;
       const fieldType = getFieldType() || 'measure';
       const action    = getAction()    || 'add';
       const key = action === 'replace'
@@ -2184,10 +2202,15 @@
         if (firstToken) typingEl.remove();
         finalizeAgentText();
         es.close();
-        sendBtn.disabled = true;
-        input.placeholder = 'Complete the form above to continue…';
+        // a config form stays answerable by typing (feedback → reject); other cards need a click
+        sendBtn.disabled = d.form_type !== 'config_edit';
+        input.placeholder = d.form_type === 'config_edit'
+          ? 'Apply or reject the form above, or type what to change…'
+          : 'Complete the form above to continue…';
 
         const onAnswer = (answer) => {
+          pendingForm = null;
+          sendBtn.disabled = true;
           input.placeholder = 'Ask for a chart…';
           const resumeTyping = addTyping();
           const res = new EventSource(
@@ -2235,6 +2258,12 @@
     if (!text || sendBtn.disabled) return;
     input.value = '';
     input.style.height = 'auto';
+    if (pendingForm) {            // a form is open: the typed text is feedback on it
+      const { reject } = pendingForm;
+      pendingForm = null;
+      reject(text);
+      return;
+    }
     sendBtn.disabled = true;
     addMsg('user', text);
     const typingEl = addTyping();

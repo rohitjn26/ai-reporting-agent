@@ -90,6 +90,15 @@ async def edit_cube_config(
     except (json.JSONDecodeError, TypeError):
         return json.dumps({"error": f"Could not parse form answer: {raw_answer!r}"})
 
+    if ans.get("rejected"):
+        return json.dumps({
+            "rejected": True, "feedback": ans.get("feedback") or "",
+            "instruction": ("The user rejected this suggestion: do not preview or commit it. If "
+                            "they said what to change, call edit_cube_config again with a "
+                            "suggestion that follows their words exactly; otherwise ask what "
+                            "they want instead."),
+        })
+
     field_type = ans.get("field_type", "measure").strip().lower()
     action     = ans.get("action",     "add").strip().lower()
     key        = ans.get("key",        "").strip()

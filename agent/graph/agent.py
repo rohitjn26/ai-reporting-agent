@@ -169,6 +169,18 @@ WHY A NUMBER CHANGED ("why is revenue down?", "what drove the jump in orders?"):
    If it has "no_driver", say plainly that nothing checked explained the change — never
    fill the gap with guesses (one organization, "it was uniform", campaigns).
 4. To chart it, pass `chart_query` to query_cube unchanged, then create_chart.
+For an AVERAGE (a rating, an average price) explain_change also splits the change into
+make-up (drivers' make_up_part) and within-member differences.
+
+WHY ONE GROUP DIFFERS, OR WHAT AN AVERAGE DEPENDS ON — don't guess causes one by one:
+- "Why does electronics rate lower than other categories?" -> build_query (the average by
+  that dimension), then compare_segments(measure, segment_dimension, segment_values).
+- "What else explains the low rating?" / "what affects X?" -> build_query (the average,
+  with the group's filter), then key_drivers(measure, filters).
+Both check every sensible dimension at once. Report the top drivers with their numbers;
+if a result has "note" or every spread is small, say plainly that the difference is
+across the board / nothing checked explains it. Never call a 0.01-0.05 difference
+significant. To chart, pass `chart_query` to query_cube unchanged.
 
 IMPORTANT query rules:
 - If build_query returns "_cube_unavailable", Cube is down or its schema is broken.
@@ -525,6 +537,11 @@ async def _cube_load(client: httpx.AsyncClient, q: dict) -> dict:
     return body
 
 
+async def _load_rows(client: httpx.AsyncClient, q: dict) -> list[dict]:
+    """An agent-shaped query's rows from Cube (the drill engine's `run`)."""
+    return (await _cube_load(client, _to_cube(q))).get("data", [])
+
+
 async def run_cube_query(query: dict, limit: int = 50) -> dict:
     """Run a build_query-shaped query against Cube's REST API -> {rows, sql} or {error}.
 
@@ -728,9 +745,8 @@ async def explain_change(
         return json.dumps({"_cube_unavailable": _cube_error_text(e)})
     view_meta = [c for c in metadata if c["name"] == measure.split(".")[0]]
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        async def run(q: dict) -> list[dict]:
-            return (await _cube_load(client, _to_cube(q))).get("data", [])
+    async with httpx.AsyncClient(timeout=60) as client:
+        run = _limited(lambda q: _load_rows(client, q))
 
         async def resolve(date_range) -> list[str]:
             # Cube resolves "last month" etc. and echoes the absolute range back
@@ -747,6 +763,14 @@ async def explain_change(
                 previous, basis = asked, "the period you asked for"
             else:
                 previous, basis = drill.default_compare(current)
+            if drill.weight_measure(measure, view_meta):   # an average: make-up vs within-member
+                gap = await drill.rank_average_gap(
+                    scope, view_meta, run, a_scope=drill._with_range(scope, time_dimension, previous),
+                    b_scope=drill._with_range(scope, time_dimension, current),
+                    distances=distances, stats=col_stats)
+                return json.dumps({"period": current, "compare_period": previous,
+                                   "compare_basis": basis, **_gap_out(gap, "before", "after")},
+                                  default=str)
             report = await drill.rank_change(scope, view_meta, run, time_dimension=time_dimension,
                                              period=current, compare_period=previous,
                                              distances=distances, stats=col_stats)
@@ -805,6 +829,175 @@ async def explain_change(
                               "filters": filters, "order": {measure: "desc"},
                               "time_dimensions": [{"dimension": time_dimension, "dateRange": current}]}
     return json.dumps({k: v for k, v in out.items() if v not in (None, [])}, default=str)
+
+
+def _r3(x):
+    return round(x, 3) if isinstance(x, float) else x
+
+
+def _gap_out(rep: drill.GapReport, a: str, b: str, dims: int = 3, members: int = 5) -> dict:
+    """The top of a GapReport for the model; `a` / `b` name the two groups."""
+    out = {
+        "measure": rep.measure, f"avg_{a}": _r3(rep.avg_a), f"avg_{b}": _r3(rep.avg_b),
+        "gap": _r3(rep.gap), "rows": {a: rep.rows_a, b: rep.rows_b},
+        "drivers": [{
+            "dimension": g.candidate.member,
+            "explained_by_make_up": _r3(g.score),
+            "make_up_part": _r3(g.mix), "within_member_part": _r3(g.rate),
+            "members": [{"value": m.value, f"avg_{a}": _r3(m.avg_a), f"avg_{b}": _r3(m.avg_b),
+                         f"rows_{a}": m.rows_a, f"rows_{b}": m.rows_b, "part_of_gap": _r3(m.mix + m.rate)}
+                        for m in g.members[:members]],
+        } for g in rep.rankings[:dims]],
+        "note": rep.note, "skipped": rep.skipped or None,
+    }
+    return {k: v for k, v in out.items() if v not in (None, [])}
+
+
+# Engine queries run at once: each is a GROUP BY over the whole view, and ~50 in
+# parallel exhausted Postgres's shared memory on a 1M-row dataset.
+DRILL_CONCURRENCY = int(os.environ.get("DRILL_CONCURRENCY", "4"))
+
+
+def _limited(load):
+    """`load(q)` with at most DRILL_CONCURRENCY calls in flight."""
+    sem = asyncio.Semaphore(DRILL_CONCURRENCY)
+
+    async def run(q: dict) -> list[dict]:
+        async with sem:
+            return await load(q)
+    return run
+
+
+_ONLY_AVERAGES = ("This works on averages (a rating, an average price or duration). For a total "
+                  "or a count, show a breakdown with build_query + a chart instead; for a change "
+                  "over time use explain_change.")
+
+
+async def _on_engine(measure: str, work):
+    """Run `work(run, view_meta, distances, stats)` against the measure's view, with the
+    same Cube access and dimension ordering explain_change uses. -> its result, or an
+    error dict when Cube is down or the measure can't be split."""
+    try:
+        metadata, _ = await _fetch_cube_metadata()
+    except (httpx.HTTPStatusError, httpx.TransportError) as e:
+        return {"_cube_unavailable": _cube_error_text(e)}
+    view_meta = [c for c in metadata if c["name"] == measure.split(".")[0]]
+    async with httpx.AsyncClient(timeout=60) as client:
+        run = _limited(lambda q: _load_rows(client, q))
+        distances, col_stats = await drill_context(client, measure, view_meta)
+        try:
+            return await work(run, view_meta, distances, col_stats)
+        except drill.NotAdditive as e:
+            return {"error": str(e), "instruction": _ONLY_AVERAGES}
+        except CubeQueryError as e:
+            return {"error": f"Cube rejected the query: {e}"}
+
+
+@tool
+async def compare_segments(
+    measure: str,
+    segment_dimension: str,
+    segment_values: list[str],
+    state: Annotated[dict, InjectedState],
+    compare_values: list[str] | None = None,
+    filters: list[dict] = [],
+) -> str:
+    """
+    Explain why an AVERAGE (a rating, an average price or duration) is higher or lower
+    in one group than in another: "why does electronics rate lower than other
+    categories", "why do new customers spend less per order". It checks every sensible
+    dimension and splits the gap into make-up (the group has more of some members, e.g.
+    more expensive products) and within-member differences (the same members score
+    differently). Not for totals or counts, and not for changes over time (explain_change).
+
+    Call build_query first for the measure by the segment dimension (e.g. "average
+    rating by category"); only fields it returned are accepted.
+
+    Args:
+        measure: the average to explain, from build_query
+        segment_dimension: the dimension that defines the groups, e.g. product category
+        segment_values: the group asked about, e.g. ["electronics"]
+        compare_values: what to compare with; omit for "everything else"
+        filters: build_query's other filters, applied to both groups
+
+    Returns:
+        JSON with each group's average and rows, the gap, and the dimensions whose make-up
+        explains it best (explained_by_make_up = share of the gap), each with its top
+        members, plus `chart_query` you may pass to query_cube. If it has "note", no
+        make-up explains the gap: the group is lower (or higher) across the board — say so
+        plainly; that is the finding. Describe WHERE the gap is; the data can't say why.
+    """
+    filters = [f for f in filters if f.get("member") != segment_dimension]
+    problem = guard.check_provenance({"measures": [measure], "dimensions": [segment_dimension],
+                                      "filters": filters}, state.get("messages", []))
+    if problem:
+        return json.dumps({"error": problem, "guard": "build_query_required"})
+    scope = {"measures": [measure], "filters": filters}
+    seg = {"member": segment_dimension, "operator": "equals", "values": segment_values}
+    other = ({"member": segment_dimension, "operator": "equals", "values": compare_values}
+             if compare_values else {"member": segment_dimension, "operator": "notEquals",
+                                     "values": segment_values})
+
+    async def work(run, view_meta, distances, stats):
+        rep = await drill.rank_average_gap(
+            scope, view_meta, run, a_scope={**scope, "filters": filters + [other]},
+            b_scope={**scope, "filters": filters + [seg]}, exclude=(segment_dimension,),
+            distances=distances, stats=stats)
+        out = {"segment": segment_values, "compared_with": compare_values or "everything else",
+               **_gap_out(rep, "others", "segment")}
+        if rep.rankings:
+            out["chart_query"] = {"measures": [measure], "filters": filters,
+                                  "dimensions": [rep.rankings[0].candidate.member, segment_dimension]}
+        return out
+
+    return json.dumps(await _on_engine(measure, work), default=str)
+
+
+@tool
+async def key_drivers(
+    measure: str,
+    state: Annotated[dict, InjectedState],
+    filters: list[dict] = [],
+) -> str:
+    """
+    Find what an AVERAGE depends on within one group: "what else explains the low
+    ratings", "what affects delivery time in electronics". It checks every sensible
+    dimension and ranks them by how much their members' averages differ (`spread`, in
+    the measure's units), lowest members first. Not for totals or counts.
+
+    Call build_query first for the measure (with the group's filter, e.g. "average rating
+    for electronics"); only fields it returned are accepted.
+
+    Args:
+        measure: the average, from build_query
+        filters: build_query's filters that define the group, if any
+
+    Returns:
+        JSON with the overall average, and per dimension its spread, the lowest and the
+        highest members (average, share of rows), plus `chart_query` for the top one.
+        A small spread everywhere means nothing checked moves the average much — say so;
+        don't guess a cause.
+    """
+    problem = guard.check_provenance({"measures": [measure], "filters": filters},
+                                     state.get("messages", []))
+    if problem:
+        return json.dumps({"error": problem, "guard": "build_query_required"})
+    scope = {"measures": [measure], "filters": filters}
+
+    async def work(run, view_meta, distances, stats):
+        rep = await drill.rank_average_spread(scope, view_meta, run, distances=distances, stats=stats)
+        show = lambda ms: [{"value": m.value, "avg": _r3(m.avg), "share_of_rows": _r3(m.share)} for m in ms]
+        out = {"measure": measure, "avg": _r3(rep.avg), "rows": rep.rows,
+               "drivers": [{"dimension": r.candidate.member, "spread": _r3(r.score),
+                            "lowest": show(r.members[:3]), "highest": show(r.members[-2:][::-1])}
+                           for r in rep.rankings[:4]],
+               "skipped": rep.skipped or None}
+        if rep.rankings:
+            out["chart_query"] = {"measures": [measure], "filters": filters, "order": {measure: "asc"},
+                                  "dimensions": [rep.rankings[0].candidate.member]}
+        return {k: v for k, v in out.items() if v not in (None, [])}
+
+    return json.dumps(await _on_engine(measure, work), default=str)
 
 
 def guarded_query_cube(mcp_query_cube):
@@ -1333,7 +1526,8 @@ async def build_agent():
         commit = safe_commit(by_name["commit_cube_config_update"], by_name["reload_cube_schema"],
                              by_name["rollback_cube_config"])
         mcp_tools = [commit if t.name == "commit_cube_config_update" else t for t in mcp_tools]
-    all_tools = mcp_tools + [build_query, explain_change, create_chart, edit_cube_config]
+    all_tools = mcp_tools + [build_query, explain_change, compare_segments, key_drivers,
+                             create_chart, edit_cube_config]
 
     _agent = create_react_agent(
         ChatAnthropic(model=MODEL),

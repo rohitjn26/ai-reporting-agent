@@ -2,6 +2,8 @@ services:
   # ── Data Layer ────────────────────────────────────────────────────────────
   postgres:
     image: postgres:15-alpine
+    # parallel GROUP BYs over 1M+ rows (drill engine) outgrow Docker's 64MB /dev/shm
+    shm_size: 512mb
     ports:
       - "127.0.0.1:5432:5432"
     environment:

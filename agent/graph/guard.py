@@ -58,6 +58,10 @@ def _tool_text(msg: ToolMessage) -> str:
     return str(c)
 
 
+# their chart_query is built from schema members, like build_query's output
+_CHART_TOOLS = ("explain_change", "explain_average")
+
+
 def recent_builds(messages: list) -> list[dict]:
     """build_query results to check against: those in the current turn (since the
     last real user message), else the most recent one earlier in the thread."""
@@ -67,12 +71,12 @@ def recent_builds(messages: list) -> list[dict]:
         if isinstance(m, HumanMessage) and not str(m.content).startswith("[Conversation summary]"):
             in_turn = False
             continue
-        if isinstance(m, ToolMessage) and m.name in ("build_query", "explain_change"):
+        if isinstance(m, ToolMessage) and m.name in ("build_query",) + _CHART_TOOLS:
             try:
                 parsed = json.loads(_tool_text(m))
             except (ValueError, TypeError):
                 continue
-            if m.name == "explain_change":
+            if m.name in _CHART_TOOLS:
                 # its chart_query is built from schema members, like build_query's output
                 parsed = parsed.get("chart_query") if isinstance(parsed, dict) else None
             if isinstance(parsed, dict):

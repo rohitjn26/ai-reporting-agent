@@ -6,7 +6,7 @@ from collections import OrderedDict
 from datetime import date
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage, ToolMessage
@@ -35,6 +35,7 @@ from graph import query_builder as qb
 from graph import feedback
 from graph import guard
 from graph import drill
+from graph import tree
 
 CUBE_MCP_URL    = os.environ.get("CUBE_MCP_URL",    "http://localhost:5001/sse")
 LIBRARY_MCP_URL = os.environ.get("LIBRARY_MCP_URL", "http://localhost:5002/sse")
@@ -169,6 +170,21 @@ WHY A NUMBER CHANGED ("why is revenue down?", "what drove the jump in orders?"):
    If it has "no_driver", say plainly that nothing checked explained the change — never
    fill the gap with guesses (one organization, "it was uniform", campaigns).
 4. To chart it, pass `chart_query` to query_cube unchanged, then create_chart.
+For an AVERAGE (a rating, an average price) explain_change also splits the change into
+make-up (drivers' make_up_part) and within-member differences.
+
+WHAT AN AVERAGE DEPENDS ON, OR WHY ONE GROUP DIFFERS — don't test causes one by one:
+- "What explains the low ratings?", "what affects X?", "when did the low ratings come in?"
+  -> build_query (the average, with the group's filters), then explain_average(measure, filters).
+- "Why does electronics rate lower than the rest?" -> build_query (the average by that
+  dimension), then explain_average(measure, filters, compare={"dimension", "values"}).
+explain_average checks every sensible dimension and time at once and returns a tree.
+Narrate it top-down with numbers ("late deliveries average 2.9★ vs 4.2★ on time; within
+late ones, ..."), and always say whether it is per review or per item. Mention dimensions
+in `left_out` only if the user asked about them. A tree with no split, or a comparison
+with "note", is a finding: say plainly nothing checked explains it / the gap is across the
+board. Never call a difference under `minimum_effect` meaningful. To chart, pass
+`chart_query` to query_cube unchanged.
 
 IMPORTANT query rules:
 - If build_query returns "_cube_unavailable", Cube is down or its schema is broken.
@@ -525,6 +541,11 @@ async def _cube_load(client: httpx.AsyncClient, q: dict) -> dict:
     return body
 
 
+async def _load_rows(client: httpx.AsyncClient, q: dict) -> list[dict]:
+    """An agent-shaped query's rows from Cube (the drill engine's `run`)."""
+    return (await _cube_load(client, _to_cube(q))).get("data", [])
+
+
 async def run_cube_query(query: dict, limit: int = 50) -> dict:
     """Run a build_query-shaped query against Cube's REST API -> {rows, sql} or {error}.
 
@@ -728,9 +749,8 @@ async def explain_change(
         return json.dumps({"_cube_unavailable": _cube_error_text(e)})
     view_meta = [c for c in metadata if c["name"] == measure.split(".")[0]]
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        async def run(q: dict) -> list[dict]:
-            return (await _cube_load(client, _to_cube(q))).get("data", [])
+    async with httpx.AsyncClient(timeout=60) as client:
+        run = _limited(lambda q: _load_rows(client, q))
 
         async def resolve(date_range) -> list[str]:
             # Cube resolves "last month" etc. and echoes the absolute range back
@@ -747,6 +767,14 @@ async def explain_change(
                 previous, basis = asked, "the period you asked for"
             else:
                 previous, basis = drill.default_compare(current)
+            if drill.weight_measure(measure, view_meta):   # an average: make-up vs within-member
+                gap = await drill.rank_average_gap(
+                    scope, view_meta, run, a_scope=drill._with_range(scope, time_dimension, previous),
+                    b_scope=drill._with_range(scope, time_dimension, current),
+                    distances=distances, stats=col_stats)
+                return json.dumps({"period": current, "compare_period": previous,
+                                   "compare_basis": basis, **_gap_out(gap, "before", "after")},
+                                  default=str)
             report = await drill.rank_change(scope, view_meta, run, time_dimension=time_dimension,
                                              period=current, compare_period=previous,
                                              distances=distances, stats=col_stats)
@@ -805,6 +833,275 @@ async def explain_change(
                               "filters": filters, "order": {measure: "desc"},
                               "time_dimensions": [{"dimension": time_dimension, "dateRange": current}]}
     return json.dumps({k: v for k, v in out.items() if v not in (None, [])}, default=str)
+
+
+def _r3(x):
+    return round(x, 3) if isinstance(x, float) else x
+
+
+def _gap_out(rep: drill.GapReport, a: str, b: str, dims: int = 3, members: int = 5) -> dict:
+    """The top of a GapReport for the model; `a` / `b` name the two groups."""
+    out = {
+        "measure": rep.measure, f"avg_{a}": _r3(rep.avg_a), f"avg_{b}": _r3(rep.avg_b),
+        "gap": _r3(rep.gap), "rows": {a: rep.rows_a, b: rep.rows_b},
+        "drivers": [{
+            "dimension": g.candidate.member,
+            "explained_by_make_up": _r3(g.score),
+            "make_up_part": _r3(g.mix), "within_member_part": _r3(g.rate),
+            "members": [{"value": m.value, f"avg_{a}": _r3(m.avg_a), f"avg_{b}": _r3(m.avg_b),
+                         f"rows_{a}": m.rows_a, f"rows_{b}": m.rows_b, "part_of_gap": _r3(m.mix + m.rate)}
+                        for m in g.members[:members]],
+        } for g in rep.rankings[:dims]],
+        "note": rep.note, "skipped": rep.skipped or None,
+    }
+    return {k: v for k, v in out.items() if v not in (None, [])}
+
+
+# Engine queries run at once: each is a GROUP BY over the whole view, and ~50 in
+# parallel exhausted Postgres's shared memory on a 1M-row dataset.
+DRILL_CONCURRENCY = int(os.environ.get("DRILL_CONCURRENCY", "4"))
+
+
+def _limited(load):
+    """`load(q)` with at most DRILL_CONCURRENCY calls in flight."""
+    sem = asyncio.Semaphore(DRILL_CONCURRENCY)
+
+    async def run(q: dict) -> list[dict]:
+        async with sem:
+            return await load(q)
+    return run
+
+
+_ONLY_AVERAGES = ("This works on averages (a rating, an average price or duration). For a total "
+                  "or a count, show a breakdown with build_query + a chart instead; for a change "
+                  "over time use explain_change.")
+
+
+async def _on_engine(measure: str, work):
+    """Run `work(run, view_meta, distances, stats)` against the measure's view, with the
+    same Cube access and dimension ordering explain_change uses. -> its result, or an
+    error dict when Cube is down or the measure can't be split."""
+    try:
+        metadata, _ = await _fetch_cube_metadata()
+    except (httpx.HTTPStatusError, httpx.TransportError) as e:
+        return {"_cube_unavailable": _cube_error_text(e)}
+    view_meta = [c for c in metadata if c["name"] == measure.split(".")[0]]
+    async with httpx.AsyncClient(timeout=60) as client:
+        run = _limited(lambda q: _load_rows(client, q))
+        distances, col_stats = await drill_context(client, measure, view_meta)
+        try:
+            return await work(run, view_meta, distances, col_stats)
+        except drill.NotAdditive as e:
+            return {"error": str(e), "instruction": _ONLY_AVERAGES}
+        except CubeQueryError as e:
+            return {"error": f"Cube rejected the query: {e}"}
+
+
+def _time_label(value: Any, granularity: str) -> str:
+    v = str(value)
+    if granularity == "year":
+        return v[:4]
+    if granularity == "quarter":
+        return f"{v[:4]}-Q{(int(v[5:7]) - 1) // 3 + 1}"
+    return v[:7] if granularity == "month" else v[:10]
+
+
+async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_item):
+    """Everything explain_average fetches: (cells, candidates, ordered dims, notes) or an
+    error dict. One cells query (cached), plus a couple of small ones to size it."""
+    view = measure.split(".")[0]
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(f"{LIBRARY_API}/v1/CUBE_CONFIG")
+        r.raise_for_status()
+    configs = r.json().get("data", [])
+    graph = tree.join_graph(configs)
+    mcube = drill.measure_cube({"measures": [measure]}, view_meta)
+    dims_meta = {d["name"]: d for v in view_meta for d in v.get("dimensions", [])}
+    value = tree.value_dimension(measure, view_meta, configs)
+    _, fans = tree.safe_cubes(mcube, graph)
+    cmp_cube = drill._source_cube(dims_meta[compare["dimension"]]) if compare and compare.get("dimension") in dims_meta else None
+
+    if per_item is None:   # the engine decides: per item only when the comparison needs it
+        per_item = bool(cmp_cube and cmp_cube in fans)
+    if not per_item and cmp_cube in fans:
+        return {"error": f"{compare['dimension']} can't be compared per review: a review's "
+                         "order can have several. Run it per item (per_item=true)."}
+    start, per = mcube, "review"
+    if per_item:
+        target = cmp_cube or min(fans, key=lambda f: f)   # no comparison: the first fan-out cube
+        start = tree.grain_for(mcube, target, graph) if target else None
+        if not start or not value:
+            return {"error": "per item isn't available here: it needs a per-row value for the "
+                             "measure and a one-to-many step to count items across"}
+        per = start.split("_")[-1].rstrip("s") or "item"
+    weight = tree.count_measure(view, start, view_meta)
+    if not weight:
+        return {"error": f"no count measure on {start} to weight rows by", "instruction": _ONLY_AVERAGES}
+
+    # a rating: few distinct values, so the cells can carry the whole distribution
+    rating, n_values = False, 1
+    if value:
+        probe = await run({"measures": [weight], "dimensions": [value], "filters": filters,
+                           "limit": tree.RATING_MAX_VALUES + 1})
+        rating, n_values = len(probe) <= tree.RATING_MAX_VALUES, len(probe)
+    if per_item and not rating:
+        return {"error": "per item needs the measure's value as a small set of values (a rating)"}
+
+    safe, fans = tree.safe_cubes(start, graph)
+    if value:   # the value's own cube is reached per item; the add-up check guards it
+        safe.add(drill._source_cube(dims_meta[value]))
+    scope = {"measures": [measure], "filters": filters}
+    # nearest cubes to the grain first (per item: products and sellers before customers);
+    # within a cube, the stats-based order drill.candidates gives
+    dist = tree.hops(start, graph)
+    ordered_names = [c.member for c in drill.candidates(scope, view_meta, None, stats)
+                     if not c.is_time and c.member not in (value, (compare or {}).get("dimension"))]
+    # within a distance, fewest values first: cheap to fetch, and splits that read well
+    ordered_names.sort(key=lambda n: (dist.get(drill._source_cube(dims_meta[n]), 99) if n in dims_meta else 99,
+                                      getattr((stats or {}).get(n), "distinct", None) or 10))
+
+    # one time bucket, coarse enough for ≤ ~24 buckets over the data's range
+    time_dim, gran, n_buckets = None, None, 1
+    tds = [d for d in dims_meta.values() if d.get("type") == "time" and drill._source_cube(d) in safe
+           and d["name"].startswith(view + ".")]
+    tds.sort(key=lambda d: (drill._source_cube(d) != mcube, drill._source_cube(d) != start))
+    if tds:
+        time_dim = tds[0]["name"]
+        years = await run({"measures": [weight], "filters": filters,
+                           "time_dimensions": [{"dimension": time_dim, "granularity": "year"}]})
+        n_years = len(years)
+        gran = "month" if n_years <= 2 else "quarter" if n_years <= 6 else "year"
+        n_buckets = {"month": 12 * n_years, "quarter": 4 * n_years, "year": n_years}[gran]
+        if n_buckets < 2:   # one bucket can't split anything
+            time_dim, gran, n_buckets = None, None, 1
+
+    n_compare = getattr((stats or {}).get((compare or {}).get("dimension")), "distinct", 20) if compare else 1
+    extra = n_buckets * (n_values if rating else 1) * n_compare
+    picked, skipped = tree.pick_candidates(ordered_names, view_meta, safe, fans, stats, extra)
+
+    for attempt in range(3):
+        dims = picked + ([compare["dimension"]] if compare else []) + ([value] if rating else [])
+        q = {"measures": [weight] + ([] if rating else [measure]), "dimensions": dims,
+             "filters": filters, "limit": tree.CELL_LIMIT}
+        if time_dim:
+            q["time_dimensions"] = [{"dimension": time_dim, "granularity": gran}]
+        key = (view, measure, per, json.dumps(filters, sort_keys=True), tuple(dims), time_dim, gran)
+        cells = tree.cache_get(key)
+        if cells is None:
+            rows = await run(q)
+            if len(rows) >= tree.CELL_LIMIT and picked:
+                skipped[picked.pop()] = "left out: too many combinations"
+                continue
+            tkey = f"{time_dim}.{gran}" if time_dim else None
+            if tkey:
+                for row in rows:
+                    row[tkey] = _time_label(row.get(tkey) or row.get(time_dim), gran)
+            key_dims = [d for d in dims if d != value] + ([tkey] if tkey else [])
+            total_q = {"measures": [weight], "filters": filters + (
+                [{"member": value, "operator": "set"}] if value and rating else [])}
+            total = sum(drill._num(r.get(weight)) for r in await run(total_q))
+            cells = tree.Cells(key_dims, tree.cells_from_rows(rows, key_dims, weight, value if rating else None,
+                                                              measure), rating, per, total)
+            tree.cache_put(key, cells)
+        break
+    else:
+        return {"error": "too many combinations even with few dimensions — add a filter"}
+
+    counted = sum(st.n for _, st in cells.rows)
+    if cells.total and counted > cells.total * 1.005:
+        return {"error": f"the cells add up to {counted:.0f} rows but there are {cells.total:.0f}: "
+                         "some dimension counts rows more than once, so the tree would be wrong"}
+    cands = picked + ([f"{time_dim}.{gran}"] if time_dim else [])
+    ordered = {f"{time_dim}.{gran}"} if time_dim else set()
+    return cells, cands, ordered, skipped
+
+
+@tool
+async def explain_average(
+    measure: str,
+    state: Annotated[dict, InjectedState],
+    filters: list[dict] = [],
+    compare: dict | None = None,
+    per_item: bool | None = None,
+) -> str:
+    """
+    Explain an AVERAGE (a rating, an average price or duration): what it depends on, or
+    why one group's is higher or lower than the rest. "What explains the low ratings?",
+    "what affects delivery time?", "why does electronics rate lower than other
+    categories?", "when did the low ratings come in?". It checks every sensible
+    dimension and time on its own and returns a tree: the split that matters most, then
+    what matters inside each branch. Not for totals or counts, and not for a change
+    between two periods (explain_change).
+
+    Call build_query first for the measure (with the group's filters, and the compare
+    dimension if any); only fields it returned are accepted.
+
+    Args:
+        measure: the average, from build_query
+        filters: build_query's filters for the group to explain
+        compare: {"dimension": ..., "values": [...]} to explain why that group differs from
+                 the rest, or {"dimension", "values", "others": [...]} vs named values
+        per_item: leave unset — the engine decides; it is per item only when the compare
+                  dimension sits behind a one-to-many join (a review's order has many items)
+
+    Returns:
+        JSON: `per` ("review" or "item" — always say which), the tree (rows, avg, split_by,
+        branches with their values, p), dimensions left out and why, and for a comparison
+        the gap split into make-up vs within-member differences. A tree with no split means
+        nothing checked moves the average by the minimum effect — say so; don't guess.
+        `chart_query` (when given) charts the top split.
+    """
+    filters = [f for f in filters if not (compare and f.get("member") == compare.get("dimension"))]
+    wanted = {"measures": [measure], "filters": filters,
+              "dimensions": [compare["dimension"]] if compare else []}
+    problem = guard.check_provenance(wanted, state.get("messages", []))
+    if problem:
+        return json.dumps({"error": problem, "guard": "build_query_required"})
+
+    async def work(run, view_meta, distances, stats):
+        if not drill.weight_measure(measure, view_meta):
+            return {"error": f"'{measure}' isn't an average", "instruction": _ONLY_AVERAGES}
+        got = await _tree_inputs(run, view_meta, stats, measure, filters, compare, per_item)
+        if isinstance(got, dict):
+            return got
+        cells, cands, ordered, skipped = got
+        echoes = tree.restating(cells, cands)
+        cands = [c for c in cands if c not in echoes]
+        skipped = {**echoes, **skipped}
+        out = {"measure": measure, "per": cells.per,
+               "minimum_effect": tree.min_effect(cells.stat().mean, cells.rating),
+               "checked": cands}
+        if compare:
+            ci = cells.dims.index(compare["dimension"])
+            seg = {str(v) for v in compare.get("values", [])}
+            gap = tree.make_up(cells, compare["dimension"], compare.get("values", []),
+                               compare.get("others"), cands)
+            out["comparison"] = {k: _r3(v) if isinstance(v, float) else v for k, v in gap.items()
+                                 if k != "by_dimension"}
+            out["comparison"]["by_dimension"] = [
+                {k: (_r3(v) if isinstance(v, float) else v) for k, v in d.items() if k != "members"}
+                | {"members": [{k: _r3(v) if isinstance(v, float) else v for k, v in m.items()}
+                               for m in d["members"][:3]]}
+                for d in gap["by_dimension"][:3]]
+            seg_cells = tree.Cells(cells.dims, [(k, s) for k, s in cells.rows if str(k[ci]) in seg],
+                                   cells.rating, cells.per, 0)
+            out["tree_in_segment"] = tree.grow(seg_cells, cands, ordered).to_dict()
+        else:
+            root = tree.grow(cells, cands, ordered)
+            out["tree"] = root.to_dict()
+            if root.split and cells.per == "review":   # per item, Cube can't chart the same numbers
+                chart = {"measures": [measure], "filters": filters}
+                if root.split in ordered:                  # the time bucket: "view.dim.granularity"
+                    dim, gran = root.split.rsplit(".", 1)
+                    chart["time_dimensions"] = [{"dimension": dim, "granularity": gran}]
+                else:
+                    chart["dimensions"] = [root.split]
+                out["chart_query"] = chart
+        if skipped:
+            out["left_out"] = skipped
+        return out
+
+    return json.dumps(await _on_engine(measure, work), default=str)
 
 
 def guarded_query_cube(mcp_query_cube):
@@ -1110,6 +1407,7 @@ def safe_commit(mcp_commit, reload_tool, rollback_tool):
         if not reload_msg.startswith(_RELOAD_FAILED):
             live = reload_msg.startswith("Cube restarted and ready")
             _refresh_stats_for(committed_text)
+            tree.clear_cache()   # cached cells may describe the old model
             out = {"status": "committed and live" if live else
                    "committed, but Cube did not confirm the reload — check it",
                    "id": committed.get("id"),
@@ -1333,7 +1631,8 @@ async def build_agent():
         commit = safe_commit(by_name["commit_cube_config_update"], by_name["reload_cube_schema"],
                              by_name["rollback_cube_config"])
         mcp_tools = [commit if t.name == "commit_cube_config_update" else t for t in mcp_tools]
-    all_tools = mcp_tools + [build_query, explain_change, create_chart, edit_cube_config]
+    all_tools = mcp_tools + [build_query, explain_change, explain_average,
+                             create_chart, edit_cube_config]
 
     _agent = create_react_agent(
         ChatAnthropic(model=MODEL),

@@ -195,7 +195,9 @@ def join_edges(sql: str) -> list[tuple[str, str]]:
 def alias_tables(sql: str) -> dict[str, tuple[str, str]]:
     """{cube alias: (schema, table)} from the FROM/JOIN clauses of Cube-generated SQL,
     e.g. `LEFT JOIN mdbl.c_site AS "mdbl_c_site"` -> {"mdbl_c_site": ("mdbl", "c_site")}."""
-    return {alias: (schema, table) for schema, table, alias in re.findall(
+    # With a one-to-many join Cube moves the measure into a subquery and prefixes the
+    # aliases there ("us_ecom_order_reviews_key__us_ecom_customers"); key by the cube name.
+    return {alias.split("_key__", 1)[-1]: (schema, table) for schema, table, alias in re.findall(
         r'(?:FROM|JOIN)\s+"?(\w+)"?\."?(\w+)"?\s+AS\s+"(\w+)"', sql, flags=re.I)}
 
 
@@ -815,3 +817,186 @@ async def rank_breakdown(
     if additive:
         report.rankings.sort(key=lambda r: (_dominated(r),) + _sort_key(r))
     return report
+
+
+# ── averages: mix vs rate ─────────────────────────────────────────────────────
+#
+# An average (a rating, an average price) can't be split like a total, but it is
+# sum ÷ rows, and both of those add up. Weighting each member's average by its rows
+# (a count measure on the same cube), the gap between two groups A and B splits
+# exactly per member k of a dimension, with p = k's share of its side's rows and
+# r = k's average (the symmetric Kitagawa split):
+#
+#   gap = Σ (p_B − p_A)·(r_A + r_B)/2     mix:  B is made of different members
+#       + Σ (r_B − r_A)·(p_A + p_B)/2     rate: the same members score differently in B
+#
+# A dimension explains the gap when its mix part is large. When no dimension's
+# mix does, B is lower (or higher) across the board.
+
+MIX_EXPLAINS = 0.25     # under this share of the gap, no dimension's mix explains it
+
+
+def weight_measure(measure: str, view_meta: list[dict]) -> Optional[str]:
+    """For an average: a count measure on the same cube, to weight its members by
+    (counts rows, so it slightly overweights rows where the averaged column is
+    empty). None when the measure isn't an average or its cube has no count."""
+    if _agg_type(measure, view_meta) != "avg":
+        return None
+    ms = _view_members(view_meta, measure.split(".")[0], "measures")
+    cube = next((_source_cube(m) for m in ms if m["name"] == measure), None)
+    return next((m["name"] for m in ms if m.get("aggType") == "count" and _source_cube(m) == cube), None)
+
+
+@dataclass
+class RateMember:
+    value: Any
+    rows_a: float
+    avg_a: Optional[float]
+    rows_b: float
+    avg_b: Optional[float]
+    mix: float              # this member's part of the gap from B's different make-up
+    rate: float             # its part from scoring differently in B
+
+
+@dataclass
+class GapRanking:
+    candidate: Candidate
+    score: float            # |mix part| / |gap|: how much of the gap B's make-up explains
+    mix: float
+    rate: float
+    members: list[RateMember]
+
+
+@dataclass
+class GapReport:
+    measure: str
+    avg_a: float
+    avg_b: float
+    gap: float
+    rows_a: float
+    rows_b: float
+    rankings: list[GapRanking]
+    skipped: dict[str, str] = field(default_factory=dict)
+    note: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def _avg_query(scope: dict, measure: str, weight: str, c: Optional[Candidate], max_members: int) -> dict:
+    q = {"measures": [measure, weight], "filters": scope.get("filters", []),
+         "time_dimensions": [{k: v for k, v in td.items() if k != "granularity"}
+                             for td in scope.get("time_dimensions", [])]}
+    if c is not None:
+        q["dimensions"], q["limit"] = [c.member], max_members + 1
+    return _clean(q)
+
+
+def _avg_side(rows: list[dict], c: Optional[Candidate], measure: str, weight: str) -> tuple[dict, dict]:
+    """-> ({member: rows}, {member: sum}) — both add up. Rows with no average are left out."""
+    n: dict = {}
+    s: dict = {}
+    for r in rows:
+        avg = r.get(measure)
+        if avg is None:
+            continue
+        k = (r.get(_row_key(c), r.get(c.member)) if c is not None else None)
+        cnt = _num(r.get(weight))
+        n[k] = n.get(k, 0.0) + cnt
+        s[k] = s.get(k, 0.0) + _num(avg) * cnt
+    return n, s
+
+
+def _avg_skip(rows_list: list, c: Candidate, totals: list[float], sides: list[tuple[dict, dict]],
+              max_members: int) -> Optional[str]:
+    """Why a dimension can't be ranked for an average, or None."""
+    failed = next((r for r in rows_list if isinstance(r, BaseException)), None)
+    if failed:
+        return f"query failed: {failed}"
+    if any(len(r) > max_members for r in rows_list):
+        return f"more than {max_members} members"
+    for (n, _), total in zip(sides, totals):
+        if _fans_out(n, total):
+            return _fan_out_note(n, total)
+    if _unreadable({k: 1.0 for n, _ in sides for k in n}):
+        return _UNREADABLE_NOTE
+    if any(_mostly_blank(n) for n, _ in sides):
+        return _BLANK_NOTE
+    return None
+
+
+async def rank_average_gap(
+    scope: dict,
+    view_meta: list[dict],
+    run: Run,
+    *,
+    a_scope: dict,
+    b_scope: dict,
+    exclude: tuple = (),
+    max_candidates: int = 24,
+    max_members: int = 50,
+    min_share: float = 0.01,
+    distances: Optional[dict[str, tuple[int, int]]] = None,
+    stats: Optional[dict] = None,
+) -> GapReport:
+    """Rank the dimensions whose make-up explains why the average of scope's measure
+    is different in `b_scope` than in `a_scope` (two filtered versions of scope: two
+    periods, or a segment and the rest). Raises NotAdditive when the measure isn't an
+    average with a count to weight it by."""
+    measure = scope["measures"][0]
+    weight = weight_measure(measure, view_meta)
+    if not weight:
+        raise NotAdditive(f"'{measure}' isn't an average with a row count on its cube, so "
+                          "it can't be split into make-up and per-member differences")
+    cands = [c for c in candidates(scope, view_meta, distances, stats)
+             if not c.is_time and c.member not in exclude][:max_candidates]
+    queries = [_avg_query(s, measure, weight, None, max_members) for s in (a_scope, b_scope)]
+    queries += [_avg_query(s, measure, weight, c, max_members) for c in cands for s in (a_scope, b_scope)]
+    results = await asyncio.gather(*(run(q) for q in queries), return_exceptions=True)
+    for r in results[:2]:
+        if isinstance(r, BaseException):
+            raise r
+    (na, sa), (nb, sb) = (_avg_side(results[i], None, measure, weight) for i in (0, 1))
+    rows_a, rows_b = sum(na.values()), sum(nb.values())
+    avg_a = sum(sa.values()) / rows_a if rows_a else 0.0
+    avg_b = sum(sb.values()) / rows_b if rows_b else 0.0
+    gap = avg_b - avg_a
+    report = GapReport(measure, avg_a, avg_b, gap, rows_a, rows_b, [])
+
+    for i, c in enumerate(cands):
+        pair = [results[2 + 2 * i], results[3 + 2 * i]]
+        sides = [] if any(isinstance(r, BaseException) for r in pair) else \
+            [_avg_side(r, c, measure, weight) for r in pair]
+        why = _avg_skip(pair, c, [rows_a, rows_b], sides, max_members)
+        if why:
+            report.skipped[c.member] = why
+            continue
+        (n_a, s_a), (n_b, s_b) = sides
+        keys = set(n_a) | set(n_b)
+        sizes = {k: max(n_a.get(k, 0.0) / (rows_a or 1), n_b.get(k, 0.0) / (rows_b or 1)) for k in keys}
+        n_a, s_a, n_b, s_b = _fold_small(sizes, min_share, n_a, s_a, n_b, s_b)
+        keys = set(n_a) | set(n_b)
+        if len(keys) < 2:
+            report.skipped[c.member] = "only one member"
+            continue
+        tot_a, tot_b = sum(n_a.values()) or 1.0, sum(n_b.values()) or 1.0
+        members = []
+        for k in keys:
+            ra = s_a[k] / n_a[k] if n_a.get(k) else None
+            rb = s_b[k] / n_b[k] if n_b.get(k) else None
+            ra_, rb_ = (ra if ra is not None else rb), (rb if rb is not None else ra)
+            pa, pb = n_a.get(k, 0.0) / tot_a, n_b.get(k, 0.0) / tot_b
+            members.append(RateMember(k, n_a.get(k, 0.0), ra, n_b.get(k, 0.0), rb,
+                                      (pb - pa) * (ra_ + rb_) / 2, (rb_ - ra_) * (pa + pb) / 2))
+        members.sort(key=lambda m: (-abs(m.mix + m.rate), str(m.value)))
+        mix, rate = sum(m.mix for m in members), sum(m.rate for m in members)
+        report.rankings.append(GapRanking(c, abs(mix) / (abs(gap) or 1.0), mix, rate, members))
+
+    report.rankings = _drop_duplicates(
+        report.rankings, lambda m: (str(m.value), m.rows_a, m.rows_b), report.skipped)
+    report.rankings.sort(key=_sort_key)
+    if report.rankings and report.rankings[0].score < MIX_EXPLAINS:
+        report.note = ("no dimension's make-up explains much of the gap: the difference is "
+                       "across the board — the same members score differently, not a different mix")
+    return report
+

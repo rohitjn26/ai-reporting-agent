@@ -242,6 +242,9 @@ def test_semantic_composite_join_keeps_key_columns_groupable(cities):
         "${CUBE}.country = ${cities}.country AND ${CUBE}.city = ${cities}.city"
     assert {"country", "city"} <= set(cubes["cities"]["dimensions"])
     assert cubes["cities"]["dimensions"]["pk"]["primary_key"]
+    # qualified, so the key isn't ambiguous once a cube sharing a column name is joined
+    assert all(part.startswith("${CUBE}.") for part in
+               cubes["cities"]["dimensions"]["pk"]["sql"][len("CONCAT("):-1].split(", '|', "))
 
 
 def test_table_named_column_is_a_name_signal():

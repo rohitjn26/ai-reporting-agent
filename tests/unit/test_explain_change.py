@@ -71,9 +71,11 @@ async def test_needs_build_query_first(monkeypatch):
 
 
 async def test_refuses_a_ratio_measure(monkeypatch):
-    _patch_cube(monkeypatch)
-    built = {**BUILT, "measures": ["sales.avg_price"]}
-    out = await _call(_history(built), {**ARGS, "measure": "sales.avg_price"})
+    # a hand-written ratio (type number) has no row count to weight it — averages do
+    ratio = {"name": "sales.revenue_per_order", "aggType": "number"}
+    _patch_cube(monkeypatch, meta=[{**META[0], "measures": META[0]["measures"] + [ratio]}])
+    built = {**BUILT, "measures": ["sales.revenue_per_order"]}
+    out = await _call(_history(built), {**ARGS, "measure": "sales.revenue_per_order"})
     assert "can't be split" in out["error"] and "numerator" in out["instruction"]
 
 

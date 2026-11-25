@@ -629,7 +629,7 @@ async def _stream_agent(request: Request, input_, thread_id: str, agent=None, mo
                 # explain_change's chart_query isn't what build_query planned ("revenue
                 # last month" → revenue by region), so don't record it against that
                 # trace; it becomes its own trace for the user's question instead.
-                if name == "explain_change" and not error:
+                if name in ("explain_change", "explain_average") and not error:
                     trace_id = None
                 if name == "preview_cube_config_update" and not error:
                     try:

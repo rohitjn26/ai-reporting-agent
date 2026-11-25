@@ -107,3 +107,13 @@ async def test_running_total_becomes_an_unbounded_rolling_window(monkeypatch, pa
     assert out["measures"]["cumulative_count"] == {
         "sql": "id", "type": "count", "title": "Participants so far",
         "rolling_window": {"trailing": "unbounded"}}
+
+
+async def test_rejecting_the_suggestion_returns_the_feedback_not_a_change(monkeypatch, patch_lib):
+    _patch_form_answer(monkeypatch, json.dumps(
+        {"rejected": True, "feedback": "subtract the two timestamps, they are dates"}))
+    out = json.loads(await _run(cube_name="orders", intent="add response time",
+                                suggested_sql="response_time_days * 24"))
+    assert out["rejected"] is True and out["feedback"].startswith("subtract")
+    assert "do not preview or commit" in out["instruction"]
+    assert "measures" not in out and "dimensions" not in out

@@ -59,7 +59,7 @@ def _tool_text(msg: ToolMessage) -> str:
 
 
 # their chart_query is built from schema members, like build_query's output
-_CHART_TOOLS = ("explain_change", "compare_segments", "key_drivers")
+_CHART_TOOLS = ("explain_change", "explain_average")
 
 
 def recent_builds(messages: list) -> list[dict]:

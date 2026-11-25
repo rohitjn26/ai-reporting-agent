@@ -185,7 +185,9 @@ def _build_cube(table: str, prof: dict, grain: dict, role: str,
                         "title": _title(key[0]), "primary_key": True,
                         "description": f"Unique {table} identifier (primary key)."}
     elif key:
-        concat = ", '|', ".join(key)
+        # ${CUBE}. on each column: Cube qualifies a bare column itself, but not columns
+        # inside an expression — CONCAT(order_id, ...) is ambiguous once orders is joined
+        concat = ", '|', ".join(f"${{CUBE}}.{k}" for k in key)
         dims["pk"] = {"sql": f"CONCAT({concat})", "type": "string", "title": "Key",
                       "primary_key": True,
                       "description": f"Composite key of {table}: {' + '.join(key)}."}

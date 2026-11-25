@@ -1,6 +1,6 @@
 # Plan: driver tree for averages
 
-Status: agreed (2026-11-25) — not built yet. Replaces the flat version on this branch
+Status: built (2026-11-25) — see "As built" at the end. Replaces the flat version on this branch
 (`compare_segments`, `key_drivers`), keeping its maths and tests where they still apply.
 
 ## Goal
@@ -240,3 +240,31 @@ minimum effect meaningful; say "nothing checked explains it" when the root has n
 3. ~~Defaults?~~ Decided: depth 3, p < 0.10, minimum effect 0.05★ / 2%, min child 1% / 500 rows.
 
 No open questions — ready to build.
+
+
+## As built
+
+Differences from the plan, and what the live check found:
+
+- **Module:** the tree lives in `agent/graph/tree.py` (its own job), not drill.py.
+- **Candidate order:** by join steps from the grain, then fewest values first — cheap to
+  fetch and splits that read well. Size estimate: no-stats columns count as 10 values,
+  budget 5M estimated combinations; a full (50k-row) result drops the last candidate and
+  retries.
+- **Restating check (new):** a dimension that alone explains ≥ 80% of the value's
+  variation restates the measure (a review's comment title: 87%) — left out with that reason.
+- **Fixes this needed elsewhere:**
+  - `drill.alias_tables`: with a one-to-many join Cube prefixes aliases in its measure
+    subquery (`x_key__cube`), so column stats were silently never found.
+  - Cube model builder: field SQL with `${CUBE}` wasn't interpolated (only join SQL was).
+  - Discovery: composite keys now qualify columns (`CONCAT(${CUBE}.order_id, …)`);
+    unqualified, every items-with-orders query failed ("order_id is ambiguous"). The two
+    live us_ecom configs (order_items, order_payments) were updated (version 3).
+- **Live (us_ecom, no LLM):**
+  - Per review, 4.2 s: VIP customers 3.87★ vs 4.05★ (Consumer/Corporate); nothing else
+    moves ratings by 0.05★.
+  - Electronics vs the rest, per item, 25.5 s: 3.82★ vs 4.06★, across the board — no
+    brand, seller, status or year mix explains it.
+- **Not yet:** customer columns rank behind product/seller ones per item, so within
+  electronics the VIP effect isn't checked; averages over time still use explain_change's
+  flat mix/rate path.

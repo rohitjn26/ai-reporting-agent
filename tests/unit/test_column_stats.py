@@ -58,6 +58,13 @@ LEFT JOIN "app"."part" AS "part" ON "part".site = "site".id
 LEFT JOIN app.response AS "resp" ON "part".id = "resp".participant'''
 
 
+def test_alias_tables_keys_subquery_aliases_by_cube():
+    # a one-to-many join makes Cube prefix aliases inside its measure subquery
+    sql = ('SELECT 1 FROM shop.customers AS "reviews_key__customers" '
+           'LEFT JOIN shop.reviews AS "reviews_key__reviews" ON 1=1')
+    assert drill.alias_tables(sql) == {"customers": ("shop", "customers"), "reviews": ("shop", "reviews")}
+
+
 def test_alias_tables_reads_schema_and_table_for_every_alias():
     assert drill.alias_tables(SQL) == {"org": ("app", "org"), "site": ("app", "site"),
                                        "part": ("app", "part"), "resp": ("app", "response")}

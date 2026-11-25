@@ -8,12 +8,32 @@ import {
 const isDescriptionEmpty = (d) =>
   d === '' || (typeof d === 'string' && d.trim() === '');
 
+// Join SQL contains Cube references like `${CUBE}.customer_id = ${customers.id}`.
+// Cube's transpiler normally turns such a template literal into a function whose
+// params are the referenced cubes (CUBE, customers) so `${...}` interpolates the
+// proxy args into real SQL. We build joins dynamically from JSON strings, so
+// reproduce that: collect the base identifiers referenced via ${...} and return a
+// function that interpolates them through a template literal. (Plain `() => sql`
+// would leave the ${...} literal — which is why joins previously errored.)
+const sqlRefToFunction = (sqlString) => {
+  const refs = [];
+  const re = /\$\{\s*([a-zA-Z_][a-zA-Z0-9_]*)/g;
+  let m;
+  while ((m = re.exec(sqlString)) !== null) {
+    if (!refs.includes(m[1])) refs.push(m[1]);
+  }
+  // eslint-disable-next-line no-new-func
+  return new Function(...refs, 'return `' + sqlString.replace(/`/g, '\\`') + '`;');
+};
+
 export const convertStringPropToFunction = (propNames, definition, options = {}) => {
   const result = { ...definition };
   propNames.forEach((prop) => {
     const val = result[prop];
     if (!val) return;
-    result[prop] = () => val;
+    // `${CUBE}.col` and other cube references must be interpolated like a JS model's
+    // template literal; a plain `() => val` would send "${CUBE}" to the database as text
+    result[prop] = typeof val === 'string' && val.includes('${') ? sqlRefToFunction(val) : () => val;
   });
   if (options.stripEmptyDescription && isDescriptionEmpty(result.description)) {
     delete result.description;
@@ -46,23 +66,7 @@ export const transformMeasures = (measures) =>
     return acc;
   }, {});
 
-// Join SQL contains Cube references like `${CUBE}.customer_id = ${customers.id}`.
-// Cube's transpiler normally turns such a template literal into a function whose
-// params are the referenced cubes (CUBE, customers) so `${...}` interpolates the
-// proxy args into real SQL. We build joins dynamically from JSON strings, so
-// reproduce that: collect the base identifiers referenced via ${...} and return a
-// function that interpolates them through a template literal. (Plain `() => sql`
-// would leave the ${...} literal — which is why joins previously errored.)
-const sqlRefToFunction = (sqlString) => {
-  const refs = [];
-  const re = /\$\{\s*([a-zA-Z_][a-zA-Z0-9_]*)/g;
-  let m;
-  while ((m = re.exec(sqlString)) !== null) {
-    if (!refs.includes(m[1])) refs.push(m[1]);
-  }
-  // eslint-disable-next-line no-new-func
-  return new Function(...refs, 'return `' + sqlString.replace(/`/g, '\\`') + '`;');
-};
+
 
 export const transformJoins = (joins) =>
   Object.keys(joins).reduce((acc, name) => {

@@ -70,18 +70,6 @@ def test_a_gap_with_the_same_mix_is_called_across_the_board():
     assert "across the board" in rep.note
 
 
-def test_spread_ranks_what_the_average_depends_on():
-    data = (rows("electronics", "S1", "high", 2, 50) + rows("electronics", "S2", "low", 5, 50)
-            + rows("home", "S1", "high", 2, 50) + rows("home", "S2", "low", 5, 50)
-            + rows("home", "S2", "high", 2, 1))
-    rep = asyncio.run(drill.rank_average_spread({"measures": ["v.avg_score"]}, META, fake_cube(data)))
-    names = [r.candidate.member for r in rep.rankings]
-    assert names[0] in ("v.price_band", "v.seller") and names[-1] == "v.category"
-    top = rep.rankings[0]
-    assert top.score == pytest.approx(1.5, abs=0.02)
-    assert top.members[0].avg < top.members[-1].avg                 # lowest average first
-
-
 def test_totals_and_ratios_are_refused():
     scope, a, b = scopes()
     for m in ("v.total", "v.count"):
@@ -89,78 +77,3 @@ def test_totals_and_ratios_are_refused():
             asyncio.run(drill.rank_average_gap({**scope, "measures": [m]}, META, fake_cube([]),
                                                a_scope=a, b_scope=b))
     assert drill.weight_measure("v.avg_score", META) == "v.count"
-
-
-# ── the tools, as the agent calls them ────────────────────────────────────────
-
-import json
-
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.prebuilt import ToolNode
-
-from graph import agent
-
-MIX = (rows("electronics", "S1", "high", 3, 40) + rows("electronics", "S2", "high", 3, 40)
-       + rows("electronics", "S1", "low", 5, 10) + rows("electronics", "S2", "low", 5, 10)
-       + rows("home", "S1", "high", 3, 10) + rows("home", "S2", "high", 3, 10)
-       + rows("home", "S1", "low", 5, 40) + rows("home", "S2", "low", 5, 40))
-
-
-def _patch(monkeypatch, data):
-    cube = fake_cube(data)
-
-    async def meta():
-        return META, []
-
-    async def load(client, q):
-        q = {**q, "time_dimensions": q.pop("timeDimensions", [])}
-        return {"data": await cube(q)}
-
-    async def context(client, measure, view_meta):
-        return None, None
-
-    monkeypatch.setattr(agent, "_fetch_cube_metadata", meta)
-    monkeypatch.setattr(agent, "_cube_load", load)
-    monkeypatch.setattr(agent, "drill_context", context)
-
-
-async def _call(tool, args, built):
-    history = [HumanMessage(content="why is electronics rated lower?"),
-               ToolMessage(content=json.dumps(built), name="build_query", tool_call_id="b1"),
-               AIMessage(content="", tool_calls=[{"id": "t1", "name": tool.name, "args": args}])]
-    out = await ToolNode([tool]).ainvoke({"messages": history})
-    return json.loads(out["messages"][-1].content)
-
-
-async def test_compare_segments_names_the_make_up_and_drops_the_segments_own_filter(monkeypatch):
-    _patch(monkeypatch, MIX)
-    built = {"measures": ["v.avg_score"], "dimensions": ["v.category"],
-             "filters": [{"member": "v.category", "operator": "equals", "values": ["electronics"]}]}
-    out = await _call(agent.compare_segments, {
-        "measure": "v.avg_score", "segment_dimension": "v.category", "segment_values": ["electronics"],
-        "filters": built["filters"]}, built)
-    assert (out["avg_others"], out["avg_segment"], out["gap"]) == (4.6, 3.4, -1.2)
-    top = out["drivers"][0]
-    assert top["dimension"] == "v.price_band" and top["explained_by_make_up"] == 1.0
-    assert out["chart_query"]["dimensions"] == ["v.price_band", "v.category"]
-
-
-async def test_key_drivers_lists_lowest_members_first(monkeypatch):
-    _patch(monkeypatch, MIX)
-    built = {"measures": ["v.avg_score"]}
-    out = await _call(agent.key_drivers, {"measure": "v.avg_score"}, built)
-    top = out["drivers"][0]
-    assert top["dimension"] == "v.price_band" and top["lowest"][0]["value"] == "high"
-    assert top["highest"][0]["value"] == "low"
-
-
-async def test_both_need_build_query_first(monkeypatch):
-    _patch(monkeypatch, MIX)
-    out = await _call(agent.key_drivers, {"measure": "v.avg_score"}, {"measures": ["v.count"]})
-    assert out["guard"] == "build_query_required"
-
-
-async def test_a_total_gets_pointed_elsewhere(monkeypatch):
-    _patch(monkeypatch, MIX)
-    out = await _call(agent.key_drivers, {"measure": "v.total"}, {"measures": ["v.total"]})
-    assert "averages" in out["instruction"] and "explain_change" in out["instruction"]

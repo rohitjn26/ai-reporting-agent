@@ -195,7 +195,9 @@ def join_edges(sql: str) -> list[tuple[str, str]]:
 def alias_tables(sql: str) -> dict[str, tuple[str, str]]:
     """{cube alias: (schema, table)} from the FROM/JOIN clauses of Cube-generated SQL,
     e.g. `LEFT JOIN mdbl.c_site AS "mdbl_c_site"` -> {"mdbl_c_site": ("mdbl", "c_site")}."""
-    return {alias: (schema, table) for schema, table, alias in re.findall(
+    # With a one-to-many join Cube moves the measure into a subquery and prefixes the
+    # aliases there ("us_ecom_order_reviews_key__us_ecom_customers"); key by the cube name.
+    return {alias.split("_key__", 1)[-1]: (schema, table) for schema, table, alias in re.findall(
         r'(?:FROM|JOIN)\s+"?(\w+)"?\."?(\w+)"?\s+AS\s+"(\w+)"', sql, flags=re.I)}
 
 
@@ -830,9 +832,6 @@ async def rank_breakdown(
 #
 # A dimension explains the gap when its mix part is large. When no dimension's
 # mix does, B is lower (or higher) across the board.
-#
-# For one group on its own, a dimension matters when its members' averages spread
-# out: score = the rows-weighted standard deviation of the member averages.
 
 MIX_EXPLAINS = 0.25     # under this share of the gap, no dimension's mix explains it
 
@@ -879,33 +878,6 @@ class GapReport:
     rankings: list[GapRanking]
     skipped: dict[str, str] = field(default_factory=dict)
     note: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-@dataclass
-class MemberAverage:
-    value: Any
-    rows: float
-    share: float
-    avg: float
-
-
-@dataclass
-class SpreadRanking:
-    candidate: Candidate
-    score: float            # rows-weighted standard deviation of the member averages
-    members: list[MemberAverage]    # lowest average first
-
-
-@dataclass
-class SpreadReport:
-    measure: str
-    avg: float
-    rows: float
-    rankings: list[SpreadRanking]
-    skipped: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1028,53 +1000,3 @@ async def rank_average_gap(
                        "across the board — the same members score differently, not a different mix")
     return report
 
-
-async def rank_average_spread(
-    scope: dict,
-    view_meta: list[dict],
-    run: Run,
-    *,
-    max_candidates: int = 24,
-    max_members: int = 50,
-    min_share: float = 0.01,
-    distances: Optional[dict[str, tuple[int, int]]] = None,
-    stats: Optional[dict] = None,
-) -> SpreadReport:
-    """Rank the dimensions whose members' averages differ most within scope: what the
-    average depends on. Raises NotAdditive like rank_average_gap."""
-    measure = scope["measures"][0]
-    weight = weight_measure(measure, view_meta)
-    if not weight:
-        raise NotAdditive(f"'{measure}' isn't an average with a row count on its cube")
-    cands = [c for c in candidates(scope, view_meta, distances, stats) if not c.is_time][:max_candidates]
-    queries = [_avg_query(scope, measure, weight, None, max_members)]
-    queries += [_avg_query(scope, measure, weight, c, max_members) for c in cands]
-    results = await asyncio.gather(*(run(q) for q in queries), return_exceptions=True)
-    if isinstance(results[0], BaseException):
-        raise results[0]
-    n0, s0 = _avg_side(results[0], None, measure, weight)
-    rows = sum(n0.values())
-    overall = sum(s0.values()) / rows if rows else 0.0
-    report = SpreadReport(measure, overall, rows, [])
-
-    for c, res in zip(cands, results[1:]):
-        side = [] if isinstance(res, BaseException) else [_avg_side(res, c, measure, weight)]
-        why = _avg_skip([res], c, [rows], side, max_members)
-        if why:
-            report.skipped[c.member] = why
-            continue
-        n, s = side[0]
-        n, s = _fold_small(n, min_share, n, s)
-        if len(n) < 2:
-            report.skipped[c.member] = "only one member"
-            continue
-        total = sum(n.values()) or 1.0
-        members = [MemberAverage(k, n[k], n[k] / total, s[k] / n[k]) for k in n if n[k]]
-        spread = math.sqrt(sum(m.rows * (m.avg - overall) ** 2 for m in members) / total)
-        members.sort(key=lambda m: (m.avg, str(m.value)))
-        report.rankings.append(SpreadRanking(c, spread, members))
-
-    report.rankings = _drop_duplicates(
-        report.rankings, lambda m: (str(m.value), m.rows), report.skipped)
-    report.rankings.sort(key=_sort_key)
-    return report

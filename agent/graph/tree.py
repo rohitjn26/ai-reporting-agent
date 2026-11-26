@@ -318,8 +318,9 @@ def _sortable(v):
 
 def merge_categories(groups: dict, ordered: bool, min_effect: float, alpha: float = ALPHA) -> list[tuple[list, Stat]]:
     """CHAID merging: repeatedly join the two most alike categories (adjacent ones for an
-    ordered dimension such as time) while they don't differ significantly — or, when
-    the spread is unknown, while their averages are closer than half the minimum effect."""
+    ordered dimension such as time) while they don't differ significantly, or their
+    averages are closer than half the minimum effect (with ~1M rows, 0.01★ is
+    "significant" but too small to keep apart)."""
     items = sorted(([[k], g] for k, g in groups.items()), key=lambda kv: _sortable(kv[0][0]))
     while len(items) > 1:
         pairs = [(i, i + 1) for i in range(len(items) - 1)] if ordered else \
@@ -327,8 +328,10 @@ def merge_categories(groups: dict, ordered: bool, min_effect: float, alpha: floa
 
         def alike(ij):
             a, b = items[ij[0]][1], items[ij[1]][1]
+            if abs(a.mean - b.mean) < min_effect / 2:   # too close to matter, however "significant"
+                return 1.0
             p = anova_p([a, b])
-            return p if p is not None else (1.0 if abs(a.mean - b.mean) < min_effect / 2 else 0.0)
+            return p if p is not None else 0.0
 
         i, j = max(pairs, key=alike)
         if alike((i, j)) <= alpha:

@@ -159,3 +159,10 @@ def test_a_dimension_that_restates_the_value_is_left_out():
     c = ratings(pairs)
     echoes = tree.restating(c, ["delay", "state", "pay"])     # "delay" holds the title here
     assert list(echoes) == ["delay"] and "restates" in echoes["delay"]
+
+
+def test_significant_but_tiny_differences_are_merged():
+    # 3.76 / 3.77 / 3.78 on 200k rows each: "significant", but 0.01★ apart — one branch
+    pairs = [(("x", s, "card"), spread(m, 200_000)) for s, m in [("a", 3.76), ("b", 3.77), ("c", 3.78), ("d", 4.35)]]
+    root = tree.grow(ratings(pairs), DIMS, ordered=set())
+    assert [b.values for b in root.branches] == [["a", "b", "c"], ["d"]]

@@ -406,6 +406,11 @@ async def discovery_publish(request: Request):
         return {**plan, "problem": problem}
     try:
         loaded = await asyncio.to_thread(pub.load_data, draft, pub.DEFAULT_PG_URL, plan["load_tables"])
+        try:   # child counts / totals on parent tables, so "bigger orders rate lower" is findable
+            sizes = await asyncio.to_thread(pub.compute_parent_sizes, draft, pub.DEFAULT_PG_URL)
+            plan["size_dimensions"] = pub.add_size_dimensions(draft, sizes)
+        except Exception as e:   # an optimisation: never fail a publish over it
+            plan["size_dimensions_error"] = str(e)
         done = await asyncio.to_thread(pub.upsert_library, draft, library)
     except Exception as e:
         return {**plan, "error": f"publish failed: {e}"}

@@ -182,3 +182,41 @@ def test_upsert_failure_undoes_earlier_writes(monkeypatch):
 def test_load_data_with_no_tables_touches_nothing(shop):
     d = _draft(shop)
     assert publish.load_data(d, "postgresql://nowhere:1/x", tables=[]) == {}
+
+
+# ── parent size columns ───────────────────────────────────────────────────────
+
+def _size_draft():
+    return {"dataset": "shop", "cubes": [
+        {"name": "shop_orders", "data": {"sql": "SELECT * FROM shop.orders", "dimensions": {}, "joins": {
+            "shop_items": {"sql": "${CUBE}.order_id = ${shop_items}.order_id", "relationship": "one_to_many"},
+            "shop_customers": {"sql": "${CUBE}.customer_id = ${shop_customers.id}", "relationship": "many_to_one"}}}},
+        {"name": "shop_items", "data": {"sql": "SELECT * FROM shop.items", "joins": {}}},
+        {"name": "shop_customers", "data": {"sql": "SELECT * FROM shop.customers", "joins": {
+            "shop_orders": {"sql": "${CUBE}.id = ${shop_orders.customer_id}", "relationship": "one_to_many"}}}}],
+        "views": [{"name": "shop_view", "data": {"cubes": [
+            {"join_path": "shop_customers.shop_orders", "includes": ["count"]},
+            {"join_path": "shop_customers", "includes": "*"}]}}]}
+
+
+def test_child_links_reads_one_to_many_joins_in_both_sql_forms():
+    links = publish.child_links(_size_draft())
+    assert [(l["parent_table"], l["child_table"], l["pairs"]) for l in links] == [
+        ("orders", "items", [("order_id", "order_id")]), ("customers", "orders", [("id", "customer_id")])]
+
+
+def test_size_dimension_uses_the_count_itself_when_small_else_bands():
+    small = publish.size_dimension("items_count", "Items per Order", 6, 6, [1, 2, 3, 4])
+    assert small["sql"] == "CAST(${CUBE}.items_count AS TEXT)"
+    banded = publish.size_dimension("items_price_total", "Total", 9000, 4800.5, [250, 700, 700, 1500])
+    assert "'1: under 250'" in banded["sql"] and "'2: 250-700'" in banded["sql"]
+    assert "'4: 1,500+'" in banded["sql"]                  # duplicate cut dropped
+
+
+def test_size_dimensions_go_into_the_cube_and_listing_views():
+    d = _size_draft()
+    added = publish.add_size_dimensions(d, {"shop_orders": {"items_count_band": {"sql": "x"}}})
+    assert added == ["shop_orders.items_count_band"]
+    assert "items_count_band" in d["cubes"][0]["data"]["dimensions"]
+    entries = d["views"][0]["data"]["cubes"]
+    assert entries[0]["includes"] == ["count", "items_count_band"] and entries[1]["includes"] == "*"

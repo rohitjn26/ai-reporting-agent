@@ -246,3 +246,134 @@ def record_publish(draft: dict, state: dict | None = None) -> dict:
     }
     save_manifest(manifest)
     return manifest
+
+
+# ── parent size: how many children each row has, and their totals ────────────
+# "Big orders get lower ratings" needs "items per order" — on the parent, as a column.
+# Every one-to-many join gives its parent table a child count and the totals of a few
+# numeric child columns, computed once at publish (plain columns at query time), plus
+# a banded dimension for each so the driver tree can split on them.
+
+import math
+import re
+
+# "${CUBE}.order_id = ${items}.order_id" or "${CUBE}.order_id = ${items.order_id}"
+_JOIN_EQ = re.compile(r"\$\{CUBE\}\.(\w+)\s*=\s*\$\{(\w+)(?:\}\.(\w+)|\.(\w+)\})")
+_FROM_TABLE = re.compile(r'FROM\s+"?(\w+)"?\."?(\w+)"?', re.I)
+MAX_CHILD_TOTALS = 3      # numeric child columns totalled per join
+SIZE_BANDS = 5            # quantile bands for a total, or a count with many values
+
+
+def child_links(draft: dict) -> list[dict]:
+    """The draft's one-to-many joins: [{parent_cube, child_cube, schema, parent_table,
+    child_table, pairs: [(parent column, child column)]}]."""
+    tables = {}
+    for c in draft.get("cubes", []):
+        m = _FROM_TABLE.search((c.get("data") or {}).get("sql", ""))
+        if m:
+            tables[c["name"]] = (m.group(1), m.group(2))
+    out = []
+    for c in draft.get("cubes", []):
+        for child, j in ((c.get("data") or {}).get("joins") or {}).items():
+            if (j or {}).get("relationship") != "one_to_many" or c["name"] not in tables or child not in tables:
+                continue
+            pairs = [(p, a or b) for p, cube, a, b in _JOIN_EQ.findall(j.get("sql", "")) if cube == child]
+            if pairs and tables[c["name"]][0] == tables[child][0]:
+                out.append({"parent_cube": c["name"], "child_cube": child, "schema": tables[child][0],
+                            "parent_table": tables[c["name"]][1], "child_table": tables[child][1],
+                            "pairs": pairs})
+    return out
+
+
+def _fmt(x: float) -> str:
+    return f"{x:,.0f}" if abs(x) >= 100 else f"{x:,.2f}".rstrip("0").rstrip(".")
+
+
+def size_dimension(column: str, title: str, distinct: int, max_value: float, cuts: list[float]) -> dict:
+    """A string dimension the tree can split on: the count itself when it has few small
+    values (0-9), otherwise quantile bands ("2: 3-5") that sort in order."""
+    col = f"${{CUBE}}.{column}"
+    if max_value is not None and distinct <= 10 and max_value < 10 and float(max_value).is_integer():
+        sql = f"CAST({col} AS TEXT)"
+    else:
+        cuts = sorted(set(c for c in cuts if c is not None))
+        if not cuts:
+            sql = f"CAST({col} AS TEXT)"
+        else:
+            whens = [f"WHEN {col} < {cuts[0]} THEN '1: under {_fmt(cuts[0])}'"]
+            whens += [f"WHEN {col} < {hi} THEN '{i + 2}: {_fmt(lo)}-{_fmt(hi)}'"
+                      for i, (lo, hi) in enumerate(zip(cuts, cuts[1:]))]
+            sql = (f"CASE WHEN {col} IS NULL THEN NULL " + " ".join(whens) +
+                   f" ELSE '{len(cuts) + 1}: {_fmt(cuts[-1])}+' END")
+    return {"sql": sql, "type": "string", "title": title,
+            "description": f"{title}, in bands (computed at publish from the child rows)."}
+
+
+def add_size_dimensions(draft: dict, sizes: dict[str, dict[str, dict]]) -> list[str]:
+    """Put {parent cube: {dimension name: definition}} into the draft's cubes, and into
+    every view that lists the parent cube's members. Returns the names added."""
+    added = []
+    by_name = {c["name"]: c for c in draft.get("cubes", [])}
+    for cube, dims in sizes.items():
+        if cube not in by_name:
+            continue
+        by_name[cube]["data"].setdefault("dimensions", {}).update(dims)
+        added += [f"{cube}.{d}" for d in dims]
+        for v in draft.get("views", []):
+            for entry in (v.get("data") or {}).get("cubes", []):
+                inc = entry.get("includes")
+                if str(entry.get("join_path", "")).split(".")[-1] == cube and isinstance(inc, list):
+                    entry["includes"] = inc + [d for d in dims if d not in inc]
+    return added
+
+
+def compute_parent_sizes(draft: dict, pg_url: str = DEFAULT_PG_URL) -> dict[str, dict[str, dict]]:
+    """For each one-to-many join: index the child's join key, add `<child>_count` and up
+    to MAX_CHILD_TOTALS `<child>_<column>_total` columns to the parent table (recomputed
+    from scratch, so re-publishing stays right), and return the banded dimensions for
+    add_size_dimensions. Parents with no children get count 0."""
+    import psycopg
+    sizes: dict[str, dict[str, dict]] = {}
+    with psycopg.connect(pg_url, autocommit=True) as con:
+        for link in child_links(draft):
+            s, p, ch = link["schema"], link["parent_table"], link["child_table"]
+            pcols, ccols = [a for a, _ in link["pairs"]], [b for _, b in link["pairs"]]
+            numeric = [r[0] for r in con.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s "
+                "AND table_name = %s AND data_type IN ('integer','bigint','smallint','numeric',"
+                "'real','double precision') ORDER BY ordinal_position", (s, ch)).fetchall()
+                if r[0] not in ccols and not r[0].lower().endswith("id")
+                and not r[0].endswith(("_count", "_total"))]
+            # a numeric column that is nearly all distinct is a row number, not a quantity
+            numeric = [c for c in numeric if con.execute(
+                f"SELECT COUNT(DISTINCT {_quote(c)}) < 0.9 * COUNT(*) FROM {_quote(s)}.{_quote(ch)}"
+            ).fetchone()[0]][:MAX_CHILD_TOTALS]
+            count_col = f"{ch}_count"
+            totals = {f"{ch}_{c}_total": c for c in numeric}
+            q, P, C = _quote, f"{_quote(s)}.{_quote(p)}", f"{_quote(s)}.{_quote(ch)}"
+            con.execute(f"CREATE INDEX IF NOT EXISTS {q(ch + '_' + '_'.join(ccols) + '_idx')} "
+                        f"ON {C} ({', '.join(q(c) for c in ccols)})")
+            con.execute(f"ALTER TABLE {P} " + ", ".join(
+                [f"ADD COLUMN IF NOT EXISTS {q(count_col)} BIGINT"] +
+                [f"ADD COLUMN IF NOT EXISTS {q(t)} DOUBLE PRECISION" for t in totals]))
+            con.execute(f"UPDATE {P} SET {q(count_col)} = 0" +
+                        "".join(f", {q(t)} = NULL" for t in totals))
+            agg = ", ".join([f"COUNT(*) AS n"] + [f"SUM({q(c)}) AS {q(t)}" for t, c in totals.items()])
+            con.execute(
+                f"UPDATE {P} AS p SET {q(count_col)} = a.n" + "".join(f", {q(t)} = a.{q(t)}" for t in totals) +
+                f" FROM (SELECT {', '.join(q(c) for c in ccols)}, {agg} FROM {C} GROUP BY "
+                f"{', '.join(q(c) for c in ccols)}) AS a WHERE " +
+                " AND ".join(f"p.{q(pc)} = a.{q(cc)}" for pc, cc in link["pairs"]))
+            dims = {}
+            for col in [count_col, *totals]:
+                distinct, top = con.execute(f"SELECT COUNT(DISTINCT {q(col)}), MAX({q(col)}) FROM {P}").fetchone()
+                cuts = con.execute(
+                    f"SELECT percentile_disc(ARRAY[{', '.join(str((i + 1) / SIZE_BANDS) for i in range(SIZE_BANDS - 1))}]) "
+                    f"WITHIN GROUP (ORDER BY {q(col)}) FROM {P} WHERE {q(col)} IS NOT NULL").fetchone()[0] or []
+                pretty = col.replace("_", " ").title()
+                one = p[:-1] if p.endswith("s") and not p.endswith("ss") else p   # "orders" -> "order"
+                title = f"{ch.replace('_', ' ').title()} per {one.replace('_', ' ').title()}" if col == count_col else pretty
+                dims[f"{col}_band"] = size_dimension(col, title, distinct or 0, top,
+                                                     [float(c) for c in cuts if c is not None])
+            sizes.setdefault(link["parent_cube"], {}).update(dims)
+    return sizes

@@ -979,13 +979,23 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
     extra = n_buckets * (n_values if rating else 1) * n_compare
     picked, skipped = tree.pick_candidates(ordered_names, view_meta, safe, fans, stats, extra)
 
+    # big tables: a reproducible random share of rows, through the grain's sample bucket
+    value_set = [{"member": value, "operator": "set"}] if value and rating else []
+    all_rows = sum(drill._num(r.get(weight)) for r in await run(
+        {"measures": [weight], "filters": filters + value_set}))
+    share = tree.sample_share(all_rows)
+    bucket = next((d["name"] for d in dims_meta.values() if d.get("aliasMember") == f"{start}.sample_bucket"), None)
+    sample = [{"member": bucket, "operator": "lt", "values": [str(share)]}] if share < 100 and bucket else []
+    if share < 100 and not bucket:
+        share = 100   # no sample bucket on this cube: explain all rows, slower
+
     for attempt in range(3):
         dims = picked + ([compare["dimension"]] if compare else []) + ([value] if rating else [])
         q = {"measures": [weight] + ([] if rating else [measure]), "dimensions": dims,
-             "filters": filters, "limit": tree.CELL_LIMIT}
+             "filters": filters + sample, "limit": tree.CELL_LIMIT}
         if time_dim:
             q["time_dimensions"] = [{"dimension": time_dim, "granularity": gran}]
-        key = (view, measure, per, json.dumps(filters, sort_keys=True), tuple(dims), time_dim, gran)
+        key = (view, measure, per, json.dumps(filters + sample, sort_keys=True), tuple(dims), time_dim, gran)
         cells = tree.cache_get(key)
         if cells is None:
             rows = await run(q)
@@ -997,9 +1007,8 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
                 for row in rows:
                     row[tkey] = _time_label(row.get(tkey) or row.get(time_dim), gran)
             key_dims = [d for d in dims if d != value] + ([tkey] if tkey else [])
-            total_q = {"measures": [weight], "filters": filters + (
-                [{"member": value, "operator": "set"}] if value and rating else [])}
-            total = sum(drill._num(r.get(weight)) for r in await run(total_q))
+            total = all_rows if not sample else sum(drill._num(r.get(weight)) for r in await run(
+                {"measures": [weight], "filters": filters + value_set + sample}))
             cells = tree.Cells(key_dims, tree.cells_from_rows(rows, key_dims, weight, value if rating else None,
                                                               measure), rating, per, total, start)
             tree.cache_put(key, cells)
@@ -1013,7 +1022,9 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
                          "some dimension counts rows more than once, so the tree would be wrong"}
     cands = picked + ([f"{time_dim}.{gran}"] if time_dim else [])
     ordered = {f"{time_dim}.{gran}"} if time_dim else set()
-    return cells, cands, ordered, skipped
+    note = ({"share_percent": share, "rows_used": round(cells.total), "rows_total": round(all_rows)}
+            if sample else None)
+    return cells, cands, ordered, skipped, note
 
 
 @tool
@@ -1050,7 +1061,8 @@ async def explain_average(
         branches with their values, p), dimensions left out and why, and for a comparison
         the gap split into make-up vs within-member differences. A tree with no split means
         nothing checked moves the average by the minimum effect — say so; don't guess.
-        `chart_query` (when given) charts the top split.
+        `chart_query` (when given) charts the top split. With `sample`, a big table was
+        explained from a random share of its rows: say so ("based on a 10% sample").
     """
     filters = [f for f in filters if not (compare and f.get("member") == compare.get("dimension"))]
     wanted = {"measures": [measure], "filters": filters,
@@ -1065,7 +1077,7 @@ async def explain_average(
         got = await _tree_inputs(run, view_meta, stats, measure, filters, compare, per_item)
         if isinstance(got, dict):
             return got
-        cells, cands, ordered, skipped = got
+        cells, cands, ordered, skipped, sample = got
         per_item_used = cells.grain != drill.measure_cube({"measures": [measure]}, view_meta)
         echoes = tree.restating(cells, cands)
         cands = [c for c in cands if c not in echoes]
@@ -1101,6 +1113,8 @@ async def explain_average(
                 out["chart_query"] = chart
         if skipped:
             out["left_out"] = skipped
+        if sample:   # the answer must say it's a sample
+            out["sample"] = sample
         return out
 
     return json.dumps(await _on_engine(measure, work), default=str)

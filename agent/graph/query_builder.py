@@ -131,6 +131,8 @@ def render_schema(metadata: list[dict]) -> str:
                 continue
             lines.append(f"  {kind.capitalize()}:")
             for m in members:
+                if m["name"].endswith("sample_bucket"):   # internal (sampling), not a business field
+                    continue
                 title = m.get("shortTitle") or m.get("title") or ""
                 desc = f" — {m['description']}" if m.get("description") else ""
                 lines.append(f"    {m['name']}  ({m['type']}) {title}{desc}")

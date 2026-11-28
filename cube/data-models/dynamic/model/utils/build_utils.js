@@ -103,11 +103,37 @@ export const viewSqlAlias = (name) => {
   return `v_${h.toString(36)}`;
 };
 
-export const transformView = (viewData) => {
-  const cubes = (viewData.cubes || []).map((entry) => ({
-    ...entry,
-    join_path: joinPathToFunction(entry.join_path),
-  }));
+// Every cube with a primary key gets SAMPLE_DIM: a stable 0-99 hash of the key, so the
+// driver tree can explain a big table from a reproducible sample (`< 10` = 10%) instead
+// of scanning and joining every row. Postgres hashtext.
+export const SAMPLE_DIM = 'sample_bucket';
+
+export const withSampleBucket = (dimensions) => {
+  const pk = Object.values(dimensions || {}).find((d) => d && (d.primary_key || d.primaryKey));
+  if (!pk || !pk.sql || (dimensions || {})[SAMPLE_DIM]) return dimensions;
+  const key = /^\w+$/.test(pk.sql) ? `\${CUBE}.${pk.sql}` : pk.sql;   // bare column: qualify it
+  return {
+    ...dimensions,
+    [SAMPLE_DIM]: {
+      sql: `MOD(ABS(HASHTEXT(CAST((${key}) AS TEXT))), 100)`,
+      type: 'number',
+      title: 'Sample bucket (internal)',
+      description: 'Internal, for sampling large tables: a stable 0-99 hash of the row key. Not a business field.',
+    },
+  };
+};
+
+export const transformView = (viewData, sampledCubes = new Set()) => {
+  const cubes = (viewData.cubes || []).map((entry) => {
+    const cube = String(entry.join_path).split('.').pop();
+    const inc = entry.includes;
+    // a view that lists its members wouldn't show the sample bucket otherwise
+    // unprefixed views would get one sample_bucket per cube under the same name: alias it
+    const member = entry.prefix ? SAMPLE_DIM : { name: SAMPLE_DIM, alias: `${cube}_${SAMPLE_DIM}` };
+    const includes = Array.isArray(inc) && sampledCubes.has(cube) && !inc.includes(SAMPLE_DIM)
+      ? [...inc, member] : inc;
+    return { ...entry, includes, join_path: joinPathToFunction(entry.join_path) };
+  });
   const view = { cubes };
   const alias = viewSqlAlias(viewData.name);
   if (alias) view.sqlAlias = alias;

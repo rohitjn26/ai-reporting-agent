@@ -17,6 +17,7 @@ META = [{"name": V, "measures": [
     {"name": "v.total", "aggType": "sum", "aliasMember": "items.total"}],
     "dimensions": [
         {"name": "v.score", "type": "number", "aliasMember": "reviews.score"},
+        {"name": "v.reviews_sample_bucket", "type": "number", "aliasMember": "reviews.sample_bucket"},
         {"name": "v.created", "type": "time", "aliasMember": "reviews.created"},
         {"name": "v.delay", "type": "string", "aliasMember": "orders.delay"},
         {"name": "v.state", "type": "string", "aliasMember": "customers.state"},
@@ -45,7 +46,7 @@ def make_orders():
         cats = random.choice([["electronics"], ["electronics", "home"], ["home"]])
         late_p = 0.6 if "electronics" in cats else 0.1
         delay = "late" if random.random() < late_p else "on_time"
-        orders.append({"delay": delay, "state": random.choice(["SP", "RJ"]),
+        orders.append({"delay": delay, "state": random.choice(["SP", "RJ"]), "bucket": i % 100,
                        "score": random.choice([1, 2, 3, 4] if delay == "late" else [4, 5]),
                        "year": random.choice(["2023", "2024"]),
                        "items": cats})
@@ -63,6 +64,9 @@ async def fake_run(q):
     groups = {}
     for o in ORDERS:
         if any(f.get("operator") == "set" for f in q.get("filters", [])) and o["score"] is None:
+            continue
+        if any(f["member"].endswith("sample_bucket") and o["bucket"] >= int(f["values"][0])
+               for f in q.get("filters", []) if f.get("operator") == "lt"):
             continue
         rows = [dict(o, category=c) for c in o["items"]] if per_item else [o]
         for r in rows:
@@ -176,3 +180,11 @@ async def test_needs_build_query_and_an_average():
     assert out["guard"] == "build_query_required"
     out = await _call({"measure": "v.total"}, {"measures": ["v.total"]})
     assert "averages" in out["instruction"]
+
+
+async def test_a_big_table_is_explained_from_a_sample(monkeypatch):
+    monkeypatch.setattr(tree, "SAMPLE_ABOVE", 1000)
+    monkeypatch.setattr(tree, "SAMPLE_TARGET", 1000)      # 4000 reviews -> keep 25%
+    out = await _call({"measure": "v.avg_score"}, {"measures": ["v.avg_score"]})
+    assert out["sample"] == {"share_percent": 25, "rows_used": 1000, "rows_total": 4000}
+    assert out["tree"]["rows"] == 1000 and out["tree"]["split_by"] == "v.delay"

@@ -44,6 +44,8 @@ MAX_CANDIDATES = 8
 CELL_LIMIT = 50_000            # Cube's default row cap; a full result means "too many cells"
 CELL_BUDGET = 5_000_000        # estimated combinations allowed: real ones are far fewer,
                                # and a full result just drops one dimension and retries
+SAMPLE_ABOVE = int(os.environ.get("TREE_SAMPLE_ABOVE", "2000000"))    # rows; sample past this
+SAMPLE_TARGET = int(os.environ.get("TREE_SAMPLE_TARGET", "1000000"))  # about this many rows
 RATING_MAX_VALUES = 11         # a value with ≤ this many distinct values is a rating scale
 BLANK = "(blank)"
 
@@ -523,6 +525,13 @@ def value_dimension(measure: str, view_meta: list[dict], configs: list[dict]) ->
         return None
     return next((d["name"] for d in drill._view_members(view_meta, view, "dimensions")
                  if d.get("aliasMember") == f"{cube}.{col}"), None)
+
+
+def sample_share(total_rows: float) -> int:
+    """Percent of rows to keep (1-100): all of them up to SAMPLE_ABOVE, else ≈SAMPLE_TARGET."""
+    if total_rows <= SAMPLE_ABOVE:
+        return 100
+    return max(1, min(100, math.ceil(100 * SAMPLE_TARGET / total_rows)))
 
 
 def cube_title(cube: str, view_meta: list[dict], configs: list[dict]) -> str:

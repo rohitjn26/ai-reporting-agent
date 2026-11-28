@@ -3,6 +3,7 @@ import {
   transformMeasures,
   transformJoins,
   transformView,
+  withSampleBucket,
   validateCubeSchema,
   validateViewSchema,
 } from './model/utils/build_utils.js';
@@ -19,6 +20,8 @@ const fetchResources = async (url) => {
   const { data = [] } = await resp.json();
   return data;
 };
+
+const sampledCubes = new Set();   // cubes that got a sample bucket (see withSampleBucket)
 
 asyncModule(async () => {
   // 1) Base cubes — single-table, with joins declared here so views can traverse
@@ -51,10 +54,11 @@ asyncModule(async () => {
           ...(cubeData.title ? { title: cubeData.title } : {}),
           ...(cubeData.description ? { description: cubeData.description } : {}),
           refreshKey: { every: '10 second' },
-          dimensions: transformDimensions(cubeData.dimensions || {}),
+          dimensions: transformDimensions(withSampleBucket(cubeData.dimensions || {})),
           measures:   transformMeasures(cubeData.measures   || {}),
           joins:      transformJoins(cubeData.joins         || {}),
         });
+        if (withSampleBucket(cubeData.dimensions || {}) !== (cubeData.dimensions || {})) sampledCubes.add(cubeName);
         log('Registered cube:', cubeName);
       } catch (err) {
         error(`Failed to register cube ${cubeName}:`, err.message);
@@ -89,7 +93,7 @@ asyncModule(async () => {
       }
 
       try {
-        view(viewName, transformView(viewData));
+        view(viewName, transformView(viewData, sampledCubes));
         log('Registered view:', viewName);
       } catch (err) {
         error(`Failed to register view ${viewName}:`, err.message);

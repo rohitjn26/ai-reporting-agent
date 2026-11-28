@@ -114,7 +114,7 @@ def format_metadata(entries: list[dict], view: str = "") -> str:
         lines += [_fmt(m) for m in c["measures"]]
     if c.get("dimensions"):
         lines.append("  Dimensions:")
-        lines += [_fmt(d) for d in c["dimensions"]]
+        lines += [_fmt(d) for d in c["dimensions"] if not d["name"].endswith("sample_bucket")]
     return "\n".join(lines)
 
 

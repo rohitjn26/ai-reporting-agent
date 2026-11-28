@@ -211,3 +211,11 @@ async def test_a_field_whose_sql_fails_is_left_out_not_fatal():
         agent._plan_error = real
     assert "v.state" not in out["checked"] and "its SQL fails" in out["left_out"]["v.state"]
     assert out["tree"]["split_by"] == "v.delay"
+
+
+async def test_a_filter_on_a_per_item_dimension_switches_to_per_item():
+    built = {"measures": ["v.avg_score"],
+             "filters": [{"member": "v.category", "operator": "equals", "values": ["electronics"]}]}
+    out = await _call({"measure": "v.avg_score", "filters": built["filters"]}, built)
+    assert out["per"] == "items" and "v.category" in out["why_per"]
+    assert out["tree"]["split_by"] == "v.delay"

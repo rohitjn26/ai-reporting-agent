@@ -45,6 +45,36 @@ class TimeDimension(BaseModel):
     dateRange: Optional[Any] = None            # e.g. "last 30 days" or [from, to]
 
 
+def normalize_filters(filters: list) -> list:
+    """Cube's filter shape, whatever the model wrote: {"view.member": "value"} or
+    {"dimension": ...} become {"member", "operator": "equals", "values": [...]};
+    and/or groups are normalised inside. Anything unrecognisable is dropped."""
+    out = []
+    for f in filters or []:
+        if not isinstance(f, dict):
+            continue
+        for group in ("and", "or"):
+            if isinstance(f.get(group), list):
+                out.append({group: normalize_filters(f[group])})
+                break
+        else:
+            if f.get("member") or f.get("dimension"):
+                g = {**f, "member": f.get("member") or f.get("dimension")}
+                g.pop("dimension", None)
+                g.setdefault("operator", "equals")
+                if "values" in g and not isinstance(g["values"], list):
+                    g["values"] = [g["values"]]
+                if "values" in g:
+                    g["values"] = [str(v) for v in g["values"]]
+                out.append(g)
+            elif len(f) == 1:   # shorthand {"view.member": value}
+                (member, value), = f.items()
+                if isinstance(member, str) and "." in member:
+                    vals = value if isinstance(value, list) else [value]
+                    out.append({"member": member, "operator": "equals", "values": [str(v) for v in vals]})
+    return out
+
+
 class CubeQuery(BaseModel):
     measures: list[str] = Field(default_factory=list)
     dimensions: list[str] = Field(default_factory=list)
@@ -69,7 +99,7 @@ class CubeQuery(BaseModel):
         if self.dimensions:
             q["dimensions"] = self.dimensions
         if self.filters:
-            q["filters"] = self.filters
+            q["filters"] = normalize_filters(self.filters)
         if self.time_dimensions:
             q["time_dimensions"] = [t.model_dump(exclude_none=True) for t in self.time_dimensions]
         if self.order:
@@ -272,13 +302,18 @@ def select_view(
     llm=None,
     cubes: list[dict] | None = None,
     config=None,
+    previous_view: str | None = None,
 ) -> ViewSelection:
     """Route a request to exactly one view. Returns ViewSelection(view=None) when
-    the request would need to span views (Cube can't answer that in one query)."""
+    the request would need to span views (Cube can't answer that in one query).
+    `previous_view`: the view the conversation has been using — kept for follow-ups."""
     llm = llm or _default_view_llm(model or os.environ.get("VIEW_SELECTOR_MODEL", "claude-haiku-4-5-20251001"))
     msgs = [("system", _SELECT_SYSTEM), ("human", _cached(f"Views:\n{render_view_catalog(metadata, cubes)}"))]
     if context:
         msgs.append(("human", f"Recent conversation (for follow-ups):\n{context}"))
+    if previous_view and any(c.get("name") == previous_view for c in metadata):
+        msgs.append(("human", f"This conversation has been using the view {previous_view}. Keep "
+                              "using it unless the request clearly needs data only another view has."))
     msgs.append(("human", f"Request: {request}"))
     return _call(llm, msgs, config)
 
@@ -292,6 +327,7 @@ def _resolve_view(
     view_llm,
     cubes: list[dict] | None = None,
     config=None,
+    previous_view: str | None = None,
 ) -> tuple[list[dict] | None, str | None, str]:
     """Pick the single view this request lives in -> (view_metadata, error, reason).
     With 0–1 views there's nothing to route. `error` is set (and metadata None)
@@ -300,7 +336,7 @@ def _resolve_view(
     if len(metadata) <= 1:
         return metadata, None, "the only view available"
     sel = select_view(request, metadata, context=context, model=model, llm=view_llm, cubes=cubes,
-                      config=config)
+                      config=config, previous_view=previous_view)
     if not sel.view:
         return None, sel.reason or "request spans multiple views and can't be answered in one query", ""
     view_meta = [c for c in metadata if c.get("name") == sel.view]
@@ -364,6 +400,7 @@ def build_query(
     cubes: list[dict] | None = None,
     examples_fn: Callable[[str, list[dict]], list[dict]] | None = None,
     config=None,
+    previous_view: str | None = None,
 ) -> dict:
     """NL → validated Cube query dict. Routes to a single view first (a query can
     never span views), builds against only that view's slice, then repairs static
@@ -376,7 +413,7 @@ def build_query(
     forwarded to every LLM call."""
     view_meta, view_error, view_reason = _resolve_view(request, metadata, context=context,
                                                        model=model, view_llm=view_llm, cubes=cubes,
-                                                       config=config)
+                                                       config=config, previous_view=previous_view)
     if view_error:
         return {"_view_error": view_error}
 

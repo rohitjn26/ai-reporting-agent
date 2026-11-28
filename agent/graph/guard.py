@@ -110,6 +110,9 @@ def check_provenance(query: dict, messages: list) -> str | None:
 
     chosen = set().union(*(query_members(b) for b in usable))
     extra = sorted(wanted - chosen)
+    if not extra:   # every field was built, just never all in one query
+        return ("Rejected: no single build_query result has all of these fields together. Call "
+                "build_query again for exactly this query, then pass its fields unchanged.")
     return ("Rejected: these fields did not come from build_query: " + ", ".join(extra) +
             ". Call build_query again (put the change you want, or the Cube error you are "
             "fixing, in `context`), then pass its fields to query_cube unchanged.")

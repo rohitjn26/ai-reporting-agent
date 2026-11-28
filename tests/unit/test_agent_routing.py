@@ -169,7 +169,7 @@ def _build_with_meta_error(monkeypatch, exc):
     async def boom():
         raise exc
     monkeypatch.setattr(agent, "_fetch_cube_metadata", boom)
-    return json.loads(asyncio.run(agent.build_query.ainvoke({"request": "compliance by site"})))
+    return json.loads(asyncio.run(agent.build_query.ainvoke({"request": "compliance by site", "state": {"messages": []}})))
 
 
 def test_build_query_stops_on_schema_compile_error(monkeypatch):

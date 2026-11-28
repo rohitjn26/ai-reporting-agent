@@ -174,17 +174,24 @@ For an AVERAGE (a rating, an average price) explain_change also splits the chang
 make-up (drivers' make_up_part) and within-member differences.
 
 WHAT AN AVERAGE DEPENDS ON, OR WHY ONE GROUP DIFFERS — don't test causes one by one:
-- "What explains the low ratings?", "what affects X?", "when did the low ratings come in?"
-  -> build_query (the average, with the group's filters), then explain_average(measure, filters).
-- "Why does electronics rate lower than the rest?" -> build_query (the average by that
-  dimension), then explain_average(measure, filters, compare={"dimension", "values"}).
+- A group vs the others — "why does electronics rate lowest / toys highest?", "why is X
+  lower than the rest?" -> build_query (the average by that dimension), then
+  explain_average(measure, compare={"dimension": ..., "values": [the group]}). Never answer
+  these with a filter to the group: a tree inside one group says what varies within it,
+  not why it differs from the others.
+- What drives it within one group or overall — "what explains the low ratings?", "what
+  affects X in electronics?", "when did they come in?" -> explain_average(measure, filters).
 explain_average checks every sensible dimension and time at once and returns a tree.
-Narrate it top-down with numbers ("late deliveries average 2.9★ vs 4.2★ on time; within
-late ones, ..."), and always say what is counted (`per`: per review, per order item, ...). Mention dimensions
-in `left_out` only if the user asked about them. A tree with no split, or a comparison
-with "note", is a finding: say plainly nothing checked explains it / the gap is across the
-board. Never call a difference under `minimum_effect` meaningful. To chart, pass
-`chart_query` to query_cube unchanged.
+Narrate it top-down with numbers, and say what is counted (`per`, and `why_per` if given)
+and whether it was a sample. Only claim what the result shows:
+- A comparison: say how much of the gap the top dimension's make-up explains; if it has
+  "note", the group differs across the board — say exactly that.
+- A tree: only its splits are drivers. Dimensions in `checked` without a split did NOT
+  move the average by `minimum_effect` — say "nothing else checked explains it", never
+  "secondary impact".
+- Never offer causes the data didn't test ("bought in smaller batches", "quality issues").
+  If one is worth checking, run the comparison that tests it.
+To chart, pass `chart_query` to query_cube unchanged.
 
 IMPORTANT query rules:
 - If build_query returns "_cube_unavailable", Cube is down or its schema is broken.
@@ -570,7 +577,8 @@ async def run_cube_query(query: dict, limit: int = 50) -> dict:
 
 
 @tool
-async def build_query(request: str, config: RunnableConfig, context: str = "") -> str:
+async def build_query(request: str, config: RunnableConfig, state: Annotated[dict, InjectedState],
+                      context: str = "") -> str:
     """
     Translate a natural-language data request into a validated Cube query.
 
@@ -614,9 +622,20 @@ async def build_query(request: str, config: RunnableConfig, context: str = "") -
     # build_query is sync (structured LLM call) — run off the event loop.
     # examples_fn: past requests users confirmed/corrected on the chosen view,
     # shown to the model as few-shot examples (graph/feedback.py).
+    # the view the conversation is on, so a follow-up isn't routed to another dataset
+    previous = None
+    for m in reversed(state.get("messages", [])):
+        if isinstance(m, ToolMessage) and m.name == "build_query":
+            try:
+                previous = json.loads(_tool_output_text(m.content)).get("_view")
+            except (ValueError, AttributeError):
+                previous = None
+            if previous:
+                break
     query = await asyncio.to_thread(qb.build_query, request, metadata,
                                     context=context or None, cubes=cubes,
-                                    examples_fn=feedback.examples_for, config=config)
+                                    examples_fn=feedback.examples_for, config=config,
+                                    previous_view=previous)
     if isinstance(query, dict) and query.get("_view_error"):
         # A single query can't span two views. Stop the tool chain here and hand the
         # boundary back to the model to explain — don't let it fall through to query_cube.
@@ -950,14 +969,22 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
     _, fans = tree.safe_cubes(mcube, graph)
     cmp_cube = drill._source_cube(dims_meta[compare["dimension"]]) if compare and compare.get("dimension") in dims_meta else None
 
-    if per_item is None:   # the engine decides: per item only when the comparison needs it
-        per_item = bool(cmp_cube and cmp_cube in fans)
-    if not per_item and cmp_cube in fans:
-        return {"error": f"{compare['dimension']} can't be compared per review: a review's "
-                         "order can have several. Run it per item (per_item=true)."}
+    # a filter on a one-to-many dimension (category, for a review) has no single value per
+    # row either: per row it would mean "rows whose order has any such item"
+    fan_filter = next((f["member"] for f in qb._flat_filters(filters)
+                       if f.get("member") in dims_meta and drill._source_cube(dims_meta[f["member"]]) in fans), None)
+    fan_cube = (cmp_cube if cmp_cube in fans else None) or \
+        (drill._source_cube(dims_meta[fan_filter]) if fan_filter else None)
+    if per_item is None:   # the engine decides: per item only when the question needs it
+        per_item = bool(fan_cube)
+    if not per_item and fan_cube:
+        return {"error": f"{(compare or {}).get('dimension') or fan_filter} has several values per "
+                         f"{mcube} row, so it can't be used per {mcube}. Run it per item (per_item=true)."}
+    why_per = (f"counted per item: {(compare or {}).get('dimension') if cmp_cube in fans else fan_filter} "
+               f"belongs to each item, not to each {mcube} row") if fan_cube else None
     start = mcube
     if per_item:
-        target = cmp_cube or min(fans, key=lambda f: f)   # no comparison: the first fan-out cube
+        target = fan_cube or cmp_cube or min(fans, key=lambda f: f)
         start = tree.grain_for(mcube, target, graph) if target else None
         if not start or not value:
             return {"error": "per item isn't available here: it needs a per-row value for the "
@@ -1068,7 +1095,7 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
     ordered = {f"{time_dim}.{gran}"} if time_dim else set()
     note = ({"share_percent": share, "rows_used": round(cells.total), "rows_total": round(all_rows)}
             if sample else None)
-    return cells, cands, ordered, skipped, note
+    return cells, cands, ordered, skipped, note, why_per
 
 
 @tool
@@ -1121,7 +1148,7 @@ async def explain_average(
         got = await _tree_inputs(run, view_meta, stats, measure, filters, compare, per_item)
         if isinstance(got, dict):
             return got
-        cells, cands, ordered, skipped, sample = got
+        cells, cands, ordered, skipped, sample, why_per = got
         per_item_used = cells.grain != drill.measure_cube({"measures": [measure]}, view_meta)
         echoes = tree.restating(cells, cands)
         cands = [c for c in cands if c not in echoes]
@@ -1159,6 +1186,8 @@ async def explain_average(
             out["left_out"] = skipped
         if sample:   # the answer must say it's a sample
             out["sample"] = sample
+        if why_per:
+            out["why_per"] = why_per
         return out
 
     return json.dumps(await _on_engine(measure, work), default=str)

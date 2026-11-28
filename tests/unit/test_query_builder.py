@@ -256,3 +256,39 @@ def test_view_catalog_prefers_cubes_carried_in_view_meta():
                                 "description": "People enrolled."}]},
             "dimensions": [{"name": "study.x", "aliasMember": "participant.x"}]}
     assert "  - participant (Participants): People enrolled." in qb.render_view_catalog([view])
+
+
+def test_filters_in_any_shape_come_out_in_cubes_shape():
+    assert qb.normalize_filters([
+        {"orders.country": "DE"},                                            # shorthand
+        {"orders.status": ["paid", "sent"]},
+        {"dimension": "orders.city", "values": "Berlin"},                   # old spelling
+        {"member": "orders.total", "operator": "gt", "values": [100]},
+        {"or": [{"orders.country": "FR"}, {"member": "orders.country", "operator": "notSet"}]},
+        "junk", {}]) == [
+        {"member": "orders.country", "operator": "equals", "values": ["DE"]},
+        {"member": "orders.status", "operator": "equals", "values": ["paid", "sent"]},
+        {"member": "orders.city", "values": ["Berlin"], "operator": "equals"},
+        {"member": "orders.total", "operator": "gt", "values": ["100"]},
+        {"or": [{"member": "orders.country", "operator": "equals", "values": ["FR"]},
+                {"member": "orders.country", "operator": "notSet"}]}]
+
+
+def test_build_query_returns_normalised_filters():
+    llm = FakeLLM(qb.CubeQuery(measures=["orders.total_revenue"], filters=[{"orders.country": "DE"}]))
+    q = qb.build_query("revenue in Germany", META, llm=llm)
+    assert q["filters"] == [{"member": "orders.country", "operator": "equals", "values": ["DE"]}]
+
+
+def test_router_is_told_which_view_the_conversation_uses():
+    seen = []
+
+    class Spy:
+        def invoke(self, msgs):
+            seen.extend(m[1] for m in msgs if isinstance(m[1], str))
+            return qb.ViewSelection(view="orders", reason="r")
+    qb.select_view("and by country?", MULTI, llm=Spy(), previous_view="orders")
+    assert any("has been using the view orders" in t for t in seen)
+    seen.clear()
+    qb.select_view("and by country?", MULTI, llm=Spy(), previous_view="gone_view")   # not in schema
+    assert not any("has been using" in t for t in seen)

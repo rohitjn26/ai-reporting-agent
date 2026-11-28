@@ -21,10 +21,15 @@ def ratings(pairs):
 
 
 def spread(mean, n):
-    """A 1-5 distribution of n ratings with roughly this mean."""
-    lo, hi = math_floor(mean), math_floor(mean) + 1
-    w = mean - lo
-    return {lo: round(n * (1 - w)), hi: round(n * w)} if hi <= 5 else {5: n}
+    """n ratings on 1-5 with this mean and a realistic spread (sd ≈ 1): 30% spread evenly
+    over 1-5, the rest on the two scores around what makes the mean come out right."""
+    v = min(5.0, max(1.0, (mean - 0.3 * 3) / 0.7))
+    lo = min(4, math_floor(v))
+    w = v - lo
+    dist = {k: 0.3 * n / 5 for k in range(1, 6)}
+    dist[lo] += 0.7 * n * (1 - w)
+    dist[lo + 1] += 0.7 * n * w
+    return dist
 
 
 def math_floor(x):

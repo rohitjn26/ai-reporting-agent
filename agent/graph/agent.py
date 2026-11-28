@@ -180,7 +180,7 @@ WHAT AN AVERAGE DEPENDS ON, OR WHY ONE GROUP DIFFERS — don't test causes one b
   dimension), then explain_average(measure, filters, compare={"dimension", "values"}).
 explain_average checks every sensible dimension and time at once and returns a tree.
 Narrate it top-down with numbers ("late deliveries average 2.9★ vs 4.2★ on time; within
-late ones, ..."), and always say whether it is per review or per item. Mention dimensions
+late ones, ..."), and always say what is counted (`per`: per review, per order item, ...). Mention dimensions
 in `left_out` only if the user asked about them. A tree with no split, or a comparison
 with "note", is a finding: say plainly nothing checked explains it / the gap is across the
 board. Never call a difference under `minimum_effect` meaningful. To chart, pass
@@ -926,14 +926,14 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
     if not per_item and cmp_cube in fans:
         return {"error": f"{compare['dimension']} can't be compared per review: a review's "
                          "order can have several. Run it per item (per_item=true)."}
-    start, per = mcube, "review"
+    start = mcube
     if per_item:
         target = cmp_cube or min(fans, key=lambda f: f)   # no comparison: the first fan-out cube
         start = tree.grain_for(mcube, target, graph) if target else None
         if not start or not value:
             return {"error": "per item isn't available here: it needs a per-row value for the "
                              "measure and a one-to-many step to count items across"}
-        per = start.split("_")[-1].rstrip("s") or "item"
+    per = tree.cube_title(start, view_meta, configs)
     weight = tree.count_measure(view, start, view_meta)
     if not weight:
         return {"error": f"no count measure on {start} to weight rows by", "instruction": _ONLY_AVERAGES}
@@ -1001,7 +1001,7 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
                 [{"member": value, "operator": "set"}] if value and rating else [])}
             total = sum(drill._num(r.get(weight)) for r in await run(total_q))
             cells = tree.Cells(key_dims, tree.cells_from_rows(rows, key_dims, weight, value if rating else None,
-                                                              measure), rating, per, total)
+                                                              measure), rating, per, total, start)
             tree.cache_put(key, cells)
         break
     else:
@@ -1045,7 +1045,8 @@ async def explain_average(
                   dimension sits behind a one-to-many join (a review's order has many items)
 
     Returns:
-        JSON: `per` ("review" or "item" — always say which), the tree (rows, avg, split_by,
+        JSON: `per` (what one counted row is, e.g. "Order Reviews" or "Order Items" — always
+        say it), the tree (rows, avg, split_by,
         branches with their values, p), dimensions left out and why, and for a comparison
         the gap split into make-up vs within-member differences. A tree with no split means
         nothing checked moves the average by the minimum effect — say so; don't guess.
@@ -1065,11 +1066,12 @@ async def explain_average(
         if isinstance(got, dict):
             return got
         cells, cands, ordered, skipped = got
+        per_item_used = cells.grain != drill.measure_cube({"measures": [measure]}, view_meta)
         echoes = tree.restating(cells, cands)
         cands = [c for c in cands if c not in echoes]
         skipped = {**echoes, **skipped}
         out = {"measure": measure, "per": cells.per,
-               "minimum_effect": tree.min_effect(cells.stat().mean, cells.rating),
+               "minimum_effect": _r3(tree.min_effect(cells.stat())),
                "checked": cands}
         if compare:
             ci = cells.dims.index(compare["dimension"])
@@ -1089,7 +1091,7 @@ async def explain_average(
         else:
             root = tree.grow(cells, cands, ordered)
             out["tree"] = root.to_dict()
-            if root.split and cells.per == "review":   # per item, Cube can't chart the same numbers
+            if root.split and not per_item_used:      # per item, Cube can't chart the same numbers
                 chart = {"measures": [measure], "filters": filters}
                 if root.split in ordered:                  # the time bucket: "view.dim.granularity"
                     dim, gran = root.split.rsplit(".", 1)

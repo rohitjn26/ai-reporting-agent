@@ -32,8 +32,11 @@ Run = Callable[[dict], Awaitable[list[dict]]]
 
 # ── settings (env-overridable) ────────────────────────────────────────────────
 ALPHA = float(os.environ.get("TREE_ALPHA", "0.10"))            # split / merge significance
-MIN_EFFECT_RATING = float(os.environ.get("TREE_MIN_EFFECT", "0.05"))   # ★ for ratings
-MIN_EFFECT_SHARE = float(os.environ.get("TREE_MIN_EFFECT_SHARE", "0.02"))  # of the mean otherwise
+# smallest change in the average worth a split: this share of the value's standard
+# deviation (≈0.06★ on a 1-5 rating, ≈2 points on a 0/1 rate) — or, when the spread
+# is unknown, this share of the mean
+MIN_EFFECT_SD = float(os.environ.get("TREE_MIN_EFFECT_SD", "0.05"))
+MIN_EFFECT_SHARE = float(os.environ.get("TREE_MIN_EFFECT_SHARE", "0.02"))
 MIN_CHILD_SHARE = float(os.environ.get("TREE_MIN_CHILD_SHARE", "0.01"))
 MIN_CHILD_ROWS = int(os.environ.get("TREE_MIN_CHILD_ROWS", "500"))
 MAX_DEPTH = int(os.environ.get("TREE_MAX_DEPTH", "3"))
@@ -163,8 +166,9 @@ class Cells:
     dims: list[str]                 # the cell key's dimensions, in order
     rows: list[tuple[tuple, Stat]]  # (key values, stat)
     rating: bool                    # values came as a distribution (variance known)
-    per: str                        # "review" (one row of the measure's cube) or "item"
+    per: str                        # what one counted row is: the grain cube's title ("Order Items")
     total: float                    # the weight's total, to check the cells add up
+    grain: str = ""                 # the cube whose rows are counted
     fetched_at: float = field(default_factory=time.time)
 
     def stat(self) -> Stat:
@@ -356,8 +360,13 @@ def _absorb_small(groups: list[tuple[list, Stat]], min_rows: float, ordered: boo
     return groups
 
 
-def min_effect(mean: float, rating: bool) -> float:
-    return MIN_EFFECT_RATING if rating else MIN_EFFECT_SHARE * abs(mean)
+def min_effect(stat: Stat) -> float:
+    """The smallest change in the average worth reporting, in the value's own units."""
+    if stat.ss is not None and stat.n:
+        sd = math.sqrt(max(0.0, stat.ss / stat.n - stat.mean ** 2))
+        if sd > 0:
+            return MIN_EFFECT_SD * sd
+    return MIN_EFFECT_SHARE * abs(stat.mean)
 
 
 @dataclass
@@ -369,13 +378,12 @@ class Split:
 
 
 def best_split(cells: list[tuple[tuple, Stat]], dims: list[str], usable: list[str],
-               ordered: set[str], rating: bool) -> Optional[Split]:
+               ordered: set[str], rating: bool, eff: float) -> Optional[Split]:
     """The most significant split of these cells that is real (p < ALPHA), big enough to
     care about (minimum effect) and has no tiny branch; None when nothing qualifies."""
     parent = Stat(ss=0.0 if rating else None)
     for _, st in cells:
         parent.add(st)
-    eff = min_effect(parent.mean, rating)
     min_rows = max(MIN_CHILD_SHARE * parent.n, MIN_CHILD_ROWS)
     best = None
     for d in usable:
@@ -425,6 +433,8 @@ def restating(cells: Cells, candidates: list[str]) -> dict[str, str]:
 
 def grow(cells: Cells, candidates: list[str], ordered: set[str], depth: int = MAX_DEPTH) -> Node:
     """The driver tree over `candidates` (a subset of cells.dims)."""
+    eff = min_effect(cells.stat())   # one threshold for the whole tree, from the root
+
     def build(rows, used: list[str], level: int) -> Node:
         st = Stat(ss=0.0 if cells.rating else None)
         for _, s in rows:
@@ -432,7 +442,8 @@ def grow(cells: Cells, candidates: list[str], ordered: set[str], depth: int = MA
         node = Node(st.n, st.mean)
         if level >= depth:
             return node
-        sp = best_split(rows, cells.dims, [c for c in candidates if c not in used], ordered, cells.rating)
+        sp = best_split(rows, cells.dims, [c for c in candidates if c not in used], ordered,
+                        cells.rating, eff)
         if sp is None:
             return node
         node.split, node.p = sp.dim, sp.p
@@ -512,6 +523,18 @@ def value_dimension(measure: str, view_meta: list[dict], configs: list[dict]) ->
         return None
     return next((d["name"] for d in drill._view_members(view_meta, view, "dimensions")
                  if d.get("aliasMember") == f"{cube}.{col}"), None)
+
+
+def cube_title(cube: str, view_meta: list[dict], configs: list[dict]) -> str:
+    """What one row of `cube` is called ("Order Items"): the view's carried cube titles,
+    then the config's title, then the name."""
+    for v in view_meta:
+        for c in ((v.get("meta") or {}).get("cubes") or []):
+            if c.get("name") == cube and c.get("title"):
+                return c["title"]
+    data = next(((c.get("data") or {}) for c in configs
+                 if ((c.get("data") or {}).get("name") or c.get("name")) == cube), {})
+    return data.get("title") or cube
 
 
 def count_measure(view: str, cube: str, view_meta: list[dict]) -> Optional[str]:

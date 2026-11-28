@@ -130,7 +130,7 @@ async def _call(args, built):
 
 async def test_tree_per_review_splits_on_delay_and_leaves_out_fan_out_dimensions():
     out = await _call({"measure": "v.avg_score"}, {"measures": ["v.avg_score"]})
-    assert out["per"] == "review"
+    assert out["per"] == "reviews"
     t = out["tree"]
     assert t["split_by"] == "v.delay"
     assert [b["values"] for b in t["branches"]] == [["late"], ["on_time"]]
@@ -144,7 +144,7 @@ async def test_comparing_a_fan_out_dimension_runs_per_item_and_finds_the_make_up
     built = {"measures": ["v.avg_score"], "dimensions": ["v.category"]}
     out = await _call({"measure": "v.avg_score",
                        "compare": {"dimension": "v.category", "values": ["electronics"]}}, built)
-    assert out["per"] == "item"
+    assert out["per"] == "items"
     cmp = out["comparison"]
     assert cmp["avg_segment"] < cmp["avg_others"]
     assert cmp["by_dimension"][0]["dimension"] == "v.delay"

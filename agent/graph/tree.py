@@ -40,6 +40,7 @@ MIN_EFFECT_SHARE = float(os.environ.get("TREE_MIN_EFFECT_SHARE", "0.02"))
 MIN_CHILD_SHARE = float(os.environ.get("TREE_MIN_CHILD_SHARE", "0.01"))
 MIN_CHILD_ROWS = int(os.environ.get("TREE_MIN_CHILD_ROWS", "500"))
 MAX_DEPTH = int(os.environ.get("TREE_MAX_DEPTH", "3"))
+MIN_BRANCH = int(os.environ.get("TREE_MIN_BRANCH", "30"))     # rows, on any data size
 MAX_CANDIDATES = 8
 CELL_LIMIT = 50_000            # Cube's default row cap; a full result means "too many cells"
 CELL_BUDGET = 5_000_000        # estimated combinations allowed: real ones are far fewer,
@@ -386,7 +387,9 @@ def best_split(cells: list[tuple[tuple, Stat]], dims: list[str], usable: list[st
     parent = Stat(ss=0.0 if rating else None)
     for _, st in cells:
         parent.add(st)
-    min_rows = max(MIN_CHILD_SHARE * parent.n, MIN_CHILD_ROWS)
+    # 500 rows per branch, or a tenth of the node on small data — never under MIN_BRANCH
+    # rows, where one or two odd rows would decide the split
+    min_rows = max(MIN_CHILD_SHARE * parent.n, min(MIN_CHILD_ROWS, 0.1 * parent.n), MIN_BRANCH)
     best = None
     for d in usable:
         i = dims.index(d)

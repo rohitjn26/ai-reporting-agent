@@ -906,6 +906,35 @@ def _time_label(value: Any, granularity: str) -> str:
     return v[:7] if granularity == "month" else v[:10]
 
 
+def _inline(sql: str, params: list) -> str:
+    """Cube's $1.. placeholders filled in as literals (for EXPLAIN only)."""
+    for i in range(len(params), 0, -1):
+        v = params[i - 1]
+        sql = sql.replace(f"${i}", "NULL" if v is None else "'" + str(v).replace("'", "''") + "'")
+    return sql
+
+
+async def _plan_error(q: dict) -> str | None:
+    """Why Postgres can't plan the SQL Cube generates for `q`, or None. EXPLAIN only —
+    nothing runs — so a broken field is found in milliseconds, whatever the table size."""
+    import asyncpg
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.get(f"{CUBE_URL}/cubejs-api/v1/sql", params={"query": json.dumps(_to_cube(q))},
+                        headers={"Authorization": f"Bearer {CUBE_API_SECRET}"})
+    body = r.json()
+    if body.get("error"):
+        return str(body["error"])
+    sql, params = body["sql"]["sql"]
+    conn = await asyncpg.connect(DATA_DB_URL)
+    try:
+        await conn.execute("EXPLAIN " + _inline(sql, params))
+    except asyncpg.PostgresError as e:
+        return str(e)
+    finally:
+        await conn.close()
+    return None
+
+
 async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_item):
     """Everything explain_average fetches: (cells, candidates, ordered dims, notes) or an
     error dict. One cells query (cached), plus a couple of small ones to size it."""
@@ -989,7 +1018,7 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
     if share < 100 and not bucket:
         share = 100   # no sample bucket on this cube: explain all rows, slower
 
-    for attempt in range(3):
+    for attempt in range(4):
         dims = picked + ([compare["dimension"]] if compare else []) + ([value] if rating else [])
         q = {"measures": [weight] + ([] if rating else [measure]), "dimensions": dims,
              "filters": filters + sample, "limit": tree.CELL_LIMIT}
@@ -998,6 +1027,14 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
         key = (view, measure, per, json.dumps(filters + sample, sort_keys=True), tuple(dims), time_dim, gran)
         cells = tree.cache_get(key)
         if cells is None:
+            if await _plan_error(q):   # a broken field would sink the whole query: find and drop it
+                bad = {c: e for c in picked if (e := await _plan_error({**q, "dimensions": [c], "limit": 1}))}
+                if not bad:
+                    return {"error": f"Cube can't run the cells query: {(await _plan_error(q))[:300]}"}
+                for c, e in bad.items():
+                    picked.remove(c)
+                    skipped[c] = f"its SQL fails: {e[:120]}"
+                continue
             rows = await run(q)
             if len(rows) >= tree.CELL_LIMIT and picked:
                 skipped[picked.pop()] = "left out: too many combinations"

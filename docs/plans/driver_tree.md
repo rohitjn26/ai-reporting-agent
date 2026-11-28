@@ -268,3 +268,27 @@ Differences from the plan, and what the live check found:
 - **Not yet:** customer columns rank behind product/seller ones per item, so within
   electronics the VIP effect isn't checked; averages over time still use explain_change's
   flat mix/rate path.
+
+## v2: generalise (2026-11-28)
+
+Built after the us_ecom work, so nothing depends on one dataset:
+
+- **Minimum effect from the value's spread:** 5% of its standard deviation (0.06★ on a
+  1-5 rating, ~2 points on a 0/1 rate); 2% of the mean when the spread is unknown.
+- **Grain labelled by the cube's title** ("Order Items"), not a chopped table name.
+- **Sampling:** the Cube builder gives every cube with a primary key a `sample_bucket`
+  (stable 0-99 hash of the key; aliased per cube in unprefixed views; hidden from the
+  model's schema). Above 2M rows the tree uses ≈1M via `bucket < N` and says so.
+  Live: electronics per item used 49% of 2.05M rows, same answer as the full run.
+- **Parent size at publish:** every one-to-many join gives the parent table a child count
+  and totals of up to 3 numeric child columns (identifier-like ones skipped), indexed on
+  the join key, plus banded dimensions in the cube and listing views. Re-publish
+  recomputes. Applies to datasets published from now on (us_ecom has hand-made ones).
+- **Robustness:** the cells query is planned with Postgres EXPLAIN first; a field whose
+  SQL fails is left out with the reason (found: seed `orders.order_bucket` references the
+  measure `day_count`). Branches need ≥ 30 rows on any data size.
+- **Checked on three other datasets** (seed sales, discovery demo, us_ecom item price) —
+  all non-rating averages, so the effect-only path. mdbl/flu28 weren't loaded in Cube.
+
+Still open: the restating check needs the value's distribution, so it only runs for
+rating-like values; datasets published before v2 don't have parent-size columns.

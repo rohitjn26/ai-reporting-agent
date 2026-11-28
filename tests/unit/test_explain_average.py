@@ -54,6 +54,7 @@ def make_orders():
 
 
 ORDERS = make_orders()
+BROKEN: dict = {}   # dimensions tuple -> plan error, for the broken-field test
 
 
 async def fake_run(q):
@@ -118,6 +119,11 @@ def fakes(monkeypatch):
     monkeypatch.setattr(agent, "_fetch_cube_metadata", meta)
     monkeypatch.setattr(agent, "_cube_load", load)
     monkeypatch.setattr(agent, "drill_context", context)
+
+    async def plans(q):   # no Cube /sql or Postgres here: every query plans unless a test says not
+        return BROKEN.get(tuple(q.get("dimensions", [])))
+    monkeypatch.setattr(agent, "_plan_error", plans)
+    BROKEN.clear()
     real = agent.httpx.AsyncClient
     monkeypatch.setattr(agent.httpx, "AsyncClient",
                         lambda **kw: Lib() if kw.get("timeout") == 10 else real(**kw))
@@ -188,3 +194,20 @@ async def test_a_big_table_is_explained_from_a_sample(monkeypatch):
     out = await _call({"measure": "v.avg_score"}, {"measures": ["v.avg_score"]})
     assert out["sample"] == {"share_percent": 25, "rows_used": 1000, "rows_total": 4000}
     assert out["tree"]["rows"] == 1000 and out["tree"]["split_by"] == "v.delay"
+
+
+async def test_a_field_whose_sql_fails_is_left_out_not_fatal():
+    BROKEN[("v.state",)] = 'column "day_count" does not exist'
+    real = agent._plan_error
+
+    async def plans(q):   # the full cells query fails while state is in it
+        if "v.state" in q.get("dimensions", []):
+            return 'column "day_count" does not exist'
+        return None
+    agent._plan_error = plans
+    try:
+        out = await _call({"measure": "v.avg_score"}, {"measures": ["v.avg_score"]})
+    finally:
+        agent._plan_error = real
+    assert "v.state" not in out["checked"] and "its SQL fails" in out["left_out"]["v.state"]
+    assert out["tree"]["split_by"] == "v.delay"

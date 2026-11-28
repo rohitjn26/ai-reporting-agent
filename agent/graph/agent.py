@@ -975,6 +975,12 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
         rating, n_values = len(probe) <= tree.RATING_MAX_VALUES, len(probe)
     if per_item and not rating:
         return {"error": "per item needs the measure's value as a small set of values (a rating)"}
+    # any other average: its hidden companions (Cube builder) give the spread inside cells
+    alias = next((m.get("aliasMember") for m in drill._view_members(view_meta, view, "measures")
+                  if m["name"] == measure), None)
+    by_alias = {m.get("aliasMember"): m["name"] for m in drill._view_members(view_meta, view, "measures")}
+    spread = (by_alias.get(f"{alias}_nvals"), by_alias.get(f"{alias}_sumsq")) if alias and not rating else (None, None)
+    spread = spread if all(spread) else None
 
     safe, fans = tree.safe_cubes(start, graph)
     if value:   # the value's own cube is reached per item; the add-up check guards it
@@ -1020,7 +1026,7 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
 
     for attempt in range(4):
         dims = picked + ([compare["dimension"]] if compare else []) + ([value] if rating else [])
-        q = {"measures": [weight] + ([] if rating else [measure]), "dimensions": dims,
+        q = {"measures": [weight] + ([] if rating else [measure]) + list(spread or []), "dimensions": dims,
              "filters": filters + sample, "limit": tree.CELL_LIMIT}
         if time_dim:
             q["time_dimensions"] = [{"dimension": time_dim, "granularity": gran}]
@@ -1047,7 +1053,8 @@ async def _tree_inputs(run, view_meta, stats, measure, filters, compare, per_ite
             total = all_rows if not sample else sum(drill._num(r.get(weight)) for r in await run(
                 {"measures": [weight], "filters": filters + value_set + sample}))
             cells = tree.Cells(key_dims, tree.cells_from_rows(rows, key_dims, weight, value if rating else None,
-                                                              measure), rating, per, total, start)
+                                                              measure, spread),
+                               rating or bool(spread), per, total, start)
             tree.cache_put(key, cells)
         break
     else:

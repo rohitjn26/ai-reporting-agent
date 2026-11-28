@@ -168,7 +168,8 @@ class Stat:
 class Cells:
     dims: list[str]                 # the cell key's dimensions, in order
     rows: list[tuple[tuple, Stat]]  # (key values, stat)
-    rating: bool                    # values came as a distribution (variance known)
+    rating: bool                    # the value's spread inside cells is known (a rating's
+                                    # distribution, or the avg's sum-of-squares companion)
     per: str                        # what one counted row is: the grain cube's title ("Order Items")
     total: float                    # the weight's total, to check the cells add up
     grain: str = ""                 # the cube whose rows are counted
@@ -182,10 +183,11 @@ class Cells:
 
 
 def cells_from_rows(rows: list[dict], dims: list[str], weight: str, value: Optional[str],
-                    measure: str) -> list[tuple[tuple, Stat]]:
+                    measure: str, spread: Optional[tuple[str, str]] = None) -> list[tuple[tuple, Stat]]:
     """Fold Cube rows into cells. With `value` (a per-row dimension, e.g. the score)
-    each row is one value of a cell's distribution; without it, rows carry the cell's
-    average and its spread inside the cell is unknown."""
+    each row is one value of a cell's distribution. Otherwise rows carry the cell's
+    average, and with `spread` = (rows-with-a-value measure, sum-of-squares measure)
+    the spread inside the cell is known too; without it, it is unknown."""
     out: dict[tuple, Stat] = {}
     for r in rows:
         key = tuple(BLANK if r.get(d) is None else r.get(d) for d in dims)
@@ -198,8 +200,12 @@ def cells_from_rows(rows: list[dict], dims: list[str], weight: str, value: Optio
         else:
             if r.get(measure) is None:
                 continue
-            st = Stat(n, drill._num(r.get(measure)) * n, None)
-        out.setdefault(key, Stat(ss=0.0 if value else None)).add(st)
+            if spread:
+                n = drill._num(r.get(spread[0]))
+                st = Stat(n, drill._num(r.get(measure)) * n, drill._num(r.get(spread[1])))
+            else:
+                st = Stat(n, drill._num(r.get(measure)) * n, None)
+        out.setdefault(key, Stat(ss=0.0 if value or spread else None)).add(st)
     return list(out.items())
 
 

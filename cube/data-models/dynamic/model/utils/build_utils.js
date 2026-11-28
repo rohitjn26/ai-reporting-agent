@@ -123,15 +123,41 @@ export const withSampleBucket = (dimensions) => {
   };
 };
 
-export const transformView = (viewData, sampledCubes = new Set()) => {
+// Every avg measure gets two hidden companions over the same SQL: how many rows have a
+// value (`<m>_nvals`) and the sum of their squares (`<m>_sumsq`). With count, sum and sum
+// of squares, the spread of the value inside any group is known exactly, so the driver
+// tree can test significance and spot restating columns for any average, not only
+// rating-like ones.
+export const SPREAD_SUFFIXES = ['_nvals', '_sumsq'];
+
+export const withSpreadCompanions = (measures) => {
+  const out = { ...(measures || {}) };
+  Object.entries(measures || {}).forEach(([name, m]) => {
+    if (!m || m.type !== 'avg' || !m.sql || out[`${name}_sumsq`]) return;
+    out[`${name}_nvals`] = { sql: m.sql, type: 'count', title: `${m.title || name} (internal: rows with a value)` };
+    const v = /^\w+$/.test(m.sql) ? `\${CUBE}.${m.sql}` : m.sql;   // bare column: qualify it
+    out[`${name}_sumsq`] = { sql: `(${v}) * (${v})`, type: 'sum', title: `${m.title || name} (internal: sum of squares)` };
+  });
+  return out;
+};
+
+export const transformView = (viewData, sampledCubes = new Set(), spreadMeasures = new Map()) => {
   const cubes = (viewData.cubes || []).map((entry) => {
     const cube = String(entry.join_path).split('.').pop();
     const inc = entry.includes;
     // a view that lists its members wouldn't show the sample bucket otherwise
     // unprefixed views would get one sample_bucket per cube under the same name: alias it
     const member = entry.prefix ? SAMPLE_DIM : { name: SAMPLE_DIM, alias: `${cube}_${SAMPLE_DIM}` };
-    const includes = Array.isArray(inc) && sampledCubes.has(cube) && !inc.includes(SAMPLE_DIM)
+    let includes = Array.isArray(inc) && sampledCubes.has(cube) && !inc.includes(SAMPLE_DIM)
       ? [...inc, member] : inc;
+    // an avg measure the view lists brings its spread companions along
+    if (Array.isArray(includes)) {
+      const names = includes.map((i) => (typeof i === 'string' ? i : i.name));
+      const extra = names.filter((n) => typeof n === 'string' && !SPREAD_SUFFIXES.some((x) => n.endsWith(x)))
+        .flatMap((n) => SPREAD_SUFFIXES.map((x) => n + x))
+        .filter((n) => (spreadMeasures.get(cube) || new Set()).has(n) && !names.includes(n));
+      includes = [...includes, ...extra];
+    }
     return { ...entry, includes, join_path: joinPathToFunction(entry.join_path) };
   });
   const view = { cubes };

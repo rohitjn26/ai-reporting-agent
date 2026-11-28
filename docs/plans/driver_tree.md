@@ -290,5 +290,9 @@ Built after the us_ecom work, so nothing depends on one dataset:
 - **Checked on three other datasets** (seed sales, discovery demo, us_ecom item price) —
   all non-rating averages, so the effect-only path. mdbl/flu28 weren't loaded in Cube.
 
-Still open: the restating check needs the value's distribution, so it only runs for
-rating-like values; datasets published before v2 don't have parent-size columns.
+- **Spread for any average:** the Cube builder gives every avg measure hidden companions
+  (`<m>_nvals`, `<m>_sumsq`), so the cells carry count, sum and sum of squares: the
+  significance test and the restating check now work for prices, durations etc., not only
+  ratings. Live: average item price splits by category with a real p-value.
+
+Still open: datasets published before v2 don't have parent-size columns.

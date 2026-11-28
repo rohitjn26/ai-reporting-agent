@@ -171,3 +171,10 @@ def test_significant_but_tiny_differences_are_merged():
     pairs = [(("x", s, "card"), spread(m, 200_000)) for s, m in [("a", 3.76), ("b", 3.77), ("c", 3.78), ("d", 4.35)]]
     root = tree.grow(ratings(pairs), DIMS, ordered=set())
     assert [b.values for b in root.branches] == [["a", "b", "c"], ["d"]]
+
+
+def test_cells_from_avg_rows_with_spread_companions_know_the_variance():
+    rows = [{"d": "a", "w": 3, "m": 10.0, "m_n": 2, "m_ss": 250.0}]   # values 5 and 15
+    (key, st), = tree.cells_from_rows(rows, ["d"], "w", None, "m", ("m_n", "m_ss"))
+    assert (st.n, st.mean, st.ss) == (2, 10.0, 250.0)
+    assert tree.min_effect(st) == pytest.approx(0.05 * 5)          # sd of {5, 15} is 5

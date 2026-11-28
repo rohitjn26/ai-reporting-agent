@@ -111,7 +111,7 @@ def format_metadata(entries: list[dict], view: str = "") -> str:
     lines = [f"Cube: {c['name']}" + (f"  — {c['description']}" if c.get("description") else "")]
     if c.get("measures"):
         lines.append("  Measures:")
-        lines += [_fmt(m) for m in c["measures"]]
+        lines += [_fmt(m) for m in c["measures"] if not m["name"].endswith(("_nvals", "_sumsq"))]
     if c.get("dimensions"):
         lines.append("  Dimensions:")
         lines += [_fmt(d) for d in c["dimensions"] if not d["name"].endswith("sample_bucket")]

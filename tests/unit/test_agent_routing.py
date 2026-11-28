@@ -127,36 +127,40 @@ def _with_ids(msgs):
     return msgs
 
 
-def test_summarise_keeps_a_long_latest_turn_whole(monkeypatch):
-    # The old "keep last 4" rule found no user message in the last 4 and gave up.
-    msgs = _with_ids([HumanMessage(content="first"), AIMessage(content="a1"),
-                      HumanMessage(content="second"), AIMessage(content="a2"),
-                      HumanMessage(content="compliance vs activity")]
-                     + [m for i in range(4) for m in (_call(f"c{i}"), _tool("r", tid=f"c{i}"))]
-                     + [AIMessage(content="done")])
-    did, fake, _ = _run_summarise(msgs, monkeypatch)
+def _turns(n, filler=""):
+    out = []
+    for i in range(n):
+        out += [HumanMessage(content=f"q{i}"), _call(f"c{i}"), _tool(f"result {i} {filler}", tid=f"c{i}"),
+                AIMessage(content=f"a{i}")]
+    return _with_ids(out)
+
+
+def test_a_small_history_is_not_summarised(monkeypatch):
+    did, fake, prompts = _run_summarise(_turns(8), monkeypatch)       # many messages, few tokens
+    assert not did and not fake.updates and not prompts               # no Haiku call
+
+
+def test_a_large_history_keeps_the_last_turns_and_puts_the_summary_first(monkeypatch):
+    monkeypatch.setattr(agent, "SUMMARISE_TOKENS", 200)
+    msgs = _turns(5, filler="x" * 400)
+    did, fake, prompts = _run_summarise(msgs, monkeypatch)
     assert did
-    removed = {op.id for op in fake.updates[0]["messages"] if isinstance(op, RemoveMessage)}
-    assert removed == {"m0", "m1", "m2", "m3"}  # everything before the latest turn
-    summary = fake.updates[0]["messages"][-1]
-    assert summary.content.startswith("[Conversation summary]")
-
-
-def test_summarise_skips_when_only_a_summary_precedes_the_turn(monkeypatch):
-    msgs = _with_ids([HumanMessage(content="[Conversation summary]\nold"),
-                      HumanMessage(content="q")]
-                     + [m for i in range(5) for m in (_call(f"c{i}"), _tool("r", tid=f"c{i}"))])
-    did, fake, _ = _run_summarise(msgs, monkeypatch)
-    assert not did and not fake.updates
+    ops = fake.updates[0]["messages"]
+    removed = {op.id for op in ops if isinstance(op, RemoveMessage)}
+    added = [op for op in ops if not isinstance(op, RemoveMessage)]
+    assert removed == {m.id for m in msgs}                             # rebuilt in order
+    assert added[0].content.startswith("[Conversation summary]")       # summary first
+    assert [m.content for m in added[1:] if isinstance(m, HumanMessage)] == ["q2", "q3", "q4"]
+    assert all(m.id not in removed for m in added[1:])                  # kept turns re-added
+    assert "CALLS" in prompts[0] and "q0" in prompts[0] and "q4" not in prompts[0]
 
 
 def test_summarise_carries_previous_summary_over_whole(monkeypatch):
+    monkeypatch.setattr(agent, "SUMMARISE_TOKENS", 50)
     old = "[Conversation summary]\n" + "s" * 900
-    msgs = _with_ids([HumanMessage(content=old)]
-                     + [m for i in range(5) for m in (HumanMessage(content=f"q{i}"), AIMessage(content="a"))]
-                     + [HumanMessage(content="latest")])
+    msgs = _with_ids([HumanMessage(content=old)] + _turns(4))
     did, _, prompts = _run_summarise(msgs, monkeypatch)
-    assert did and old in prompts[0]
+    assert did and "s" * 900 in prompts[0]
 
 
 # ── build_query when Cube is down ─────────────────────────────────────────────

@@ -326,16 +326,16 @@ async def clear_thread(thread_id: str) -> None:
         for k in [k for k in cp.storage if k[0] == thread_id]:
             del cp.storage[k]
 
-# Summarise when message count exceeds this; the latest turn (from the last user
-# message on) is always kept as-is.
-SUMMARISE_AFTER = 10
+# Summarise only when the history sent to the model is genuinely large: old tool results
+# are already trimmed and the history is prompt-cached, so a long chat is cheap — a
+# summary per turn cost a Haiku call each time and lost the details. Keep the last
+# KEEP_TURNS user turns word for word.
+SUMMARISE_TOKENS = int(os.environ.get("SUMMARISE_TOKENS", "40000"))
+KEEP_TURNS = int(os.environ.get("SUMMARY_KEEP_TURNS", "3"))
 _SUMMARY_PREFIX = "[Conversation summary]"
 _SUMMARY_MODEL  = os.environ.get("SUMMARY_MODEL", "claude-haiku-4-5-20251001")
 
 
-# Reused across summarise calls so the httpx connection pool stays warm
-# (see the query_builder note on connection churn).
-@lru_cache(maxsize=None)
 def _summariser(model: str):
     return ChatAnthropic(model=model)
 
@@ -363,58 +363,69 @@ def _latest_turn_start(messages) -> int | None:
     return None
 
 
+def _estimate_tokens(messages: list) -> int:
+    """Rough size of what is sent (≈4 characters a token), tool calls included."""
+    chars = 0
+    for m in messages:
+        chars += len(m.content if isinstance(m.content, str) else json.dumps(m.content, default=str))
+        chars += len(json.dumps(getattr(m, "tool_calls", None) or [], default=str))
+    return chars // 4
+
+
+def _for_summary(m) -> str:
+    """One message as the summariser sees it: text, tool calls with their arguments, and
+    the head of tool results (where fields, filters and findings are)."""
+    if _is_summary(m):
+        return f"EARLIER SUMMARY: {m.content}"
+    if isinstance(m, ToolMessage):
+        return f"TOOL {m.name} RESULT: {_extract_text(m.content)[:600]}"
+    text = _extract_text(m.content)
+    calls = "".join(f"\n  CALLS {c['name']}({json.dumps(c.get('args', {}), default=str)[:300]})"
+                    for c in getattr(m, "tool_calls", None) or [])
+    return f"{m.type.upper()}: {text}{calls}"
+
+
 async def maybe_summarise(agent, thread_id: str) -> bool:
     """
-    If the stored message history for this thread is longer than SUMMARISE_AFTER,
-    ask a fast model to compress the old messages into one summary message
-    (stored as a HumanMessage so it rides in the history AFTER the system prompt,
-    keeping the cached tools+system prefix byte-stable), then remove the
-    originals from the graph state.
-
-    Returns True if summarisation happened, False otherwise.
-    Never runs when an interrupt is pending.
+    When the history sent to the model passes SUMMARISE_TOKENS, compress everything
+    before the last KEEP_TURNS user turns into one summary message, placed first, and
+    keep those turns word for word. Never runs when an interrupt is pending.
+    Returns True if it summarised.
     """
     config = {"configurable": {"thread_id": thread_id}}
     state  = await agent.aget_state(config)
-
-    # Don't touch state if a task is still pending (e.g. mid-interrupt).
     if state.next:
         return False
-
     messages = state.values.get("messages", [])
-    if len(messages) <= SUMMARISE_AFTER:
+    if _estimate_tokens(_trim_old_tool_results(messages)) <= SUMMARISE_TOKENS:
         return False
 
-    # Cut at the start of the latest turn (the last real user message), so we
-    # never orphan a ToolMessage from its tool_use. A turn with many tool steps
-    # is kept whole; everything before it is summarised.
-    cut = _latest_turn_start(messages)
-    if cut is None:
+    # cut at the start of a user turn, so no tool result is separated from its call
+    starts = [i for i, m in enumerate(messages) if isinstance(m, HumanMessage) and not _is_summary(m)]
+    if len(starts) <= KEEP_TURNS:
         return False
-    to_summarise = list(messages[:cut])
-    if not to_summarise or (len(to_summarise) == 1 and _is_summary(to_summarise[0])):
+    cut = starts[-KEEP_TURNS]
+    to_summarise, keep = messages[:cut], messages[cut:]
+    if all(_is_summary(m) for m in to_summarise):
         return False
-
-    conversation = "\n".join(
-        # A previous summary is carried over whole so it isn't lost on re-summarising.
-        f"{m.type.upper()}: {m.content if _is_summary(m) else _extract_text(m.content)}"
-        for m in to_summarise
-    )
 
     prompt = (
-        "Summarise this agent conversation in under 120 words. "
-        "Capture: what the user asked for, which cubes/measures/dimensions were used, "
-        "any config changes made, and the current state of things.\n\n"
-        + conversation
+        "Summarise this data-analysis conversation in under 200 words, for the assistant "
+        "to continue it. Keep, with exact names and numbers: the view and the fields used "
+        "(measures, dimensions, filters), what each analysis found (top drivers with their "
+        "numbers, and what was checked and ruled out), anything saved or changed (graphs, "
+        "fields, configs — with ids), fields reported missing, and every correction or "
+        "preference the user gave. Drop chit-chat.\n\n"
+        + "\n".join(_for_summary(m) for m in to_summarise)
     )
-
     summariser = _summariser(_SUMMARY_MODEL)
     response   = await summariser.ainvoke([HumanMessage(content=prompt)])
     summary    = response.content if isinstance(response.content, str) else _extract_text(response.content)
 
-    remove_ops   = [RemoveMessage(id=m.id) for m in to_summarise]
-    summary_msg  = HumanMessage(content=f"{_SUMMARY_PREFIX}\n{summary}")
-    await agent.aupdate_state(config, {"messages": remove_ops + [summary_msg]})
+    # summary first, then the kept turns: re-added under new ids so they land after it
+    kept = [m.model_copy(update={"id": str(uuid.uuid4())}) for m in keep]
+    await agent.aupdate_state(config, {"messages": [RemoveMessage(id=m.id) for m in messages]
+                                       + [HumanMessage(content=f"{_SUMMARY_PREFIX}\n{summary}")] + kept})
     return True
 
 
